@@ -647,7 +647,7 @@ mod tests {
         let symbol_size = floor.symbol_size_samples();
         // 100-byte payload + 2-byte header = 102 bytes; with 9
         // bytes/symbol that's 12 symbols (102/9 = 11.33 → 12).
-        let samples = floor.transmit_multi(&vec![0u8; 100]).unwrap();
+        let samples = floor.transmit_multi(&[0u8; 100]).unwrap();
         assert_eq!(samples.len(), 12 * symbol_size);
     }
 
