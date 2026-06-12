@@ -181,9 +181,7 @@ fn run_sine(device_name: &str, hz: u32, secs: u32) -> Result<(), AppError> {
     let resolved = output
         .device_name()
         .unwrap_or_else(|_| device_name.to_string());
-    println!(
-        "playing {hz} Hz sine for {secs}s to '{resolved}' ({channels} channel(s)) ..."
-    );
+    println!("playing {hz} Hz sine for {secs}s to '{resolved}' ({channels} channel(s)) ...");
     let buffer = generate_sine(hz, secs);
     let started = std::time::Instant::now();
     output.play_blocking(&buffer).map_err(AppError::Phy)?;
@@ -297,21 +295,27 @@ mod tests {
 
     #[test]
     fn parse_sine_with_device() {
-        let p = parse_args(&s(&[
-            "--device",
-            "Digirig",
-            "--sine",
-            "1000:3",
-        ]))
-        .unwrap();
-        assert_eq!(p.mode, Mode::Sine { freq_hz: 1000, duration_secs: 3 });
+        let p = parse_args(&s(&["--device", "Digirig", "--sine", "1000:3"])).unwrap();
+        assert_eq!(
+            p.mode,
+            Mode::Sine {
+                freq_hz: 1000,
+                duration_secs: 3
+            }
+        );
         assert_eq!(p.device.as_deref(), Some("Digirig"));
     }
 
     #[test]
     fn parse_sine_with_d_short_flag() {
         let p = parse_args(&s(&["-d", "X", "--sine", "440:1"])).unwrap();
-        assert_eq!(p.mode, Mode::Sine { freq_hz: 440, duration_secs: 1 });
+        assert_eq!(
+            p.mode,
+            Mode::Sine {
+                freq_hz: 440,
+                duration_secs: 1
+            }
+        );
     }
 
     #[test]
@@ -383,7 +387,10 @@ mod tests {
         // Amplitude should stay ≤ 0.3 to leave clipping headroom.
         let b = generate_sine(1000, 1);
         let max = b.samples().iter().fold(0.0_f32, |a, &b| a.max(b.abs()));
-        assert!(max <= 0.3 + 1e-6, "max sample {max} exceeds amplitude bound");
+        assert!(
+            max <= 0.3 + 1e-6,
+            "max sample {max} exceeds amplitude bound"
+        );
     }
 
     #[test]

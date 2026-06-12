@@ -46,12 +46,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use thiserror::Error;
 use sonde_phy::audio_device::{AudioInput, RecordOutcome};
 use sonde_phy::audio_io::{AudioBuffer, SAMPLE_RATE_HZ};
 use sonde_phy::error::PhyError;
 use sonde_phy::ofdm_main::ofdm_params::{OfdmModeName, OfdmParams};
 use sonde_phy::robustness_floor::wideband_lowdensity::WidebandLowDensityFloor;
+use thiserror::Error;
 
 // ─── Modes ──────────────────────────────────────────────────────────
 
@@ -480,9 +480,7 @@ impl Args {
                 return Err("missing --device <NAME> (required for --record-wav)".to_string());
             }
             if self.duration_secs.is_none() {
-                return Err(
-                    "missing --duration <SECS> (required for --record-wav)".to_string()
-                );
+                return Err("missing --duration <SECS> (required for --record-wav)".to_string());
             }
         }
         Ok(())
@@ -542,8 +540,7 @@ mod tests {
 
     #[test]
     fn resolve_expected_missing_file_errors() {
-        let err =
-            resolve_expected("@/nonexistent/path/that/should/not/exist").unwrap_err();
+        let err = resolve_expected("@/nonexistent/path/that/should/not/exist").unwrap_err();
         assert!(matches!(err, RxError::ExpectedFileRead { .. }));
     }
 
@@ -607,7 +604,8 @@ mod tests {
         buf.write_wav(&path).unwrap();
         let read_back = read_wav(&path).unwrap();
         let _ = std::fs::remove_file(&path);
-        let decoded = decode_one_symbol(Mode::WideFloor, read_back.samples(), FrameMode::Raw).unwrap();
+        let decoded =
+            decode_one_symbol(Mode::WideFloor, read_back.samples(), FrameMode::Raw).unwrap();
         assert_eq!(decoded, payload);
     }
 
@@ -682,7 +680,12 @@ mod tests {
     #[test]
     fn args_parse_record_wav_with_all_required_validates() {
         let a = Args::parse(&s(&[
-            "--record-wav", "/tmp/out.wav", "--device", "USB Audio", "--duration", "3",
+            "--record-wav",
+            "/tmp/out.wav",
+            "--device",
+            "USB Audio",
+            "--duration",
+            "3",
         ]))
         .unwrap();
         a.validate().unwrap();
@@ -695,19 +698,13 @@ mod tests {
 
     #[test]
     fn args_parse_decode_wav_with_expected() {
-        let a = Args::parse(&s(&[
-            "--decode-wav", "/tmp/in.wav", "--expected", "HELLO",
-        ]))
-        .unwrap();
+        let a = Args::parse(&s(&["--decode-wav", "/tmp/in.wav", "--expected", "HELLO"])).unwrap();
         assert_eq!(a.expected.as_deref(), Some("HELLO"));
     }
 
     #[test]
     fn args_parse_rejects_mutually_exclusive_modes() {
-        let a = Args::parse(&s(&[
-            "--list-devices", "--decode-wav", "/tmp/in.wav",
-        ]))
-        .unwrap();
+        let a = Args::parse(&s(&["--list-devices", "--decode-wav", "/tmp/in.wav"])).unwrap();
         let err = a.validate().unwrap_err();
         assert!(err.contains("mutually exclusive"));
     }
@@ -772,8 +769,7 @@ mod tests {
         let samples = WidebandLowDensityFloor::new()
             .transmit_with_preamble(payload)
             .unwrap();
-        let decoded =
-            decode_one_symbol(Mode::WideFloor, &samples, FrameMode::Sync).unwrap();
+        let decoded = decode_one_symbol(Mode::WideFloor, &samples, FrameMode::Sync).unwrap();
         assert_eq!(decoded, payload);
     }
 
@@ -788,8 +784,7 @@ mod tests {
             .unwrap();
         let mut samples = vec![0.0_f32; 1000];
         samples.extend_from_slice(&core);
-        let decoded =
-            decode_one_symbol(Mode::WideFloor, &samples, FrameMode::Sync).unwrap();
+        let decoded = decode_one_symbol(Mode::WideFloor, &samples, FrameMode::Sync).unwrap();
         assert_eq!(decoded, payload);
     }
 
@@ -817,8 +812,7 @@ mod tests {
     #[test]
     fn decode_sync_returns_phy_error_on_silence() {
         let silence = vec![0.0_f32; 10_000];
-        let err =
-            decode_one_symbol(Mode::WideFloor, &silence, FrameMode::Sync).unwrap_err();
+        let err = decode_one_symbol(Mode::WideFloor, &silence, FrameMode::Sync).unwrap_err();
         assert!(matches!(err, RxError::Phy(PhyError::FrameDetect(_))));
     }
 
@@ -826,8 +820,7 @@ mod tests {
     fn decode_raw_still_returns_insufficient_samples_on_short_input() {
         // Regression: the raw-mode error path is unchanged from PR #367.
         let too_short = vec![0.0_f32; 10];
-        let err =
-            decode_one_symbol(Mode::WideFloor, &too_short, FrameMode::Raw).unwrap_err();
+        let err = decode_one_symbol(Mode::WideFloor, &too_short, FrameMode::Raw).unwrap_err();
         assert!(matches!(err, RxError::InsufficientSamples { .. }));
     }
 
@@ -845,10 +838,7 @@ mod tests {
 
     #[test]
     fn args_parse_frame_mode_sync() {
-        let a = Args::parse(&s(&[
-            "--decode-wav", "/tmp/in.wav", "--frame-mode", "sync",
-        ]))
-        .unwrap();
+        let a = Args::parse(&s(&["--decode-wav", "/tmp/in.wav", "--frame-mode", "sync"])).unwrap();
         assert_eq!(a.frame_mode, FrameMode::Sync);
     }
 
@@ -900,7 +890,10 @@ mod tests {
 
     #[test]
     fn frame_mode_parse_accepts_multi_sync() {
-        assert_eq!(FrameMode::parse("multi-sync").unwrap(), FrameMode::MultiSync);
+        assert_eq!(
+            FrameMode::parse("multi-sync").unwrap(),
+            FrameMode::MultiSync
+        );
     }
 
     #[test]
@@ -917,8 +910,7 @@ mod tests {
         let samples = WidebandLowDensityFloor::new()
             .transmit_multi_with_preamble(payload)
             .unwrap();
-        let decoded =
-            decode_one_symbol(Mode::WideFloor, &samples, FrameMode::MultiSync).unwrap();
+        let decoded = decode_one_symbol(Mode::WideFloor, &samples, FrameMode::MultiSync).unwrap();
         assert_eq!(decoded, payload);
     }
 
@@ -928,8 +920,7 @@ mod tests {
         let samples = WidebandLowDensityFloor::new()
             .transmit_multi_with_preamble(&payload)
             .unwrap();
-        let decoded =
-            decode_one_symbol(Mode::WideFloor, &samples, FrameMode::MultiSync).unwrap();
+        let decoded = decode_one_symbol(Mode::WideFloor, &samples, FrameMode::MultiSync).unwrap();
         assert_eq!(decoded, payload);
     }
 
@@ -939,8 +930,7 @@ mod tests {
         let samples = WidebandLowDensityFloor::new()
             .transmit_multi_with_preamble(&payload)
             .unwrap();
-        let decoded =
-            decode_one_symbol(Mode::WideFloor, &samples, FrameMode::MultiSync).unwrap();
+        let decoded = decode_one_symbol(Mode::WideFloor, &samples, FrameMode::MultiSync).unwrap();
         assert_eq!(decoded, payload);
     }
 
@@ -952,8 +942,7 @@ mod tests {
             .unwrap();
         let mut samples = vec![0.0_f32; 1500];
         samples.extend_from_slice(&core);
-        let decoded =
-            decode_one_symbol(Mode::WideFloor, &samples, FrameMode::MultiSync).unwrap();
+        let decoded = decode_one_symbol(Mode::WideFloor, &samples, FrameMode::MultiSync).unwrap();
         assert_eq!(decoded, payload);
     }
 
@@ -965,12 +954,8 @@ mod tests {
             .unwrap();
         let mut samples = vec![0.0_f32; 800];
         samples.extend_from_slice(&core);
-        let (start, decoded) = decode_one_symbol_with_offset(
-            Mode::WideFloor,
-            &samples,
-            FrameMode::MultiSync,
-        )
-        .unwrap();
+        let (start, decoded) =
+            decode_one_symbol_with_offset(Mode::WideFloor, &samples, FrameMode::MultiSync).unwrap();
         let start = start.expect("multi-sync mode should return Some(start)");
         let offset_err = (start as i64 - 800).unsigned_abs() as usize;
         assert!(
@@ -983,15 +968,17 @@ mod tests {
     #[test]
     fn decode_multi_sync_returns_phy_error_on_silence() {
         let silence = vec![0.0_f32; 10_000];
-        let err = decode_one_symbol(Mode::WideFloor, &silence, FrameMode::MultiSync)
-            .unwrap_err();
+        let err = decode_one_symbol(Mode::WideFloor, &silence, FrameMode::MultiSync).unwrap_err();
         assert!(matches!(err, RxError::Phy(PhyError::FrameDetect(_))));
     }
 
     #[test]
     fn args_parse_frame_mode_multi_sync() {
         let a = Args::parse(&s(&[
-            "--decode-wav", "/tmp/in.wav", "--frame-mode", "multi-sync",
+            "--decode-wav",
+            "/tmp/in.wav",
+            "--frame-mode",
+            "multi-sync",
         ]))
         .unwrap();
         assert_eq!(a.frame_mode, FrameMode::MultiSync);
@@ -1015,12 +1002,8 @@ mod tests {
         buffer.write_wav(&path).unwrap();
         let read_back = read_wav(&path).unwrap();
         let _ = std::fs::remove_file(&path);
-        let decoded = decode_one_symbol(
-            Mode::WideFloor,
-            read_back.samples(),
-            FrameMode::MultiSync,
-        )
-        .unwrap();
+        let decoded =
+            decode_one_symbol(Mode::WideFloor, read_back.samples(), FrameMode::MultiSync).unwrap();
         assert_eq!(decoded, payload);
     }
 }

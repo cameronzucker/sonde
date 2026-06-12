@@ -5,7 +5,7 @@
 //! carrier-frequency-offset estimation, symbol-timing recovery, and
 //! frame-sync detection.
 
-pub mod preamble;
 pub mod carrier_offset;
-pub mod symbol_timing;
 pub mod frame_sync;
+pub mod preamble;
+pub mod symbol_timing;

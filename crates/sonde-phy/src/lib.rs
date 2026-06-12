@@ -7,16 +7,16 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-pub mod modes;
-pub mod phy_api;
-pub mod audio_io;
 #[cfg(feature = "audio-device")]
 pub mod audio_device;
-pub mod constellations;
-pub mod sync;
-pub mod subcarrier_snr;
-pub mod ofdm_main;
-pub mod robustness_floor;
+pub mod audio_io;
 pub mod coded_modulation;
+pub mod constellations;
 pub mod error;
+pub mod modes;
+pub mod ofdm_main;
+pub mod phy_api;
+pub mod robustness_floor;
+pub mod subcarrier_snr;
+pub mod sync;
 pub use error::PhyError;

@@ -35,11 +35,7 @@ impl<'a> OfdmTransmitter<'a> {
     /// may be zero). A `bits_per_subcarrier` entry of 0 skips a data
     /// sub-carrier entirely (no bits consumed, frequency bin left at
     /// 0+0j).
-    pub fn modulate_one_symbol(
-        &self,
-        payload_bits: &[u8],
-        bits_per_subcarrier: &[u8],
-    ) -> Vec<f32> {
+    pub fn modulate_one_symbol(&self, payload_bits: &[u8], bits_per_subcarrier: &[u8]) -> Vec<f32> {
         let p = self.params;
         let mut freq_bins = vec![Complex::new(0.0_f32, 0.0); p.fft_size()];
 

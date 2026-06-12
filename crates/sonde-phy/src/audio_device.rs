@@ -96,9 +96,7 @@ pub fn list_output_devices() -> Result<Vec<DeviceInfo>, PhyError> {
     let devices = host.output_devices().map_err(audio_err("output_devices"))?;
     let mut out = Vec::new();
     for device in devices {
-        let name = device
-            .name()
-            .map_err(audio_err("device name"))?;
+        let name = device.name().map_err(audio_err("device name"))?;
         let default = device
             .default_output_config()
             .map_err(audio_err("default_output_config"))?;
@@ -164,9 +162,8 @@ impl AudioOutput {
                         break;
                     }
                 }
-                found.ok_or_else(|| {
-                    PhyError::AudioIo(format!("output device not found: {name}"))
-                })?
+                found
+                    .ok_or_else(|| PhyError::AudioIo(format!("output device not found: {name}")))?
             }
         };
 
@@ -280,8 +277,7 @@ impl AudioOutput {
                     let remaining = total.saturating_sub(cursor);
                     let to_copy = out.len().min(remaining);
                     if to_copy > 0 {
-                        out[..to_copy]
-                            .copy_from_slice(&frames[cursor..cursor + to_copy]);
+                        out[..to_copy].copy_from_slice(&frames[cursor..cursor + to_copy]);
                         cursor += to_copy;
                     }
                     // Zero-fill any remainder of this callback's
@@ -447,9 +443,7 @@ impl AudioInput {
                         break;
                     }
                 }
-                found.ok_or_else(|| {
-                    PhyError::AudioIo(format!("input device not found: {name}"))
-                })?
+                found.ok_or_else(|| PhyError::AudioIo(format!("input device not found: {name}")))?
             }
         };
 
@@ -517,9 +511,7 @@ impl AudioInput {
     ) -> Result<(RecordOutcome, AudioBuffer), PhyError> {
         let channels = usize::from(self.config.channels());
         if channels == 0 {
-            return Err(PhyError::AudioIo(
-                "input device reports 0 channels".into(),
-            ));
+            return Err(PhyError::AudioIo("input device reports 0 channels".into()));
         }
         // Shared accumulator the capture callback writes into.
         // Mutex (not std::sync::RwLock or atomic) because CPAL's

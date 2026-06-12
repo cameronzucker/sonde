@@ -60,8 +60,8 @@ impl OfdmParams {
     pub fn for_mode(mode: OfdmModeName) -> Self {
         let (fft_size, bandwidth_hz) = match mode {
             OfdmModeName::Narrow => (1024usize, 500.0f32),
-            OfdmModeName::Mid    => (1024,     1000.0),
-            OfdmModeName::Wide   => (2048,     2300.0),
+            OfdmModeName::Mid => (1024, 1000.0),
+            OfdmModeName::Wide => (2048, 2300.0),
         };
         let cp_len = fft_size / 4;
         let bin_width = SAMPLE_RATE_HZ as f32 / fft_size as f32;
@@ -72,34 +72,42 @@ impl OfdmParams {
         let end_bin = center_bin + half_bins;
         let subcarrier_indices: Vec<usize> = (start_bin..=end_bin).collect();
 
-        let pilot_indices: Vec<usize> = subcarrier_indices
-            .iter()
-            .copied()
-            .step_by(4)
-            .collect();
+        let pilot_indices: Vec<usize> = subcarrier_indices.iter().copied().step_by(4).collect();
 
-        Self { fft_size, cp_len, subcarrier_indices, pilot_indices }
+        Self {
+            fft_size,
+            cp_len,
+            subcarrier_indices,
+            pilot_indices,
+        }
     }
 
     /// FFT size in samples. Always a power of two.
-    pub fn fft_size(&self) -> usize { self.fft_size }
+    pub fn fft_size(&self) -> usize {
+        self.fft_size
+    }
 
     /// Cyclic-prefix length in samples, prepended to each OFDM symbol.
-    pub fn cp_len(&self) -> usize { self.cp_len }
+    pub fn cp_len(&self) -> usize {
+        self.cp_len
+    }
 
     /// All occupied sub-carrier bin indices in ascending order
     /// (data + pilot positions combined).
-    pub fn subcarrier_indices(&self) -> &[usize] { &self.subcarrier_indices }
+    pub fn subcarrier_indices(&self) -> &[usize] {
+        &self.subcarrier_indices
+    }
 
     /// Pilot sub-carrier bin indices (a subset of
     /// [`Self::subcarrier_indices`]).
-    pub fn pilot_indices(&self) -> &[usize] { &self.pilot_indices }
+    pub fn pilot_indices(&self) -> &[usize] {
+        &self.pilot_indices
+    }
 
     /// Data sub-carrier bin indices — the occupied bins that are not
     /// pilots, returned in ascending order.
     pub fn data_indices(&self) -> Vec<usize> {
-        let pilot: std::collections::HashSet<usize> =
-            self.pilot_indices.iter().copied().collect();
+        let pilot: std::collections::HashSet<usize> = self.pilot_indices.iter().copied().collect();
         self.subcarrier_indices
             .iter()
             .copied()

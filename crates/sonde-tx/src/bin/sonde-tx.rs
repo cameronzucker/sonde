@@ -35,12 +35,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use sonde_rig_rts::{LinuxTty, RtsPtt};
 use sonde_phy::audio_device::AudioOutput;
+use sonde_rig_rts::{LinuxTty, RtsPtt};
 
 use sonde_tx::{
-    check_budget, encode_payload, resolve_payload, run_transmission, AbortablePlay,
-    AirtimeBudget, Args, Mode, TxOutcome, DEFAULT_LEAD_IN, DEFAULT_MAX_AIRTIME,
+    check_budget, encode_payload, resolve_payload, run_transmission, AbortablePlay, AirtimeBudget,
+    Args, Mode, TxOutcome, DEFAULT_LEAD_IN, DEFAULT_MAX_AIRTIME,
 };
 
 fn main() -> ExitCode {
@@ -76,8 +76,7 @@ fn main() -> ExitCode {
 
 fn run(args: Args) -> Result<(), String> {
     // ---- common: resolve payload, parse mode, encode ----
-    let payload = resolve_payload(args.payload.as_deref().unwrap())
-        .map_err(|e| e.to_string())?;
+    let payload = resolve_payload(args.payload.as_deref().unwrap()).map_err(|e| e.to_string())?;
     let mode = Mode::parse(args.mode.as_deref().unwrap()).map_err(|e| e.to_string())?;
     let buffer = encode_payload(mode, &payload, args.frame_mode).map_err(|e| e.to_string())?;
 
@@ -97,8 +96,14 @@ fn run(args: Args) -> Result<(), String> {
         buffer.samples().len()
     );
     println!("  lead-in:              {} ms", budget.lead_in.as_millis());
-    println!("  tail-drain:           {} ms", budget.tail_drain.as_millis());
-    println!("  setup slack:          {} ms", budget.setup_slack.as_millis());
+    println!(
+        "  tail-drain:           {} ms",
+        budget.tail_drain.as_millis()
+    );
+    println!(
+        "  setup slack:          {} ms",
+        budget.setup_slack.as_millis()
+    );
     println!(
         "  total airtime budget: {:.3} s  (effective cap: {} s)",
         budget.total().as_secs_f32(),
@@ -146,7 +151,8 @@ fn run(args: Args) -> Result<(), String> {
         return run_via_watchdog(&args, ptt_path, &buffer, &mut audio, &abort, effective);
     }
 
-    let tty = LinuxTty::open(ptt_path).map_err(|e| format!("opening PTT device {ptt_path:?}: {e}"))?;
+    let tty =
+        LinuxTty::open(ptt_path).map_err(|e| format!("opening PTT device {ptt_path:?}: {e}"))?;
     let mut ptt = RtsPtt::new(tty).map_err(|e| format!("initializing PTT: {e}"))?;
 
     println!(
@@ -155,14 +161,8 @@ fn run(args: Args) -> Result<(), String> {
         buffer.duration_seconds(),
     );
 
-    let outcome = run_transmission(
-        &mut ptt,
-        &mut audio,
-        &buffer,
-        DEFAULT_LEAD_IN,
-        &abort,
-    )
-    .map_err(|e| e.to_string())?;
+    let outcome = run_transmission(&mut ptt, &mut audio, &buffer, DEFAULT_LEAD_IN, &abort)
+        .map_err(|e| e.to_string())?;
 
     match outcome {
         TxOutcome::Completed => println!("transmission completed cleanly"),
@@ -251,7 +251,10 @@ fn run_via_watchdog(
             );
             Ok(())
         }
-        Err(e) => Err(format!("playback error: {e} (watchdog exit: {})", status_label(&status))),
+        Err(e) => Err(format!(
+            "playback error: {e} (watchdog exit: {})",
+            status_label(&status)
+        )),
     }
 }
 
@@ -286,9 +289,7 @@ fn install_signal_flag(sig: libc::c_int, flag: Arc<AtomicBool>) -> Result<(), St
     #[allow(unsafe_code)]
     let prev = unsafe { libc::signal(sig, handler as *const () as libc::sighandler_t) };
     if prev == libc::SIG_ERR {
-        let errno = std::io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(0);
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         return Err(format!("signal({sig}) install failed: errno={errno}"));
     }
     Ok(())

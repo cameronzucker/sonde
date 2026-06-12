@@ -206,8 +206,7 @@ impl Decoder {
             // Posterior + hard decision.
             for v in 0..n {
                 let post: f32 = channel[v]
-                    + self
-                        .var_to_checks[v]
+                    + self.var_to_checks[v]
                         .iter()
                         .enumerate()
                         .map(|(j, &c)| msg_c_to_v[c][self.c_edge_pos[v][j]])
@@ -270,8 +269,7 @@ mod tests {
         assert_eq!(outcome.decoded.len(), enc.n());
         for i in 0..enc.k() {
             assert_eq!(
-                outcome.decoded[i],
-                info[i],
+                outcome.decoded[i], info[i],
                 "bit {i} mismatch after zero-noise decode"
             );
         }
@@ -301,8 +299,7 @@ mod tests {
         );
         for i in 0..enc.k() {
             assert_eq!(
-                outcome.decoded[i],
-                info[i],
+                outcome.decoded[i], info[i],
                 "bit {i} mismatch after single-flip recovery"
             );
         }

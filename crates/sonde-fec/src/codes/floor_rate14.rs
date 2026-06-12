@@ -41,7 +41,11 @@ pub fn build() -> ParityCheckMatrix {
 /// producing a duplicate-free row partition.
 fn build_with_seed(seed: u64) -> Option<ParityCheckMatrix> {
     let m = N - K;
-    debug_assert_eq!(N * COL_WEIGHT, m * ROW_WEIGHT, "regular construction balance");
+    debug_assert_eq!(
+        N * COL_WEIGHT,
+        m * ROW_WEIGHT,
+        "regular construction balance"
+    );
 
     let total_edges = m * ROW_WEIGHT;
     debug_assert_eq!(total_edges, N * COL_WEIGHT);

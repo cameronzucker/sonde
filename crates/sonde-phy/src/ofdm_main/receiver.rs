@@ -29,11 +29,7 @@ impl<'a> OfdmReceiver<'a> {
     /// `samples.len()` must equal `params.fft_size() + params.cp_len()`.
     /// `bits_per_subcarrier` follows the same indexing as the
     /// transmitter side.
-    pub fn demodulate_one_symbol(
-        &self,
-        samples: &[f32],
-        bits_per_subcarrier: &[u8],
-    ) -> Vec<f32> {
+    pub fn demodulate_one_symbol(&self, samples: &[f32], bits_per_subcarrier: &[u8]) -> Vec<f32> {
         let p = self.params;
         let expected = p.fft_size() + p.cp_len();
         assert_eq!(samples.len(), expected, "OFDM RX symbol length mismatch");

@@ -22,7 +22,10 @@ impl OfdmEqualizer {
     /// Construct an equalizer for a given pilot-position set and FFT
     /// bin count.
     pub fn new(pilot_positions: Vec<usize>, n_bins: usize) -> Self {
-        Self { pilot_positions, n_bins }
+        Self {
+            pilot_positions,
+            n_bins,
+        }
     }
 
     /// Estimate the channel from pilot bins (which the transmitter

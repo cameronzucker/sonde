@@ -201,7 +201,11 @@ mod tests {
             ptt.assert().unwrap();
         }
         let log = log.borrow();
-        assert_eq!(log.len(), 3, "expected OpenClearBoth + AssertRts + Drop-ReleaseRts, got {log:?}");
+        assert_eq!(
+            log.len(),
+            3,
+            "expected OpenClearBoth + AssertRts + Drop-ReleaseRts, got {log:?}"
+        );
         assert_eq!(log[0], TtyOp::OpenClearBoth);
         assert_eq!(log[1], TtyOp::AssertRts);
         assert_eq!(log[2], TtyOp::ReleaseRts);

@@ -34,9 +34,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use sonde_rig_rts::{
-    run_watchdog, LinuxTty, RtsPtt, WatchdogOutcome, HARD_CAP_DURATION,
-};
+use sonde_rig_rts::{run_watchdog, LinuxTty, RtsPtt, WatchdogOutcome, HARD_CAP_DURATION};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -127,8 +125,7 @@ fn run(parsed: Parsed) -> Result<(), String> {
     // but PR_SET_PDEATHSIG will still fire. Linux-only.
     install_pdeathsig();
 
-    let tty = LinuxTty::open(&device)
-        .map_err(|e| format!("opening PTT device {device:?}: {e}"))?;
+    let tty = LinuxTty::open(&device).map_err(|e| format!("opening PTT device {device:?}: {e}"))?;
     let mut ptt = RtsPtt::new(tty).map_err(|e| format!("initializing PTT: {e}"))?;
 
     // Shared flags. Each watcher thread / handler sets its own.
@@ -206,7 +203,13 @@ fn install_pdeathsig() {
     // single-threaded at this point (no other thread spawned yet).
     #[allow(unsafe_code)]
     unsafe {
-        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong, 0, 0, 0);
+        libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            libc::SIGTERM as libc::c_ulong,
+            0,
+            0,
+            0,
+        );
     }
     // If prctl fails (e.g. kernel without PR_SET_PDEATHSIG support),
     // the stdin-EOF path is the existing fallback. Don't surface the
@@ -248,9 +251,7 @@ fn install_signal_flag(sig: libc::c_int, flag: Arc<AtomicBool>) -> Result<(), St
     #[allow(unsafe_code)]
     let prev = unsafe { libc::signal(sig, handler as *const () as libc::sighandler_t) };
     if prev == libc::SIG_ERR {
-        let errno = std::io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(0);
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         return Err(format!("signal({sig}) install failed: errno={errno}"));
     }
     Ok(())

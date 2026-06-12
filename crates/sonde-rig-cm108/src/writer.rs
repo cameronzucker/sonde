@@ -154,7 +154,10 @@ mod tests {
         ptt.assert().unwrap();
         assert_eq!(ptt.state(), PttState::Asserted);
         assert_eq!(ptt.writer().write_count(), 1);
-        assert_eq!(ptt.writer().last().unwrap().0, [0x00, 0x00, 0x04, 0x04, 0x00]);
+        assert_eq!(
+            ptt.writer().last().unwrap().0,
+            [0x00, 0x00, 0x04, 0x04, 0x00]
+        );
     }
 
     #[test]
@@ -164,7 +167,10 @@ mod tests {
         ptt.release().unwrap();
         assert_eq!(ptt.state(), PttState::Released);
         assert_eq!(ptt.writer().write_count(), 2);
-        assert_eq!(ptt.writer().last().unwrap().0, [0x00, 0x00, 0x00, 0x04, 0x00]);
+        assert_eq!(
+            ptt.writer().last().unwrap().0,
+            [0x00, 0x00, 0x00, 0x04, 0x00]
+        );
     }
 
     #[test]
@@ -220,8 +226,16 @@ mod tests {
 
         let log = log.borrow();
         assert_eq!(log.len(), 2, "expected assert + Drop-release, got {log:?}");
-        assert_eq!(log[0].0, [0x00, 0x00, 0x04, 0x04, 0x00], "first write = assert");
-        assert_eq!(log[1].0, [0x00, 0x00, 0x00, 0x04, 0x00], "second write = Drop-release");
+        assert_eq!(
+            log[0].0,
+            [0x00, 0x00, 0x04, 0x04, 0x00],
+            "first write = assert"
+        );
+        assert_eq!(
+            log[1].0,
+            [0x00, 0x00, 0x00, 0x04, 0x00],
+            "second write = Drop-release"
+        );
     }
 
     #[test]
@@ -248,7 +262,11 @@ mod tests {
             // never assert
         }
 
-        assert!(log.borrow().is_empty(), "Drop emitted spurious write: {:?}", log.borrow());
+        assert!(
+            log.borrow().is_empty(),
+            "Drop emitted spurious write: {:?}",
+            log.borrow()
+        );
     }
 
     #[test]
@@ -274,6 +292,10 @@ mod tests {
             ptt.release().unwrap();
         }
 
-        assert_eq!(log.borrow().len(), 2, "expected exactly assert + explicit-release, not a Drop-release on top");
+        assert_eq!(
+            log.borrow().len(),
+            2,
+            "expected exactly assert + explicit-release, not a Drop-release on top"
+        );
     }
 }

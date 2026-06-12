@@ -86,7 +86,9 @@ fn build_with_seed(block_n: BlockN, rate: WifiLdpcRate, seed_base: u64) -> Parit
     // columns cause decoder convergence problems). Repair by adding
     // shifts in random rows where this is violated.
     for c in 0..n_blocks {
-        let weight = (0..m_blocks).filter(|&r| block_shifts[r][c].is_some()).count();
+        let weight = (0..m_blocks)
+            .filter(|&r| block_shifts[r][c].is_some())
+            .count();
         for _ in weight..2 {
             for _try in 0..16 {
                 let r = rng.gen_range(0..m_blocks);

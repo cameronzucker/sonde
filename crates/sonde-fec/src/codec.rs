@@ -153,8 +153,7 @@ impl FecCodec for OfdmAdaptiveCodec {
         let outcome = self.decoder.decode(&deint_llrs, MAX_ITERS_OFDM);
 
         // First ldpc_k bits of the decoded codeword are info+CRC.
-        let info_plus_crc: BitVec<u8> =
-            outcome.decoded[..self.ldpc_k].iter().copied().collect();
+        let info_plus_crc: BitVec<u8> = outcome.decoded[..self.ldpc_k].iter().copied().collect();
         verify_crc32(info_plus_crc.as_bitslice()).map_err(|e| {
             FecError::DecodeFailure(format!(
                 "CRC mismatch after {} iterations: {e}",
@@ -211,7 +210,9 @@ mod tests {
         let mut state = seed;
         (0..n)
             .map(|_| {
-                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
                 ((state >> 33) & 1) as u8
             })
             .collect()

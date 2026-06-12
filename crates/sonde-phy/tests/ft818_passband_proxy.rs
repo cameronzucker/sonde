@@ -34,15 +34,9 @@ fn wide_mode_survives_300_2700_hz_brickwall() {
     let filtered = &filtered[..samples.len()];
     let rx = OfdmReceiver::new(&params);
     let llrs = rx.demodulate_one_symbol(filtered, &bits_per_sc);
-    let recovered: Vec<u8> = llrs
-        .iter()
-        .map(|l| if *l >= 0.0 { 0 } else { 1 })
-        .collect();
+    let recovered: Vec<u8> = llrs.iter().map(|l| if *l >= 0.0 { 0 } else { 1 }).collect();
     let ber = bit_error_rate(&recovered, &payload_bits);
-    assert!(
-        ber < 0.05,
-        "BER {ber} too high under FT-818 passband proxy"
-    );
+    assert!(ber < 0.05, "BER {ber} too high under FT-818 passband proxy");
 }
 
 fn brickwall_filter(samples: &[f32], sr_hz: f32, lo_hz: f32, hi_hz: f32) -> Vec<f32> {
@@ -67,7 +61,10 @@ fn brickwall_filter(samples: &[f32], sr_hz: f32, lo_hz: f32, hi_hz: f32) -> Vec<
     }
     ifft.process(&mut buf);
     let scale = 1.0 / n as f32;
-    buf.iter().take(samples.len()).map(|c| c.re * scale).collect()
+    buf.iter()
+        .take(samples.len())
+        .map(|c| c.re * scale)
+        .collect()
 }
 
 fn bit_error_rate(a: &[u8], b: &[u8]) -> f32 {

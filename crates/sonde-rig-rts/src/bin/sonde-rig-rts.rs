@@ -168,9 +168,7 @@ fn assert_with_signal_handling(
     install_signal_flag(libc::SIGTERM, Arc::clone(&signaled))?;
 
     ptt.assert().map_err(CliError::Rts)?;
-    println!(
-        "asserted RTS on {device} — auto-release in {secs}s or on SIGINT/SIGTERM",
-    );
+    println!("asserted RTS on {device} — auto-release in {secs}s or on SIGINT/SIGTERM",);
 
     let deadline = Instant::now() + Duration::from_secs(secs);
     let poll = Duration::from_millis(50);
@@ -345,8 +343,7 @@ mod tests {
 
     #[test]
     fn parse_rejects_non_numeric_duration() {
-        let err = parse_args(&s(&["assert", "-d", "/dev/x", "--duration", "forever"]))
-            .unwrap_err();
+        let err = parse_args(&s(&["assert", "-d", "/dev/x", "--duration", "forever"])).unwrap_err();
         assert!(err.contains("--duration"));
     }
 }

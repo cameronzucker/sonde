@@ -56,7 +56,7 @@ mod tests {
         // Box-plus of two same-sign LLRs is same-sign.
         assert!(boxplus(2.0, 3.0) > 0.0);
         assert!(boxplus(-2.0, -3.0) > 0.0); // (-)(-) = +
-        // Mixed-sign → negative.
+                                            // Mixed-sign → negative.
         assert!(boxplus(2.0, -3.0) < 0.0);
     }
 }

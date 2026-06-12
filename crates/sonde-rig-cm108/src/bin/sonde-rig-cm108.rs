@@ -380,8 +380,7 @@ mod tests {
 
     #[test]
     fn parse_rejects_non_numeric_duration() {
-        let err = parse_args(&s(&["assert", "-d", "/dev/x", "--duration", "forever"]))
-            .unwrap_err();
+        let err = parse_args(&s(&["assert", "-d", "/dev/x", "--duration", "forever"])).unwrap_err();
         assert!(err.contains("--duration"));
     }
 

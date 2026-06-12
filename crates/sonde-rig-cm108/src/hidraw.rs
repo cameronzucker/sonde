@@ -52,7 +52,10 @@ impl HidrawWriter {
                 path: path_str.clone(),
                 source,
             })?;
-        Ok(Self { file, path: path_str })
+        Ok(Self {
+            file,
+            path: path_str,
+        })
     }
 
     /// The path this writer was opened with (for diagnostics).
@@ -64,10 +67,7 @@ impl HidrawWriter {
 impl HidWriter for HidrawWriter {
     fn write_report(&mut self, report: &Cm108Report) -> Cm108Result<()> {
         let bytes = report.as_bytes();
-        let wrote = self
-            .file
-            .write(bytes)
-            .map_err(Cm108Error::WriteReport)?;
+        let wrote = self.file.write(bytes).map_err(Cm108Error::WriteReport)?;
         if wrote != REPORT_SIZE {
             return Err(Cm108Error::ShortWrite {
                 wrote,

@@ -13,10 +13,10 @@ use crate::error::PhyError;
 use num_complex::Complex;
 use rustfft::FftPlanner;
 
-const M: usize = 8;                      // 8-FSK ⇒ 3 bits/symbol
-const TONE_SPACING_HZ: f32 = 50.0;       // spacing between tones
-const SYMBOL_DURATION_SEC: f32 = 0.16;   // FT8-class baud as design primitive
-const CENTER_FREQ_HZ: f32 = 1500.0;      // middle of audio band
+const M: usize = 8; // 8-FSK ⇒ 3 bits/symbol
+const TONE_SPACING_HZ: f32 = 50.0; // spacing between tones
+const SYMBOL_DURATION_SEC: f32 = 0.16; // FT8-class baud as design primitive
+const CENTER_FREQ_HZ: f32 = 1500.0; // middle of audio band
 
 /// 8-FSK noncoherent floor mode for crowded-band slots. Three bits
 /// per symbol, 50 Hz tone spacing, 0.16 s symbol duration, centered
@@ -86,8 +86,7 @@ impl NarrowFskFloor {
 
         let mut bits = Vec::with_capacity(n_symbols * 3);
         for sym_idx in 0..n_symbols {
-            let mut buf: Vec<Complex<f32>> = samples
-                [sym_idx * sps..sym_idx * sps + sps]
+            let mut buf: Vec<Complex<f32>> = samples[sym_idx * sps..sym_idx * sps + sps]
                 .iter()
                 .map(|s| Complex::new(*s, 0.0))
                 .collect();

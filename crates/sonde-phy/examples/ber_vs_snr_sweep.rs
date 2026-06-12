@@ -41,7 +41,9 @@ fn awgn_channel(signal: &[f32], snr_db: f32, seed: u64) -> Vec<f32> {
     let std = noise_var.sqrt();
     let mut state = seed;
     let mut next = move || -> f32 {
-        state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         let r = (state >> 11) as f32 / (1u64 << 53) as f32;
         // Box-Muller would be better; this is a quick uniform for the
         // characterization stub.
@@ -56,7 +58,11 @@ fn sweep_ofdm(params: &OfdmParams, bits_per_sc: &[u8], snr_db: f32) -> f32 {
     let n_data_bits: usize = bits_per_sc
         .iter()
         .enumerate()
-        .filter(|(i, _)| !params.pilot_indices().contains(&params.subcarrier_indices()[*i]))
+        .filter(|(i, _)| {
+            !params
+                .pilot_indices()
+                .contains(&params.subcarrier_indices()[*i])
+        })
         .map(|(_, b)| *b as usize)
         .sum();
     let mut errors = 0usize;
@@ -66,10 +72,7 @@ fn sweep_ofdm(params: &OfdmParams, bits_per_sc: &[u8], snr_db: f32) -> f32 {
         let samples = tx.modulate_one_symbol(&payload_bits, bits_per_sc);
         let impaired = awgn_channel(&samples, snr_db, trial as u64);
         let llrs = rx.demodulate_one_symbol(&impaired, bits_per_sc);
-        let recovered: Vec<u8> = llrs
-            .iter()
-            .map(|l| if *l >= 0.0 { 0 } else { 1 })
-            .collect();
+        let recovered: Vec<u8> = llrs.iter().map(|l| if *l >= 0.0 { 0 } else { 1 }).collect();
         for (a, b) in recovered.iter().zip(payload_bits.iter()) {
             if a != b {
                 errors += 1;

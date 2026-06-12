@@ -45,7 +45,9 @@ fn awgn(signal: &[f32], snr_db: f32, seed: u64) -> Vec<f32> {
     let std = (pwr / snr_lin.max(1e-9)).sqrt();
     let mut state = seed;
     let mut next = move || -> f32 {
-        state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         let r = (state >> 11) as f32 / (1u64 << 53) as f32;
         (r - 0.5) * 2.0 * std * (3.0_f32).sqrt()
     };

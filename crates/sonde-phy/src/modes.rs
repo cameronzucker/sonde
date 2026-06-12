@@ -70,12 +70,27 @@ impl Default for ModeTable {
                 // pins in Phase 7. Three modes is a starting point per
                 // PHY spec §3.Q1 ("ARDOP uses 4; sonde may use fewer
                 // or more"); empirical channel-sim sweep settles count.
-                ModeDescriptor { short_name: "ofdm-narrow", family: ModeFamily::OfdmMain },
-                ModeDescriptor { short_name: "ofdm-mid",    family: ModeFamily::OfdmMain },
-                ModeDescriptor { short_name: "ofdm-wide",   family: ModeFamily::OfdmMain },
+                ModeDescriptor {
+                    short_name: "ofdm-narrow",
+                    family: ModeFamily::OfdmMain,
+                },
+                ModeDescriptor {
+                    short_name: "ofdm-mid",
+                    family: ModeFamily::OfdmMain,
+                },
+                ModeDescriptor {
+                    short_name: "ofdm-wide",
+                    family: ModeFamily::OfdmMain,
+                },
                 // Floor family — default + situational
-                ModeDescriptor { short_name: "floor-wblo",  family: ModeFamily::RobustnessFloor },
-                ModeDescriptor { short_name: "floor-nfsk",  family: ModeFamily::RobustnessFloor },
+                ModeDescriptor {
+                    short_name: "floor-wblo",
+                    family: ModeFamily::RobustnessFloor,
+                },
+                ModeDescriptor {
+                    short_name: "floor-nfsk",
+                    family: ModeFamily::RobustnessFloor,
+                },
             ],
         }
     }

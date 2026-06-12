@@ -174,10 +174,7 @@ impl WidebandLowDensityFloor {
         let bits_per_sc = self.bits_per_subcarrier();
         let rx = OfdmReceiver::new(&self.params);
         let llrs = rx.demodulate_one_symbol(samples, &bits_per_sc);
-        let bits: Vec<u8> = llrs
-            .iter()
-            .map(|l| if *l >= 0.0 { 0 } else { 1 })
-            .collect();
+        let bits: Vec<u8> = llrs.iter().map(|l| if *l >= 0.0 { 0 } else { 1 }).collect();
         let mut bytes = Vec::with_capacity(bits.len() / 8);
         for chunk in bits.chunks(8) {
             if chunk.len() < 8 {
@@ -267,10 +264,7 @@ impl WidebandLowDensityFloor {
     /// - the multi-symbol body after the preamble is truncated (the
     ///   declared-length header from the first symbol implies more
     ///   samples than the input provides).
-    pub fn receive_multi_with_sync(
-        &self,
-        samples: &[f32],
-    ) -> Result<(usize, Vec<u8>), PhyError> {
+    pub fn receive_multi_with_sync(&self, samples: &[f32]) -> Result<(usize, Vec<u8>), PhyError> {
         let detector = PreambleDetector::new();
         let detection = detector.scan(samples).ok_or_else(|| {
             PhyError::FrameDetect(
@@ -392,8 +386,7 @@ mod tests {
         // Allow ±1 sample tolerance for the detector's correlation
         // peak location — the threshold-based scan picks the exact
         // peak sample, but small offsets are acceptable.
-        let offset_err =
-            (start as i64 - leading_silence.len() as i64).unsigned_abs() as usize;
+        let offset_err = (start as i64 - leading_silence.len() as i64).unsigned_abs() as usize;
         assert!(
             offset_err <= 2,
             "detected start {} should be within ±2 of leading silence {} samples",
@@ -523,7 +516,8 @@ mod tests {
         let samples = floor.transmit_multi(payload).unwrap();
         let decoded = floor.receive_multi(&samples).unwrap();
         assert_eq!(
-            decoded, payload,
+            decoded,
+            payload,
             "roundtrip failed for {}-byte payload",
             payload.len()
         );
@@ -687,7 +681,8 @@ mod tests {
         let (start, decoded) = floor.receive_multi_with_sync(&samples).unwrap();
         assert_eq!(start, 0, "preamble should start at sample 0");
         assert_eq!(
-            decoded, payload,
+            decoded,
+            payload,
             "multi+preamble roundtrip failed for {}-byte payload",
             payload.len()
         );
@@ -747,8 +742,7 @@ mod tests {
         let mut samples = leading_silence.clone();
         samples.extend_from_slice(&core);
         let (start, decoded) = floor.receive_multi_with_sync(&samples).unwrap();
-        let offset_err =
-            (start as i64 - leading_silence.len() as i64).unsigned_abs() as usize;
+        let offset_err = (start as i64 - leading_silence.len() as i64).unsigned_abs() as usize;
         assert!(
             offset_err <= 2,
             "detected start {start} should be within ±2 of leading silence {} samples",

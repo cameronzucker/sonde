@@ -13,8 +13,8 @@
 //! Trimode / Pat / wl2k-go internals ([ADR
 //! 0014](../../../docs/adr/0014-clean-sheet-no-prior-art-examination.md)).
 
-pub mod ofdm_params;
-pub mod transmitter;
-pub mod receiver;
 pub mod bit_loader;
 pub mod equalizer;
+pub mod ofdm_params;
+pub mod receiver;
+pub mod transmitter;

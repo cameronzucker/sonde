@@ -39,6 +39,9 @@ fn qam_constellations_are_unit_average_energy() {
         }
         let syms = mapper.map(&bits);
         let energy: f32 = syms.iter().map(|s| s.norm_sqr()).sum::<f32>() / syms.len() as f32;
-        assert!((energy - 1.0).abs() < 0.05, "{c:?} energy = {energy}, want ~1.0");
+        assert!(
+            (energy - 1.0).abs() < 0.05,
+            "{c:?} energy = {energy}, want ~1.0"
+        );
     }
 }

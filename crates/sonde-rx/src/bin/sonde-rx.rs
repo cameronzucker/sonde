@@ -12,8 +12,8 @@ use std::time::Duration;
 use sonde_phy::audio_device::{list_input_devices, AudioInput, RecordOutcome};
 
 use sonde_rx::{
-    compute_ber, decode_one_symbol_with_offset, read_wav, record_to_wav, resolve_expected,
-    Args, FrameMode, Mode,
+    compute_ber, decode_one_symbol_with_offset, read_wav, record_to_wav, resolve_expected, Args,
+    FrameMode, Mode,
 };
 
 fn main() -> ExitCode {
@@ -113,9 +113,8 @@ fn run_decode_wav(
         needed,
         frame_mode.short_name(),
     );
-    let (start, decoded) =
-        decode_one_symbol_with_offset(mode, buffer.samples(), frame_mode)
-            .map_err(|e| e.to_string())?;
+    let (start, decoded) = decode_one_symbol_with_offset(mode, buffer.samples(), frame_mode)
+        .map_err(|e| e.to_string())?;
     if let Some(s) = start {
         println!("  preamble detected at sample {s}");
     }
@@ -152,17 +151,11 @@ fn run_decode_wav(
     Ok(())
 }
 
-fn run_record_wav(
-    path: &std::path::Path,
-    device: &str,
-    duration: Duration,
-) -> Result<(), String> {
+fn run_record_wav(path: &std::path::Path, device: &str, duration: Duration) -> Result<(), String> {
     let mut input = AudioInput::open(Some(device))
         .map_err(|e| format!("opening input device {device:?}: {e}"))?;
     let channels = input.channels();
-    let resolved = input
-        .device_name()
-        .unwrap_or_else(|_| device.to_string());
+    let resolved = input.device_name().unwrap_or_else(|_| device.to_string());
 
     let abort = Arc::new(AtomicBool::new(false));
     install_signal_flag(libc::SIGINT, Arc::clone(&abort))?;
@@ -210,9 +203,7 @@ fn install_signal_flag(sig: libc::c_int, flag: Arc<AtomicBool>) -> Result<(), St
     #[allow(unsafe_code)]
     let prev = unsafe { libc::signal(sig, handler as *const () as libc::sighandler_t) };
     if prev == libc::SIG_ERR {
-        let errno = std::io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(0);
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         return Err(format!("signal({sig}) install failed: errno={errno}"));
     }
     Ok(())

@@ -43,12 +43,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
-use thiserror::Error;
-use sonde_rig_rts::{Ptt, PttState};
 use sonde_phy::audio_device::PlayOutcome;
 use sonde_phy::audio_io::AudioBuffer;
 use sonde_phy::error::PhyError;
 use sonde_phy::robustness_floor::wideband_lowdensity::WidebandLowDensityFloor;
+use sonde_rig_rts::{Ptt, PttState};
+use thiserror::Error;
 
 // ─── Constants ──────────────────────────────────────────────────────
 
@@ -205,9 +205,7 @@ pub fn encode_payload(
 ) -> Result<AudioBuffer, TxError> {
     let floor = WidebandLowDensityFloor::new();
     let samples = match (mode, frame_mode) {
-        (Mode::WideFloor, FrameMode::Raw) => {
-            floor.transmit(payload).map_err(TxError::Phy)?
-        }
+        (Mode::WideFloor, FrameMode::Raw) => floor.transmit(payload).map_err(TxError::Phy)?,
         (Mode::WideFloor, FrameMode::Sync) => floor
             .transmit_with_preamble(payload)
             .map_err(TxError::Phy)?,
@@ -573,26 +571,19 @@ impl Args {
             return Err("missing --payload <text|@file>".to_string());
         }
         if self.dry_run && self.write_wav.is_some() {
-            return Err(
-                "--dry-run and --write-wav are mutually exclusive — pick one"
-                    .to_string(),
-            );
+            return Err("--dry-run and --write-wav are mutually exclusive — pick one".to_string());
         }
         if !self.dry_run && self.write_wav.is_none() {
             // Full-TX mode: device + ptt-device required.
             if self.device.is_none() {
-                return Err(
-                    "missing --device <name> (required for full TX; use \
+                return Err("missing --device <name> (required for full TX; use \
                      --dry-run or --write-wav for hardware-free runs)"
-                        .to_string(),
-                );
+                    .to_string());
             }
             if self.ptt_device.is_none() {
-                return Err(
-                    "missing --ptt-device <path> (required for full TX; \
+                return Err("missing --ptt-device <path> (required for full TX; \
                      e.g. /dev/digirig)"
-                        .to_string(),
-                );
+                    .to_string());
             }
         }
         Ok(())
@@ -604,9 +595,9 @@ impl Args {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sonde_rig_rts::{MockTtyWriter, RtsPtt, TtyOp};
     use std::sync::atomic::Ordering;
     use std::sync::Mutex;
-    use sonde_rig_rts::{MockTtyWriter, RtsPtt, TtyOp};
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -684,7 +675,10 @@ mod tests {
         // (per wideband_lowdensity.rs docstring). 64 bytes is well
         // over.
         let err = encode_payload(Mode::WideFloor, &[0u8; 64], FrameMode::Raw).unwrap_err();
-        assert!(matches!(err, TxError::Phy(PhyError::PayloadTooLarge { .. })));
+        assert!(matches!(
+            err,
+            TxError::Phy(PhyError::PayloadTooLarge { .. })
+        ));
     }
 
     // ─── AirtimeBudget ──────────────────────────────────────────────
@@ -775,7 +769,14 @@ mod tests {
 
     #[test]
     fn args_parse_dry_run_minimal() {
-        let a = Args::parse(&s(&["--dry-run", "--mode", "wide-floor", "--payload", "hi"])).unwrap();
+        let a = Args::parse(&s(&[
+            "--dry-run",
+            "--mode",
+            "wide-floor",
+            "--payload",
+            "hi",
+        ]))
+        .unwrap();
         assert!(a.dry_run);
         assert_eq!(a.mode.as_deref(), Some("wide-floor"));
         assert_eq!(a.payload.as_deref(), Some("hi"));
@@ -794,7 +795,13 @@ mod tests {
     #[test]
     fn args_parse_full_run_with_all_required_validates() {
         let a = Args::parse(&s(&[
-            "--mode", "wide-floor", "--payload", "hi", "--device", "USB Audio", "--ptt-device",
+            "--mode",
+            "wide-floor",
+            "--payload",
+            "hi",
+            "--device",
+            "USB Audio",
+            "--ptt-device",
             "/dev/digirig",
         ]))
         .unwrap();
@@ -825,7 +832,14 @@ mod tests {
     #[test]
     fn args_parse_short_flags_d_and_p() {
         let a = Args::parse(&s(&[
-            "--mode", "wide-floor", "--payload", "hi", "-d", "USB Audio", "-p", "/dev/digirig",
+            "--mode",
+            "wide-floor",
+            "--payload",
+            "hi",
+            "-d",
+            "USB Audio",
+            "-p",
+            "/dev/digirig",
         ]))
         .unwrap();
         assert_eq!(a.device.as_deref(), Some("USB Audio"));
@@ -862,7 +876,12 @@ mod tests {
     #[test]
     fn args_parse_write_wav_with_path() {
         let a = Args::parse(&s(&[
-            "--write-wav", "/tmp/foo.wav", "--mode", "wide-floor", "--payload", "TEST",
+            "--write-wav",
+            "/tmp/foo.wav",
+            "--mode",
+            "wide-floor",
+            "--payload",
+            "TEST",
         ]))
         .unwrap();
         assert_eq!(
@@ -884,7 +903,12 @@ mod tests {
         // --dry-run, so neither --device nor --ptt-device should be
         // required when --write-wav is set.
         let a = Args::parse(&s(&[
-            "--write-wav", "/tmp/x.wav", "--mode", "wide-floor", "--payload", "hi",
+            "--write-wav",
+            "/tmp/x.wav",
+            "--mode",
+            "wide-floor",
+            "--payload",
+            "hi",
         ]))
         .unwrap();
         a.validate().unwrap();
@@ -895,8 +919,13 @@ mod tests {
     #[test]
     fn args_parse_dry_run_and_write_wav_are_mutually_exclusive() {
         let a = Args::parse(&s(&[
-            "--dry-run", "--write-wav", "/tmp/x.wav", "--mode", "wide-floor",
-            "--payload", "hi",
+            "--dry-run",
+            "--write-wav",
+            "/tmp/x.wav",
+            "--mode",
+            "wide-floor",
+            "--payload",
+            "hi",
         ]))
         .unwrap();
         let err = a.validate().unwrap_err();
@@ -1228,7 +1257,13 @@ mod tests {
     #[test]
     fn args_parse_frame_mode_sync() {
         let a = Args::parse(&s(&[
-            "--frame-mode", "sync", "--mode", "wide-floor", "--dry-run", "--payload", "hi",
+            "--frame-mode",
+            "sync",
+            "--mode",
+            "wide-floor",
+            "--dry-run",
+            "--payload",
+            "hi",
         ]))
         .unwrap();
         assert_eq!(a.frame_mode, FrameMode::Sync);
@@ -1237,7 +1272,11 @@ mod tests {
     #[test]
     fn args_parse_frame_mode_default_is_raw_when_omitted() {
         let a = Args::parse(&s(&[
-            "--mode", "wide-floor", "--dry-run", "--payload", "hi",
+            "--mode",
+            "wide-floor",
+            "--dry-run",
+            "--payload",
+            "hi",
         ]))
         .unwrap();
         assert_eq!(a.frame_mode, FrameMode::Raw);
@@ -1259,7 +1298,10 @@ mod tests {
 
     #[test]
     fn frame_mode_parse_accepts_multi_sync() {
-        assert_eq!(FrameMode::parse("multi-sync").unwrap(), FrameMode::MultiSync);
+        assert_eq!(
+            FrameMode::parse("multi-sync").unwrap(),
+            FrameMode::MultiSync
+        );
     }
 
     #[test]
@@ -1300,8 +1342,13 @@ mod tests {
     #[test]
     fn args_parse_frame_mode_multi_sync() {
         let a = Args::parse(&s(&[
-            "--frame-mode", "multi-sync", "--mode", "wide-floor", "--dry-run",
-            "--payload", "hi",
+            "--frame-mode",
+            "multi-sync",
+            "--mode",
+            "wide-floor",
+            "--dry-run",
+            "--payload",
+            "hi",
         ]))
         .unwrap();
         assert_eq!(a.frame_mode, FrameMode::MultiSync);
@@ -1312,7 +1359,11 @@ mod tests {
     #[test]
     fn args_parse_watchdog_flag_default_false() {
         let a = Args::parse(&s(&[
-            "--mode", "wide-floor", "--dry-run", "--payload", "hi",
+            "--mode",
+            "wide-floor",
+            "--dry-run",
+            "--payload",
+            "hi",
         ]))
         .unwrap();
         assert!(!a.watchdog);
@@ -1322,7 +1373,12 @@ mod tests {
     #[test]
     fn args_parse_watchdog_flag_set() {
         let a = Args::parse(&s(&[
-            "--watchdog", "--mode", "wide-floor", "--dry-run", "--payload", "hi",
+            "--watchdog",
+            "--mode",
+            "wide-floor",
+            "--dry-run",
+            "--payload",
+            "hi",
         ]))
         .unwrap();
         assert!(a.watchdog);
@@ -1331,8 +1387,14 @@ mod tests {
     #[test]
     fn args_parse_watchdog_bin_with_path() {
         let a = Args::parse(&s(&[
-            "--watchdog", "--watchdog-bin", "/usr/local/bin/sonde-rig-watchdog",
-            "--mode", "wide-floor", "--dry-run", "--payload", "hi",
+            "--watchdog",
+            "--watchdog-bin",
+            "/usr/local/bin/sonde-rig-watchdog",
+            "--mode",
+            "wide-floor",
+            "--dry-run",
+            "--payload",
+            "hi",
         ]))
         .unwrap();
         assert!(a.watchdog);

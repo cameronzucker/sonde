@@ -6,7 +6,9 @@ fn null_phy_round_trips_a_payload_through_loopback() {
     let mut phy = NullPhy::new();
     let payload = b"hello sonde";
     let _token = phy.send_frame(payload, ModeHint::MainAuto).expect("tx");
-    let rx = phy.poll_rx().expect("rx should be available immediately on null phy");
+    let rx = phy
+        .poll_rx()
+        .expect("rx should be available immediately on null phy");
     assert_eq!(rx.payload(), payload);
     assert!(rx.decode_ok());
 }
