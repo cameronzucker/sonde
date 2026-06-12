@@ -18,6 +18,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # sonde-phy pulls in `cpal` (default-off, but activated by --all-targets
+      # for the audio bins/tests), and cpal -> alsa-sys needs the ALSA dev
+      # headers + pkg-config at build time on Linux. Without this the clippy/
+      # test steps fail in alsa-sys's build script ("Package alsa was not found").
+      - name: Install ALSA dev libraries
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
