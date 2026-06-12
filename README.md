@@ -1,4 +1,4 @@
-# tuxmodem
+# sonde
 
 Clean-sheet HF data modem; AGPLv3-only.
 
@@ -9,7 +9,7 @@ tuxlink repo. Subsystem-level intent is documented at:
 - `docs/superpowers/specs/2026-05-31-clean-sheet-modem-3-phy-waveform.md`
 - `docs/superpowers/specs/2026-05-31-clean-sheet-modem-4-fec.md`
 
-This workspace currently houses `crates/tuxmodem-phy/` (subsystem #3).
+This workspace currently houses `crates/sonde-phy/` (subsystem #3).
 FEC (#4) ships as a sibling crate. Channel simulator (#1) is an external
 AGPLv3 crate consumed as a dependency.
 

@@ -1,12 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/tuxmodem-fec",
-    "crates/tuxmodem-phy",
-    "crates/tux-rig-cm108",
-    "crates/tux-rig-rts",
-    "crates/tuxmodem-tx",
-    "crates/tuxmodem-rx",
+    "crates/sonde-fec",
+    "crates/sonde-phy",
+    "crates/sonde-rig-cm108",
+    "crates/sonde-rig-rts",
+    "crates/sonde-tx",
+    "crates/sonde-rx",
+    "hf-channel-sim",
 ]
 
 [workspace.package]
@@ -23,10 +24,10 @@ thiserror = "1"
 # Subsystem #1: path-dep until #1 publishes to crates.io as `hf-channel-sim` v0.1.
 # Once published, replace `path = ...` with `version = "0.1"`. Member crates
 # opt-in via `hf-channel-sim.workspace = true` under [dev-dependencies].
-hf-channel-sim = { path = "../hf-channel-sim" }
-tuxmodem-fec = { path = "crates/tuxmodem-fec" }
-tuxmodem-phy = { path = "crates/tuxmodem-phy" }
-tux-rig-rts = { path = "crates/tux-rig-rts" }
+hf-channel-sim = { path = "hf-channel-sim" }
+sonde-fec = { path = "crates/sonde-fec" }
+sonde-phy = { path = "crates/sonde-phy" }
+sonde-rig-rts = { path = "crates/sonde-rig-rts" }
 bitvec = "1"
 crc = "3"
 rand = "0.8"
