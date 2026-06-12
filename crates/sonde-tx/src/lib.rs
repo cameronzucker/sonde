@@ -666,7 +666,10 @@ mod tests {
     #[test]
     fn encode_payload_wide_floor_returns_nonzero_buffer() {
         let buf = encode_payload(Mode::WideFloor, b"hi", FrameMode::Raw).unwrap();
-        assert!(buf.samples().len() > 0, "encoder should emit some samples");
+        assert!(
+            !buf.samples().is_empty(),
+            "encoder should emit some samples"
+        );
     }
 
     #[test]
