@@ -150,27 +150,23 @@ fi
 
 # --- Risky-op detection ---
 # Narrow set. Read-only ops (status, diff, log, fetch, show, push) are NOT
-# governed by this hook.
+# governed by this hook. Patterns allow git GLOBAL options between `git` and the
+# subcommand — `-C` / `-c` / `--git-dir` / `--work-tree` can RETARGET the repo —
+# so `git -C <path> commit` and friends are not missed (sonde-ge9.1). Detection
+# is intentionally broad (matching verb text in a message body just means extra
+# lease-checking, which is fail-safe here).
+GLOBALS='((-C|-c)[[:space:]]+[^[:space:]]+[[:space:]]+|--git-dir([[:space:]]+|=)[^[:space:]]+[[:space:]]+|--work-tree([[:space:]]+|=)[^[:space:]]+[[:space:]]+)*'
 matched=false
-for pattern in \
-    '\bgit[[:space:]]+switch\b' \
-    '\bgit[[:space:]]+commit\b' \
-    '\bgit[[:space:]]+merge\b' \
-    '\bgit[[:space:]]+rebase\b' \
-    '\bgit[[:space:]]+pull\b' \
-    '\bgit[[:space:]]+reset\b' \
-    '\bgit[[:space:]]+add\b' \
-    '\bgit[[:space:]]+cherry-pick\b' \
-    '\bgit[[:space:]]+revert\b'; do
-    if printf '%s' "$cmd" | grep -qE "$pattern"; then
+for verb in switch commit merge rebase pull reset add cherry-pick revert; do
+    if printf '%s' "$cmd" | grep -qE "\\bgit[[:space:]]+${GLOBALS}${verb}\\b"; then
         matched=true
         break
     fi
 done
 
 # `git checkout` is risky EXCEPT for the read-only forms.
-if ! $matched && printf '%s' "$cmd" | grep -qE '\bgit[[:space:]]+checkout\b'; then
-    if ! printf '%s' "$cmd" | grep -qE '\bgit[[:space:]]+checkout[[:space:]]+(--show-current|-l|--detach)\b'; then
+if ! $matched && printf '%s' "$cmd" | grep -qE "\\bgit[[:space:]]+${GLOBALS}checkout\\b"; then
+    if ! printf '%s' "$cmd" | grep -qE "\\bgit[[:space:]]+${GLOBALS}checkout[[:space:]]+(--show-current|-l|--detach)\\b"; then
         matched=true
     fi
 fi
