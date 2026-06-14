@@ -7,7 +7,9 @@
 
 ## One-line state
 
-Phase A (a working rate-1/4 LDPC floor codec) is **done, tested, pushed**. Phases B and C (wiring it into the PHY floor + pipelines + the differential channel-sim gate) are **not started**. **Do NOT merge to main until the Task C3 differential gate passes** — `FloorRate14Codec` exists but is not yet wired, so merging now would land an island.
+**UPDATE (end of session): the ENTIRE slice (Phases A, B, C) is complete.** All 9 tasks landed; the FEC is wired end-to-end through `sonde-tx`/`sonde-rx`; the C3 differential channel-sim gate passes (rate-1/4 LDPC decodes an AWGN capture the no-FEC baseline cannot, including via the operational `encode_payload → decode_one_symbol` pipeline). Full workspace green: 340 tests, `clippy --workspace --all-targets` clean, `fmt --all --check` clean. Ready for PR/merge. The section below is the Phase-A-only checkpoint, retained for history.
+
+---
 
 ## What this slice is
 
