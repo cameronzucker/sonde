@@ -29,7 +29,7 @@ internals. Conceptual primitives are drawn from open foundations documented in
 **Coming soon:** `crates/sonde-phy-runtime` — the `SondePhy` `PhyTransport`
 adapter — tracked under bd epic `sonde-gmc`, with the implementation plan at
 [`docs/superpowers/plans/2026-06-14-sonde-phy-runtime-adapter.md`](docs/superpowers/plans/2026-06-14-sonde-phy-runtime-adapter.md)
-and architecture in [ADR 0003](docs/adr/0003-sondephy-runtime-adapter-architecture.md).
+and architecture in [ADR 0003](docs/adr/0003-sonde-phy-runtime-adapter.md).
 
 ### Commands
 

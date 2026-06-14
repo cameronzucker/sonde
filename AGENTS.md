@@ -14,7 +14,7 @@ program overview. Crates: `sonde-phy` (PHY waveform), `sonde-fec` (LDPC FEC),
 `sonde-rx`, `sonde-tx` (**keys a real radio**), `sonde-rig-rts` (serial-RTS PTT),
 `sonde-rig-cm108` (USB-HID PTT), plus the vendored `hf-channel-sim`. Coming soon:
 `crates/sonde-phy-runtime` (the `SondePhy` `PhyTransport` adapter; bd epic
-`sonde-gmc`; [ADR 0003](docs/adr/0003-sondephy-runtime-adapter-architecture.md)).
+`sonde-gmc`; [ADR 0003](docs/adr/0003-sonde-phy-runtime-adapter.md)).
 See [CLAUDE.md](CLAUDE.md#project-framing) for the full crate table.
 
 ## Commands
