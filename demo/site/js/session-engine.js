@@ -65,6 +65,8 @@ export function runSession(params, handlers = {}) {
     progress: (ev) => call("onProgress", ev),
     mode: (ev) => call("onMode", ev),
     delivered: (ev) => call("onDelivered", ev),
+    // Live on-air audio: base64 S16LE PCM, decoded to Float32 for the player.
+    audio: (ev) => call("onAudio", { samples: b64ToFloat32(ev.pcm), rate: ev.rate }),
     result: (ev) => call("onResult", ev),
     error: (ev) => call("onError", ev),
   };
@@ -100,13 +102,6 @@ export function runSession(params, handlers = {}) {
   };
 }
 
-/** Fetch + decode the session's on-air WAV → Float32 samples for the waterfall. */
-export async function fetchAudio(audioUrl) {
-  const resp = await fetch(`.${audioUrl}`);
-  if (!resp.ok) return { samples: null, sampleRate: SAMPLE_RATE_HZ };
-  return parseWav(await resp.arrayBuffer());
-}
-
 /** Hex string → Uint8Array (the delivered image bytes from a result event). */
 export function hexToBytes(hex) {
   const n = (hex || "").length >> 1;
@@ -115,42 +110,15 @@ export function hexToBytes(hex) {
   return out;
 }
 
-/**
- * Minimal RIFF/WAVE parser for 8/16-bit PCM mono → {samples: Float32Array, sampleRate}.
- * Walks the chunk list (don't assume a fixed 44-byte header).
- */
-function parseWav(buf) {
-  const dv = new DataView(buf);
-  if (dv.getUint32(0, false) !== 0x52494646 /* "RIFF" */) throw new Error("not a RIFF file");
-  let sampleRate = SAMPLE_RATE_HZ;
-  let bits = 16;
-  let off = 12;
-  let dataOff = -1;
-  let dataLen = 0;
-  while (off + 8 <= dv.byteLength) {
-    const id = dv.getUint32(off, false);
-    const size = dv.getUint32(off + 4, true);
-    const body = off + 8;
-    if (id === 0x666d7420 /* "fmt " */) {
-      sampleRate = dv.getUint32(body + 4, true);
-      bits = dv.getUint16(body + 14, true);
-    } else if (id === 0x64617461 /* "data" */) {
-      dataOff = body;
-      dataLen = size;
-    }
-    off = body + size + (size & 1);
+/** base64 of little-endian S16 PCM → Float32Array in [-1,1] (one live audio chunk). */
+function b64ToFloat32(b64) {
+  const bin = atob(b64 || "");
+  const n = bin.length >> 1;
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    let v = (bin.charCodeAt(i * 2)) | (bin.charCodeAt(i * 2 + 1) << 8); // little-endian
+    if (v >= 0x8000) v -= 0x10000; // signed
+    out[i] = v / 32768;
   }
-  if (dataOff < 0) throw new Error("no data chunk in WAV");
-  if (bits === 16) {
-    const n = dataLen >> 1;
-    const out = new Float32Array(n);
-    for (let i = 0; i < n; i++) out[i] = dv.getInt16(dataOff + i * 2, true) / 32768;
-    return { samples: out, sampleRate };
-  }
-  if (bits === 8) {
-    const out = new Float32Array(dataLen);
-    for (let i = 0; i < dataLen; i++) out[i] = (dv.getUint8(dataOff + i) - 128) / 128;
-    return { samples: out, sampleRate };
-  }
-  throw new Error(`unsupported WAV bit depth ${bits}`);
+  return out;
 }

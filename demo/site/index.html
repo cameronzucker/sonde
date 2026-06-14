@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>HF Data Modem — Live ARDOP Link Demo</title>
-  <meta name="description" content="Interactive HF data-modem demo: drive a simulated shortwave channel and watch a real reference modem (ARDOP) deliver an EmComm SITREP image over it, frame by frame — the known-good baseline Sonde is built against." />
+  <title>HF Data Modem — Live ARDOP Connected-Mode Demo</title>
+  <meta name="description" content="Watch two real ARDOP modems connect over a simulated HF channel — live: real CONNECT handshake, bandwidth negotiation, and adaptive-rate ARQ delivering an EmComm SITREP image, with the on-air signal streamed live to a 3D waterfall." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Chivo:ital,wght@0,300;0,400;0,500;0,700;0,900;1,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -16,12 +16,14 @@
   <div class="bg-glow" aria-hidden="true"></div>
   <div class="bg-grain" aria-hidden="true"></div>
 
-  <div class="shell">
-    <!-- ─────────────────────────── HEADER ─────────────────────────── -->
-    <header class="masthead">
+  <!-- ════════════════════ COCKPIT (fits one viewport) ════════════════════ -->
+  <div class="cockpit">
+
+    <!-- ── TOPBAR: identity · levers · Connect · mute ── -->
+    <header class="topbar">
       <div class="wordmark">
         <span class="wordmark__sigil" aria-hidden="true">
-          <svg viewBox="0 0 36 36" width="34" height="34" fill="none" stroke="currentColor" stroke-width="1.6">
+          <svg viewBox="0 0 36 36" width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.6">
             <circle cx="18" cy="18" r="3.2" />
             <circle cx="18" cy="18" r="9" opacity="0.55" />
             <circle cx="18" cy="18" r="15" opacity="0.25" />
@@ -32,193 +34,164 @@
           <strong>SONDE</strong>
           <span class="wordmark__sub">HF DATA MODEM</span>
         </span>
+        <span class="chip chip--live"><span class="chip__dot"></span>2 REAL ARDOP MODEMS · SIM CHANNEL · NOT ON-AIR</span>
       </div>
-      <div class="masthead__meta">
-        <span class="chip chip--live"><span class="chip__dot"></span>ARDOP · SIMULATED CHANNEL</span>
-        <span class="chip chip--muted">EMCOMM · SITREP DELIVERY</span>
-      </div>
-    </header>
 
-    <!-- ───────────────────────── HONESTY BANNER ───────────────────────── -->
-    <div class="honesty" role="note">
-      <span class="honesty__mark" aria-hidden="true">▲</span>
-      <p>
-        <strong>Two real modems · a live connection · simulated channel · not on-air.</strong>
-        Each session stands up <strong>two real ARDOP</strong> stations (ardopcf) and runs an
-        actual <strong>connection</strong> between them — CONNECT handshake, bandwidth
-        negotiation, and <strong>adaptive-rate ARQ</strong> — with their audio bridged through a
-        synthetic HF channel on the backend. No radio is keyed. ARDOP has a link layer, so lost
-        blocks are <em>retransmitted</em>: at a workable SNR the image arrives <strong>intact</strong>,
-        the modems <strong>adapt the rate down</strong> as conditions worsen, and below the cliff
-        the <strong>connection never closes</strong>. ARDOP is a known-good external baseline — the
-        bar Sonde is being built to meet — and is never reimplemented here.
-      </p>
-    </div>
-
-    <!-- ───────────────────────────── MAIN GRID ───────────────────────────── -->
-    <main class="grid">
-
-      <!-- WATERFALL HERO -->
-      <section class="panel panel--hero" aria-labelledby="hero-label">
-        <div class="panel__head">
-          <h2 class="panel__title" id="hero-label"><span class="idx">01</span> Spectral Waterfall</h2>
-          <span class="panel__hint">live 3D FFT of the transmission · press Play · drag to orbit</span>
-        </div>
-        <div class="stage" id="waterfall-mount" role="img" aria-label="3D spectrogram waterfall of the transmitted signal">
-          <span class="reg reg--tl" aria-hidden="true"></span>
-          <span class="reg reg--tr" aria-hidden="true"></span>
-          <span class="reg reg--bl" aria-hidden="true"></span>
-          <span class="reg reg--br" aria-hidden="true"></span>
-          <div class="stage__boot" id="stage-boot">press ▶ Play to stream the live spectrogram…</div>
-        </div>
-      </section>
-
-      <!-- CONTROL / LEVER PANEL -->
-      <section class="panel panel--controls" aria-labelledby="ctl-label">
-        <div class="panel__head">
-          <h2 class="panel__title" id="ctl-label"><span class="idx">02</span> Link Control</h2>
-          <span class="panel__hint">drive the channel</span>
-        </div>
-
-        <div class="ctl">
-          <div class="ctl__row">
-            <label class="ctl__label" for="snr-slider">Signal-to-noise ratio</label>
-            <output class="ctl__value" id="snr-readout">—</output>
-          </div>
+      <div class="topbar__levers">
+        <div class="lever lever--snr">
+          <label class="lever__label" for="snr-slider">Signal-to-noise <output class="lever__val" id="snr-readout">—</output></label>
           <input class="slider" type="range" id="snr-slider" min="-18" max="40" step="1" value="15" />
-          <div class="slider__scale" aria-hidden="true"><span>−18</span><span>11</span><span>40 dB</span></div>
         </div>
-
-        <div class="ctl">
-          <span class="ctl__label">Channel condition</span>
+        <div class="lever">
+          <span class="lever__label">Channel</span>
           <div class="segmented" id="condition-group" role="group" aria-label="Channel condition">
             <button type="button" class="seg" data-condition="none" aria-pressed="true">Ideal</button>
             <button type="button" class="seg" data-condition="good">Good</button>
-            <button type="button" class="seg" data-condition="moderate">Moderate</button>
+            <button type="button" class="seg" data-condition="moderate">Mod</button>
             <button type="button" class="seg" data-condition="poor">Poor</button>
             <button type="button" class="seg" data-condition="flutter">Flutter</button>
           </div>
         </div>
-
-        <div class="ctl">
-          <span class="ctl__label">ARQ bandwidth ceiling</span>
+        <div class="lever">
+          <span class="lever__label">ARQ bandwidth ceiling</span>
           <div class="segmented" id="bw-group" role="group" aria-label="ARQ bandwidth ceiling">
             <button type="button" class="seg" data-arqbw="200MAX" aria-pressed="false">200</button>
             <button type="button" class="seg" data-arqbw="500MAX" aria-pressed="false">500</button>
             <button type="button" class="seg" data-arqbw="1000MAX" aria-pressed="false">1000</button>
-            <button type="button" class="seg" data-arqbw="2000MAX" aria-pressed="true">2000 Hz</button>
+            <button type="button" class="seg" data-arqbw="2000MAX" aria-pressed="true">2000</button>
           </div>
-          <p class="ctl__note">The widest mode the modems may negotiate. ARDOP picks &amp; adapts the
-            actual data mode within this ceiling — you don't pick it.</p>
         </div>
+      </div>
 
+      <div class="topbar__actions">
         <button type="button" class="runbtn" id="run-btn" aria-busy="false">
           <span class="runbtn__glyph" aria-hidden="true">⇄</span>
-          <span class="runbtn__txt">Run connected session</span>
+          <span class="runbtn__txt">Connect</span>
         </button>
-
-        <div class="adaptation" id="adaptation-readout" aria-live="polite">
-          <span class="adaptation__tag">STATUS</span>
-          <span class="adaptation__text">Set the channel, then run a connected session…</span>
-        </div>
-      </section>
-
-      <!-- STATS -->
-      <section class="panel panel--stats" aria-labelledby="stats-label">
-        <div class="panel__head">
-          <h2 class="panel__title" id="stats-label"><span class="idx">03</span> Link Telemetry</h2>
-          <span class="panel__hint">measured this run</span>
-        </div>
-        <div class="stats">
-          <div class="stat stat--wide">
-            <span class="stat__k">Negotiated / adapting mode</span>
-            <span class="stat__v" id="stat-mode">—</span>
-            <span class="stat__sub" id="stat-constellation">—</span>
-          </div>
-          <div class="stat">
-            <span class="stat__k">Channel SNR</span>
-            <span class="stat__v" id="stat-snr">—</span>
-          </div>
-          <div class="stat">
-            <span class="stat__k">Negotiated BW</span>
-            <span class="stat__v" id="stat-bw">—</span>
-          </div>
-          <div class="stat">
-            <span class="stat__k">Throughput</span>
-            <span class="stat__v" id="stat-throughput">—</span>
-          </div>
-          <div class="stat">
-            <span class="stat__k">Time to deliver</span>
-            <span class="stat__v" id="stat-deliver">—</span>
-          </div>
-        </div>
-      </section>
-
-      <!-- RECON IMAGE -->
-      <section class="panel panel--recon" aria-labelledby="recon-label">
-        <div class="panel__head">
-          <h2 class="panel__title" id="recon-label"><span class="idx">04</span> Recon Attachment</h2>
-          <span class="panel__hint">recovered frames → JPEG</span>
-        </div>
-        <div class="recon">
-          <canvas id="recon-image" width="320" height="240" aria-label="Reconnaissance photo delivered over the ARQ link"></canvas>
-          <p class="recon__cap">The SITREP carries a ~3&nbsp;KB recon photo. ARQ retransmits lost blocks,
-            so it lands <em>intact</em> at a workable SNR — just slower as the rate adapts down. Below the
-            cliff the connection never closes and nothing arrives.</p>
-        </div>
-      </section>
-
-      <!-- CONNECTION / ARQ LOG -->
-      <section class="panel panel--console" aria-labelledby="console-label">
-        <div class="panel__head">
-          <h2 class="panel__title" id="console-label"><span class="idx">05</span> Connection / ARQ Log</h2>
-          <span class="panel__hint">
-            live protocol timeline · <span class="flip">delivered <span id="session-progress">0/0 B</span></span>
-          </span>
-        </div>
-        <div class="flog">
-          <div class="flog__bar">handshake · negotiated bandwidth · rate adaptation · ARQ delivery</div>
-          <div class="flog__stream" id="session-log-stream"><span class="console__idle">— awaiting session —</span></div>
-        </div>
-      </section>
-
-      <!-- TRANSPORT -->
-      <section class="panel panel--transport" aria-label="On-air audio playback">
-        <button type="button" class="transport__play" id="play-btn" disabled aria-label="Play or pause the on-air audio">
-          <span class="transport__glyph">▶</span><span class="transport__txt">Play on-air audio</span>
-        </button>
-        <div class="transport__track">
-          <input class="scrub" type="range" id="scrub" min="0" max="1000" step="1" value="0" aria-label="Scrub audio position" />
-        </div>
-        <button type="button" class="transport__mute" id="mute-btn" aria-pressed="false" aria-label="Mute or unmute on-air audio" title="Audio: hear what the receiver heard">
+        <button type="button" class="transport__mute" id="mute-btn" aria-pressed="false" aria-label="Mute or unmute the live on-air audio" title="Live on-air audio: what the receiver hears">
           <span class="transport__glyph" id="mute-glyph">🔊</span>
         </button>
-      </section>
-    </main>
+      </div>
+    </header>
 
-    <!-- ───────────────────────────── EXPLAINER ───────────────────────────── -->
+    <!-- ── MAIN: waterfall hero (left) · telemetry/log/recon (right) ── -->
+    <main class="cockpit__main">
+
+      <section class="cockpit__left">
+        <div class="panel panel--hero" aria-labelledby="hero-label">
+          <div class="panel__head">
+            <h2 class="panel__title" id="hero-label"><span class="idx">01</span> Live Spectral Waterfall</h2>
+            <span class="panel__hint">the on-air signal, streamed live · drag to orbit</span>
+          </div>
+          <div class="stage" id="waterfall-mount" role="img" aria-label="Live 3D spectrogram of the on-air signal">
+            <span class="reg reg--tl" aria-hidden="true"></span>
+            <span class="reg reg--tr" aria-hidden="true"></span>
+            <span class="reg reg--bl" aria-hidden="true"></span>
+            <span class="reg reg--br" aria-hidden="true"></span>
+            <div class="stage__boot" id="stage-boot">press Connect — the live spectrum streams in as the modems transmit…</div>
+          </div>
+        </div>
+        <div class="adaptation" id="adaptation-readout" aria-live="polite">
+          <span class="adaptation__tag">STATUS</span>
+          <span class="adaptation__text">Set the channel + bandwidth ceiling, then press Connect.</span>
+        </div>
+      </section>
+
+      <aside class="cockpit__right">
+        <!-- TELEMETRY -->
+        <section class="panel panel--stats" aria-labelledby="stats-label">
+          <div class="panel__head">
+            <h2 class="panel__title" id="stats-label"><span class="idx">02</span> Link Telemetry</h2>
+            <span class="panel__hint">live</span>
+          </div>
+          <div class="stats">
+            <div class="stat stat--wide">
+              <span class="stat__k">Negotiated / adapting mode</span>
+              <span class="stat__v" id="stat-mode">—</span>
+              <span class="stat__sub" id="stat-constellation">—</span>
+            </div>
+            <div class="stat">
+              <span class="stat__k">Channel SNR</span>
+              <span class="stat__v" id="stat-snr">—</span>
+            </div>
+            <div class="stat">
+              <span class="stat__k">Negotiated BW</span>
+              <span class="stat__v" id="stat-bw">—</span>
+            </div>
+            <div class="stat">
+              <span class="stat__k">Throughput</span>
+              <span class="stat__v" id="stat-throughput">—</span>
+            </div>
+            <div class="stat">
+              <span class="stat__k">Time to deliver</span>
+              <span class="stat__v" id="stat-deliver">—</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- CONNECTION / ARQ LOG -->
+        <section class="panel panel--console" aria-labelledby="console-label">
+          <div class="panel__head">
+            <h2 class="panel__title" id="console-label"><span class="idx">03</span> Connection / ARQ Log</h2>
+            <span class="panel__hint"><span class="flip">delivered <span id="session-progress">0/0 B</span></span></span>
+          </div>
+          <div class="flog">
+            <div class="flog__stream" id="session-log-stream"><span class="console__idle">— awaiting session —</span></div>
+          </div>
+        </section>
+
+        <!-- RECON IMAGE -->
+        <section class="panel panel--recon" aria-labelledby="recon-label">
+          <div class="panel__head">
+            <h2 class="panel__title" id="recon-label"><span class="idx">04</span> Recon Attachment</h2>
+            <span class="panel__hint">ARQ-delivered</span>
+          </div>
+          <div class="recon">
+            <canvas id="recon-image" width="320" height="240" aria-label="Reconnaissance photo delivered over the ARQ link"></canvas>
+          </div>
+        </section>
+      </aside>
+    </main>
+  </div>
+
+  <!-- ════════════════════ BELOW THE FOLD: framing + credits ════════════════════ -->
+  <section class="belowfold">
+    <div class="honesty" role="note">
+      <span class="honesty__mark" aria-hidden="true">▲</span>
+      <p>
+        <strong>Two real modems · a live connection · simulated channel · not on-air.</strong>
+        Each session stands up <strong>two real ARDOP</strong> stations (ardopcf) and runs an actual
+        <strong>connection</strong> between them — CONNECT handshake, bandwidth negotiation, and
+        <strong>adaptive-rate ARQ</strong> — with their audio bridged through a synthetic HF channel on
+        the backend and streamed to your browser live. No radio is keyed. ARDOP has a link layer, so
+        lost blocks are <em>retransmitted</em>: at a workable SNR the image arrives <strong>intact</strong>,
+        the modems <strong>adapt the rate down</strong> as conditions worsen, and below the cliff the
+        <strong>connection never closes</strong>. ARDOP is a known-good external baseline — the bar Sonde
+        is being built to meet — and is never reimplemented here.
+      </p>
+    </div>
+
     <section class="explainer" aria-label="What you're seeing">
       <h3>What you're seeing</h3>
       <ol>
-        <li><strong>Set the channel, then run a session.</strong> Drag SNR, pick a condition, choose the
-          ARQ <em>bandwidth ceiling</em> (the widest mode allowed), and press <em>Run connected session</em>.
-          A session is real airtime — give it time to play out.</li>
+        <li><strong>Set the channel, then Connect.</strong> Drag SNR, pick a condition, choose the ARQ
+          <em>bandwidth ceiling</em> (the widest mode allowed), and press <em>Connect</em>. A session is real
+          airtime — it plays out live over ~30–60 s.</li>
         <li><strong>Two real ARDOP stations connect.</strong> The backend runs a real CONNECT handshake,
           negotiates a bandwidth, and transfers a ~3&nbsp;KB image over <strong>adaptive-rate ARQ</strong> —
           their audio bridged through a synthetic HF channel. Real modulation, real FEC, real retransmission.</li>
-        <li><strong>Watch it adapt.</strong> The connection/ARQ log streams the handshake, the negotiated mode,
-          and every rate change; the recon photo lands intact (ARQ retransmits) — slower as the rate drops, and
-          not at all once the SNR falls below the connect cliff. Press play to hear the on-air audio and sweep its
-          live spectrum.</li>
+        <li><strong>Watch + hear it live.</strong> The on-air signal streams to the waterfall (and your
+          speakers) as it transmits; the connection/ARQ log streams the handshake, the negotiated mode, and
+          every rate change; the recon photo lands intact — slower as the rate drops, and not at all once the
+          SNR falls below the connect cliff.</li>
       </ol>
     </section>
 
-    <!-- ───────────────────────────── FOOTER ───────────────────────────── -->
     <footer class="colophon">
       <p class="credit" id="credit">Imagery credit loading…</p>
       <p class="license">Sonde is AGPLv3 · a clean-sheet HF data modem · this page transmits nothing.</p>
     </footer>
-  </div>
+  </section>
 
   <script type="module" src="js/main.js"></script>
 </body>

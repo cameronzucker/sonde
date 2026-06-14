@@ -1,18 +1,17 @@
-// main.js — bootstrap + wiring for the REAL ARDOP connected-mode link demo (ES module).
+// main.js — bootstrap + wiring for the LIVE ARDOP connected-mode demo (ES module).
 //
-// session-engine.js is the only backend-aware module; it opens a Server-Sent Events
-// stream to demo/ardop/server.py (/api/session), which runs two real ardopcf stations
-// through a real CONNECT + bandwidth negotiation + adaptive-rate ARQ transfer over
-// hf-channel-sim. This module turns that live event stream into the UI: a connection/
-// ARQ timeline, live telemetry, the recon image as it's delivered, and the on-air
-// waterfall. ardopcf is external/reference (clean-sheet, ADR 0014); the page keys nothing.
+// One action (Connect) starts a real connected session on the backend and the whole
+// page animates LIVE as it happens: the on-air audio streams from the Pi and plays
+// continuously (driving the waterfall), the connection/ARQ log + telemetry stream in,
+// and the recon image lands as ARQ delivers it. No record-then-replay. ardopcf is
+// external/reference (clean-sheet, ADR 0014); the page keys nothing.
 
-import { initSession, runSession, fetchAudio, hexToBytes, offsets } from "./session-engine.js";
+import { initSession, runSession, hexToBytes, offsets } from "./session-engine.js";
 import { createWaterfall } from "./waterfall.js";
 import { createSessionLog } from "./session-log.js";
 import { createImageReveal } from "./image-reveal.js";
 import { createControls } from "./controls.js";
-import { createAudioPlayer } from "./audio.js";
+import { createLiveAudio } from "./live-audio.js";
 
 // ── DOM handles ─────────────────────────────────────────────────────────────
 const el = (id) => document.getElementById(id);
@@ -23,25 +22,18 @@ const statBw = el("stat-bw");
 const statThroughput = el("stat-throughput");
 const statDeliver = el("stat-deliver");
 const adaptation = el("adaptation-readout");
-const playBtn = el("play-btn");
-const scrub = el("scrub");
 const muteBtn = el("mute-btn");
 const muteGlyph = el("mute-glyph");
 
 // ── Module instances + run state ─────────────────────────────────────────────
-let waterfall, imageReveal, sessionLog, controls, audioPlayer;
-let imageRange = [0, 0];     // [start,end] of the image field within the payload
-let seed = 1;                // fresh channel realization per session
-let session = null;          // current EventSource controller ({close})
-let curSnr = 0;              // SNR this session was driven at (for telemetry labeling)
+let waterfall, imageReveal, sessionLog, controls, liveAudio;
+let imageRange = [0, 0];
+let seed = 1;
+let session = null;   // current EventSource controller ({close})
 
-// ── Small helpers ─────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 const CONSTELLATION = { "4FSK": "4-FSK", "4PSK": "QPSK", "8PSK": "8-PSK", "16QAM": "16-QAM" };
-
-function constellationFor(modeId) {
-  if (!modeId) return "—";
-  return CONSTELLATION[modeId.split(".", 1)[0]] || "—";
-}
+const constellationFor = (m) => (m ? CONSTELLATION[m.split(".", 1)[0]] || "—" : "—");
 
 function fmtThroughput(bps) {
   if (!isFinite(bps) || bps <= 0) return "—";
@@ -61,46 +53,34 @@ function imageFieldRange(off) {
 function clearTelemetry() {
   statMode.textContent = "—";
   statConstellation.textContent = "—";
-  statSnr.textContent = "—";
   statBw.textContent = "—";
   statThroughput.textContent = "—";
   statDeliver.textContent = "—";
 }
 
-function setPlayGlyph(playing) {
-  const glyph = playBtn.querySelector(".transport__glyph");
-  const txt = playBtn.querySelector(".transport__txt");
-  if (glyph) glyph.textContent = playing ? "❚❚" : "▶";
-  if (txt) txt.textContent = playing ? "Pause" : "Play on-air audio";
-}
-
-// ── Run one connected session and stream it into the views ────────────────────
+// ── Run one LIVE connected session ────────────────────────────────────────────
 function runConnectedSession(state) {
   if (session) session.close();   // cancel any in-flight session (latest lever wins)
-  curSnr = state.snrDb;
   const mySeed = seed++;
 
-  // Reset views for a fresh session.
+  // The Connect click is the user gesture that unlocks audio — start the player now.
+  liveAudio.start();
+
   controls.setRunning(true);
   sessionLog.reset();
   waterfall.reset();
   clearTelemetry();
   statSnr.textContent = `${state.snrDb} dB`;
-  audioPlayer.stop();
-  audioPlayer.load(null);
-  playBtn.disabled = true;
-  setPlayGlyph(false);
-  scrub.value = "0";
   imageReveal.showFailed("CONNECTING…", `${state.condition} · ${state.arqbw.replace("MAX", " Hz max")}`);
   setStatus(`Dialing ${state.arqbw.replace("MAX", " Hz max")} at ${state.snrDb} dB / ${state.condition}…`);
   sessionLog.event("call", `ARQ CONNECT — SNR ${state.snrDb} dB · ${state.condition}`, state.arqbw);
 
   let lastModes = [];
 
-  session = runSession(state, {
+  session = runSession({ ...state, seed: mySeed }, {
     onPhase: (ev) => setStatus(ev.msg),
-    onStation: (ev) =>
-      sessionLog.event("info", `${ev.station} = ${ev.call} (${ev.role})`),
+    onStation: (ev) => sessionLog.event("info", `${ev.station} = ${ev.call} (${ev.role})`),
+    onAudio: (ev) => liveAudio.enqueue(ev.samples, ev.rate),   // LIVE on-air audio → waterfall
     onConnected: (ev) => {
       statBw.textContent = ev.bandwidth ? `${ev.bandwidth} Hz` : "—";
       sessionLog.event("conn", `CONNECTED — ${ev.call_a} ⇄ ${ev.call_b}`,
@@ -108,19 +88,16 @@ function runConnectedSession(state) {
       setStatus(`Connected · negotiated ${ev.bandwidth || "?"} Hz — transferring image over ARQ…`);
     },
     onDataStart: (ev) => {
-      sessionLog.event("arq", `image handed to the ARQ buffer`, `${ev.bytes} B`);
+      sessionLog.event("arq", "image handed to the ARQ buffer", `${ev.bytes} B`);
       imageReveal.showFailed("RECEIVING…", `0 / ${ev.bytes} B`);
     },
     onProgress: (ev) => {
       sessionLog.setProgress(ev.received, ev.total);
-      if (ev.received < ev.total) {
-        imageReveal.showFailed("RECEIVING…", `${ev.received} / ${ev.total} B`);
-      }
+      if (ev.received < ev.total) imageReveal.showFailed("RECEIVING…", `${ev.received} / ${ev.total} B`);
     },
     onMode: (ev) => {
-      // Log only the newly-added modes (rate adaptation steps).
-      const fresh = ev.modes.slice(lastModes.length);
-      fresh.forEach((m) => sessionLog.event("rate", `data mode ${m}`, constellationFor(m)));
+      ev.modes.slice(lastModes.length).forEach((m) =>
+        sessionLog.event("rate", `data mode ${m}`, constellationFor(m)));
       lastModes = ev.modes;
       statMode.textContent = ev.current || "—";
       statConstellation.textContent = constellationFor(ev.current);
@@ -132,11 +109,9 @@ function runConnectedSession(state) {
         `${ev.received}/${ev.total} B`);
     },
     onResult: (ev) => finishSession(ev),
-    onError: (ev) => {
-      sessionLog.event("fail", ev.msg);
-      setStatus(`Error: ${ev.msg}`);
-    },
+    onError: (ev) => { sessionLog.event("fail", ev.msg); setStatus(`Error: ${ev.msg}`); },
     onDone: () => {
+      liveAudio.stop();   // stop accepting chunks; queued audio drains, waterfall idles
       controls.setRunning(false);
       session = null;
     },
@@ -156,50 +131,24 @@ function finishSession(ev) {
     setStatus("CONNECT FAILED — the link can't close at this SNR; nothing was delivered.");
     imageReveal.showFailed("CONNECT FAILED", "link could not close");
     statThroughput.textContent = "—";
-  } else {
-    const bps = ev.duration_s > 0 ? (ev.received * 8) / ev.duration_s : 0;
-    statThroughput.textContent = fmtThroughput(bps);
-    const bytes = hexToBytes(ev.image_hex);
-    const fraction = ev.total > 0 ? ev.received / ev.total : 0;
-    if (bytes.length) imageReveal.render(bytes, imageRange, fraction);
-    else imageReveal.showFailed();
-    setStatus(ev.outcome === "pass"
-      ? `Delivered intact in ${ev.duration_s.toFixed(1)} s. Press play to hear the on-air signal.`
-      : `Partial: ${ev.received}/${ev.total} B before the link dropped.`);
+    return;
   }
-
-  // Load the teed on-air audio for the waterfall (present even on a failed connect:
-  // it captured the CONNECT attempts). Enable Play once it's decoded.
-  if (ev.audio_url) {
-    fetchAudio(ev.audio_url).then(({ samples, sampleRate }) => {
-      audioPlayer.load(samples, sampleRate);
-      playBtn.disabled = !(samples && samples.length);
-    }).catch(() => { playBtn.disabled = true; });
-  }
+  const bps = ev.duration_s > 0 ? (ev.received * 8) / ev.duration_s : 0;
+  statThroughput.textContent = fmtThroughput(bps);
+  const bytes = hexToBytes(ev.image_hex);
+  const fraction = ev.total > 0 ? ev.received / ev.total : 0;
+  if (bytes.length) imageReveal.render(bytes, imageRange, fraction);
+  else imageReveal.showFailed();
+  setStatus(ev.outcome === "pass"
+    ? `Delivered intact in ${ev.duration_s.toFixed(1)} s.`
+    : `Partial: ${ev.received}/${ev.total} B before the link dropped.`);
 }
 
-// ── Transport: play the captured on-air audio (drives the live waterfall) ──────
-function wireTransport() {
-  playBtn.addEventListener("click", () => {
-    if (audioPlayer.isPlaying()) {
-      audioPlayer.stop();
-      setPlayGlyph(false);
-    } else {
-      const offset = Number(scrub.value) / 1000;
-      audioPlayer.play(offset);
-      setPlayGlyph(audioPlayer.isPlaying());
-    }
-  });
-  audioPlayer.onEnded(() => setPlayGlyph(false));
-
-  scrub.addEventListener("input", () => {
-    audioPlayer.stop();   // resumes from the new position on next Play
-    setPlayGlyph(false);
-  });
-
+// ── Audio mute ────────────────────────────────────────────────────────────────
+function wireMute() {
   muteBtn.addEventListener("click", () => {
-    const next = !audioPlayer.isMuted();
-    audioPlayer.setMuted(next);
+    const next = !liveAudio.isMuted();
+    liveAudio.setMuted(next);
     muteBtn.setAttribute("aria-pressed", String(next));
     if (muteGlyph) muteGlyph.textContent = next ? "🔇" : "🔊";
   });
@@ -209,13 +158,8 @@ function wireTransport() {
 async function loadCredit() {
   try {
     const resp = await fetch("./assets/source-credit.txt");
-    if (resp.ok) {
-      const text = (await resp.text()).trim().replace(/\n+/g, " · ");
-      el("credit").textContent = text;
-    }
-  } catch {
-    /* leave the placeholder credit text */
-  }
+    if (resp.ok) el("credit").textContent = (await resp.text()).trim().replace(/\n+/g, " · ");
+  } catch { /* leave the placeholder */ }
 }
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
@@ -223,18 +167,18 @@ async function boot() {
   await initSession();
   imageRange = imageFieldRange(offsets());
 
-  audioPlayer = createAudioPlayer();
+  liveAudio = createLiveAudio();
   waterfall = createWaterfall(el("waterfall-mount"), {
-    getAnalyser: () => audioPlayer.getAnalyser(),
-    isPlaying: () => audioPlayer.isPlaying(),
+    getAnalyser: () => liveAudio.getAnalyser(),
+    isPlaying: () => liveAudio.isPlaying(),
   });
   sessionLog = createSessionLog(el("session-log-stream"), el("session-progress"));
   imageReveal = createImageReveal(el("recon-image"));
   controls = createControls(runConnectedSession);
 
-  wireTransport();
+  wireMute();
   loadCredit();
-  setStatus("Set the channel, choose a bandwidth ceiling, then Run connected session.");
+  setStatus("Set the channel + bandwidth ceiling, then press Connect to run a live session.");
 }
 
 boot().catch((err) => {
