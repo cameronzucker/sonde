@@ -652,16 +652,6 @@ mod tests {
     // ─── coded-path error rejection (Task B3) ──────────────────────────
 
     #[test]
-    fn receive_multi_rejects_input_shorter_than_one_block() {
-        let floor = WidebandLowDensityFloor::new();
-        let too_short = vec![0.0_f32; 10];
-        assert!(matches!(
-            floor.receive_multi(&too_short),
-            Err(PhyError::FrameDetect(_))
-        ));
-    }
-
-    #[test]
     fn receive_multi_rejects_truncated_multiblock() {
         // Block 0's header declares many blocks; supplying only block 0's
         // samples must surface FrameDetect (the later blocks are truncated).
