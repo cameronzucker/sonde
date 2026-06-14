@@ -21,10 +21,11 @@ import sys
 
 import numpy as np
 
-# Reference TX RMS in int16 units (ardopcf at DRIVELEVEL 80 measures ~8000 RMS).
-# Noise power is set relative to THIS, not the instantaneous signal, so silence
-# still carries the noise floor and the SNR is honest across bursts.
-REF_RMS = 8000.0
+# Reference TX RMS in int16 units, MEASURED at ardopcf's output through the snd-aloop
+# loopback (active-burst RMS ≈ 17900, peak ≈ 27700; sonde-imh.2 calibration). Noise
+# power is set relative to THIS, not the instantaneous signal, so silence still
+# carries the noise floor and the labeled SNR is honest during a transmission.
+REF_RMS = 17900.0
 # Small block = low added latency. ARDOP's half-duplex turnaround (ConReq→ConAck)
 # misses its RX window if the bridge buffers too much, so keep this tight (~21 ms
 # at 12 kHz). The per-block numpy overhead is negligible.

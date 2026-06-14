@@ -20,6 +20,7 @@ stations have NO PTT device, so nothing can key a real radio — no RF.
 """
 import argparse
 import os
+import signal
 import socket
 import subprocess
 import threading
@@ -156,6 +157,11 @@ def main():
     ap.add_argument("--call-b", default="N0BBB")
     ap.add_argument("--timeout", type=float, default=60)
     args = ap.parse_args()
+
+    # Turn SIGTERM (e.g. `timeout`, or the backend killing us) into SystemExit so
+    # the finally-block teardown runs — otherwise arecord/aplay leak and hold the
+    # loopback devices, breaking the next run.
+    signal.signal(signal.SIGTERM, lambda *a: (_ for _ in ()).throw(SystemExit(143)))
 
     procs, files = [], []
     hosts = []
