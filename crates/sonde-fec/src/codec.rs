@@ -172,8 +172,7 @@ impl FecCodec for FloorRate14Codec {
         let perm = deinterleave_index_perm(self.n, INTERLEAVER_ROWS);
         let deint_llrs: Vec<f32> = (0..self.n).map(|i| llr[perm[i]]).collect();
         let outcome = self.decoder.decode(&deint_llrs, MAX_ITERS_OFDM);
-        let info_plus_crc: BitVec<u8> =
-            outcome.decoded[..self.ldpc_k].iter().copied().collect();
+        let info_plus_crc: BitVec<u8> = outcome.decoded[..self.ldpc_k].iter().copied().collect();
         verify_crc32(info_plus_crc.as_bitslice()).map_err(|e| {
             FecError::DecodeFailure(format!(
                 "CRC mismatch after {} iterations: {e}",

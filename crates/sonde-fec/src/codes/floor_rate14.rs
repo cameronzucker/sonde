@@ -33,7 +33,11 @@ const SEED: u64 = 0xFEC0_F100_0014_u64;
 /// (ADR 0014).
 pub fn build() -> ParityCheckMatrix {
     let m = N - K; // parity rows = 1536
-    debug_assert_eq!(K * COL_WEIGHT, m, "exact degree-3 balance requires K*COL_WEIGHT == m");
+    debug_assert_eq!(
+        K * COL_WEIGHT,
+        m,
+        "exact degree-3 balance requires K*COL_WEIGHT == m"
+    );
 
     // Data half: COL_WEIGHT copies of each data column, deterministically
     // shuffled, then exactly one data edge assigned per check row.
@@ -76,7 +80,11 @@ mod tests {
 
     #[test]
     fn build_is_deterministic() {
-        assert_eq!(build().rows, build().rows, "construction must be reproducible");
+        assert_eq!(
+            build().rows,
+            build().rows,
+            "construction must be reproducible"
+        );
     }
 
     #[test]
@@ -88,15 +96,21 @@ mod tests {
                 col_deg[c] += 1;
             }
         }
-        for c in 0..K {
-            assert_eq!(col_deg[c], 3, "data column {c} must have degree 3");
+        for (c, &deg) in col_deg.iter().enumerate().take(K) {
+            assert_eq!(deg, 3, "data column {c} must have degree 3");
         }
         for (i, row) in h.rows.iter().enumerate() {
             let data_edges = row.iter().filter(|&&c| c < K).count();
-            assert_eq!(data_edges, 1, "check row {i} must carry exactly one data edge");
+            assert_eq!(
+                data_edges, 1,
+                "check row {i} must carry exactly one data edge"
+            );
             assert!(row.contains(&(K + i)), "row {i} missing diagonal parity");
             if i > 0 {
-                assert!(row.contains(&(K + i - 1)), "row {i} missing subdiagonal parity");
+                assert!(
+                    row.contains(&(K + i - 1)),
+                    "row {i} missing subdiagonal parity"
+                );
             }
         }
     }
