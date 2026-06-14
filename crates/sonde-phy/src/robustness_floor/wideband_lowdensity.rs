@@ -21,27 +21,32 @@ use crate::ofdm_main::transmitter::OfdmTransmitter;
 use crate::robustness_floor::coded_framing::{
     blocks_from_first_block, deframe_info_bits, frame_info_bits,
 };
+use crate::sync::carrier_offset::{analytic_signal, derotate};
 use crate::sync::preamble::{PreambleDetector, PreambleGenerator};
 
-/// Sample count of the Zadoff-Chu preamble emitted by
-/// [`WidebandLowDensityFloor::transmit_with_preamble`]. Matches the
-/// pin in [`crate::sync::preamble`].
-pub const PREAMBLE_LEN_SAMPLES: usize = 192;
+/// Sample count of the Schmidl-Cox repeated-pair preamble emitted by
+/// [`WidebandLowDensityFloor::transmit_with_preamble`]. Re-exported from
+/// [`crate::sync::preamble`] so the two never drift.
+pub const PREAMBLE_LEN_SAMPLES: usize = crate::sync::preamble::PREAMBLE_LEN;
 
 /// Early-alignment guard: the symbol FFT window starts this many samples
-/// EARLIER than the detected preamble end. The real-valued correlator can lock
-/// onto the *delayed* path of a multipath channel (measured: Watterson Moderate
-/// detects ~48 samples late), so without the guard the window would start late
-/// and spill into the next symbol. Backing off by a fixed margin lands the
-/// window inside the cyclic prefix, where the offset is just a per-sub-carrier
-/// phase ramp the channel estimator absorbs. 128 covers ITU-R F.520
-/// Good/Moderate/Poor path delays (24/48/96 samples @ 48 kHz) with margin, well
-/// inside the 512-sample CP.
+/// EARLIER than the detected preamble end. The phase-invariant (I/Q) correlator
+/// detects the frame accurately, but can still lock the *delayed* path of a
+/// multipath channel (Good Δτ=24, Moderate Δτ=48 samples @ 48 kHz), which would
+/// bias the window late and spill into the next symbol (ISI). Backing off a
+/// small margin biases the window EARLY — within the 512-sample cyclic prefix,
+/// where the offset is only a gentle per-sub-carrier phase ramp the channel
+/// estimator absorbs (early is safe, late is ISI).
+///
+/// 32 was chosen empirically (sonde-64w.3): a 40-seed Watterson Good/Moderate
+/// sweep decodes every detected frame at any guard in [0, 32], and a small early
+/// bias absorbs delayed-path lock. The prior value of 128 over-steepened the
+/// phase ramp on *accurately* detected frames and itself cost decodes.
 ///
 /// NOTE: timing is NOT the dominant fading failure mode — frequency-selective
 /// nulls are (see [`crate::ofdm_main::receiver`] and the fading gate). This
 /// guard is a robustness margin for delayed-path lock, not the fading fix.
-const SYNC_WINDOW_GUARD_SAMPLES: usize = 128;
+const SYNC_WINDOW_GUARD_SAMPLES: usize = 32;
 
 /// Raised-cosine inter-symbol windowing roll-off, in samples. Confined to the
 /// 512-sample cyclic-prefix guard so the FFT body stays intact (decode is
@@ -350,25 +355,53 @@ impl WidebandLowDensityFloor {
     ///   threshold;
     /// - no body samples follow the preamble, or the body is truncated.
     pub fn receive_multi_with_sync(&self, samples: &[f32]) -> Result<(usize, Vec<u8>), PhyError> {
-        let detector = PreambleDetector::new();
-        let detection = detector.scan(samples).ok_or_else(|| {
-            PhyError::FrameDetect(
-                "preamble not detected in input (signal too weak or no preamble \
-                 present); pass a longer/cleaner capture"
-                    .to_string(),
-            )
-        })?;
-        let body_start = (detection.start_sample + PREAMBLE_LEN_SAMPLES)
-            .saturating_sub(SYNC_WINDOW_GUARD_SAMPLES);
-        if body_start >= samples.len() {
+        // Two-stage synchronization (sonde-xhw.3), all on the analytic signal:
+        //   1. Schmidl-Cox `M(d)` for CFO-invariant detection + coarse CFO,
+        //   2. derotate + a sharp template MF for exact timing,
+        // then derotate the whole capture in the time domain BEFORE the
+        // per-symbol FFT. Without CFO correction the floor collapses above ~20 Hz
+        // — a ±100 Hz offset is ~4 sub-carrier spacings, which slides the
+        // spectrum off the pilot bins (the per-symbol pilot equalizer absorbs a
+        // constant phase + a phase ramp, but not a frequency shift). Detection
+        // must be CFO-invariant too: a template matched filter's magnitude
+        // collapses below the noise floor at ±100 Hz, so we detect on `M(d)`.
+        //
+        // We pad the analytic lift on both ends so the Hilbert FFT's circular
+        // wrap cannot contaminate the frame region (Codex Q3). `Re{analytic(x)}`
+        // == `x`, so with a ~0 Hz estimate the projection is the identity and the
+        // clean path stays bit-identical.
+        const ANALYTIC_PAD: usize = 512;
+        let sr = crate::audio_io::SAMPLE_RATE_HZ as f32;
+        let mut padded = vec![0.0_f32; samples.len() + 2 * ANALYTIC_PAD];
+        padded[ANALYTIC_PAD..ANALYTIC_PAD + samples.len()].copy_from_slice(samples);
+        let mut analytic = analytic_signal(&padded);
+        let det = PreambleDetector::new()
+            .detect_analytic(&analytic, sr)
+            .ok_or_else(|| {
+                PhyError::FrameDetect(
+                    "preamble not detected in input (signal too weak or no preamble \
+                     present); pass a longer/cleaner capture"
+                        .to_string(),
+                )
+            })?;
+        derotate(&mut analytic, det.cfo_hz, sr);
+        let corrected: Vec<f32> = analytic[ANALYTIC_PAD..ANALYTIC_PAD + samples.len()]
+            .iter()
+            .map(|c| c.re)
+            .collect();
+
+        // `det.start_sample` is in padded coordinates; convert back.
+        let start_sample = det.start_sample.saturating_sub(ANALYTIC_PAD);
+        let body_start =
+            (start_sample + PREAMBLE_LEN_SAMPLES).saturating_sub(SYNC_WINDOW_GUARD_SAMPLES);
+        if body_start >= corrected.len() {
             return Err(PhyError::FrameDetect(format!(
-                "preamble detected at sample {} but no body samples follow",
-                detection.start_sample
+                "preamble detected at sample {start_sample} but no body samples follow"
             )));
         }
-        let body = &samples[body_start..];
+        let body = &corrected[body_start..];
         let payload = self.receive_multi(body)?;
-        Ok((detection.start_sample, payload))
+        Ok((start_sample, payload))
     }
 }
 
