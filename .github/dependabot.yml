@@ -1,0 +1,33 @@
+version: 2
+updates:
+  # Rust workspace dependencies (root manifest covers all member crates).
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: America/Phoenix
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "build(cargo)"
+      include: scope
+    labels:
+      - dependencies
+      - rust
+
+  # GitHub Actions used by the workflows.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: America/Phoenix
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci(actions)"
+      include: scope
+    labels:
+      - dependencies
+      - github-actions

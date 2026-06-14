@@ -1,0 +1,26 @@
+name: release-please
+
+# Project-level SemVer + CHANGELOG automation (ADR 0005). Uses the "simple"
+# release-type: it maintains version.txt + CHANGELOG.md + a `vX.Y.Z` git tag
+# from Conventional Commit messages, decoupled from the per-crate Cargo.toml
+# versions (those are bumped only at crates.io publish — a separate effort).
+#
+# On each push to main, release-please opens/updates a release PR. Merging that
+# PR cuts the release (tag + CHANGELOG + version.txt bump).
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: googleapis/release-please-action@v5
+        with:
+          config-file: .github/release-please-config.json
+          manifest-file: .github/.release-please-manifest.json

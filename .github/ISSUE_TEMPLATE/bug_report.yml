@@ -1,0 +1,57 @@
+name: Bug report
+description: Report a defect in Sonde
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. **Do not include identifying station data**
+        (callsign, location, off-air captures of third parties) — redact it.
+        For security issues, use the private advisory link instead (see SECURITY.md).
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: Output of `git rev-parse --short HEAD` or the release tag.
+      placeholder: e.g. v0.1.0 or 1efac2f
+    validations:
+      required: true
+  - type: dropdown
+    id: crate
+    attributes:
+      label: Affected crate(s)
+      multiple: true
+      options:
+        - sonde-phy
+        - sonde-fec
+        - sonde-rx
+        - sonde-tx
+        - sonde-rig-rts
+        - sonde-rig-cm108
+        - sonde-phy-runtime
+        - hf-channel-sim
+        - workspace / build / CI
+        - not sure
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected vs. what occurred. Include exact error text.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: Minimal steps. Include the command(s) run and any input (redacted).
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: OS + version, Rust toolchain (`rustc --version`), and hardware if relevant (rig, sound interface) — no identifying station data.
+    validations:
+      required: false

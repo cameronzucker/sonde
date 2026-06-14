@@ -1,11 +1,16 @@
-//! Floor rate-1/4 LDPC code: n=2048, k=512, regular (3,4) construction.
+//! Floor rate-1/4 LDPC code: n=2048, k=512, IRA / dual-diagonal
+//! construction.
 //!
-//! Per Gallager 1963 + MacKay-Neal 1996, regular LDPC codes with sparse
-//! random parity-check matrices approach Shannon capacity under sum-
-//! product decoding at moderate iteration counts. The (3,4) regular
-//! construction balances column weight (decoder cycle count per bit)
-//! and row weight (parity-check density). Fixed seed → reproducible
-//! matrix → reproducible BER curves.
+//! The parity half is an invertible lower-bidiagonal (accumulator)
+//! structure and the data half carries exactly three edges per data
+//! column. This makes `H` encodable by the systematic encoder with no
+//! column pivoting — the right-half square submatrix is unit lower
+//! triangular and therefore non-singular over GF(2). Fixed seed →
+//! reproducible matrix → reproducible BER curves.
+//!
+//! Conceptual primitive: irregular-repeat-accumulate codes
+//! (Lin/Costello, open foundations). No prior-modem format examined
+//! (ADR 0014).
 
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
@@ -16,72 +21,46 @@ use crate::parity_matrix::ParityCheckMatrix;
 const N: usize = 2048;
 const K: usize = 512;
 const COL_WEIGHT: usize = 3;
-const ROW_WEIGHT: usize = 4;
 const SEED: u64 = 0xFEC0_F100_0014_u64;
 
-/// Construct the floor rate-1/4 parity-check matrix.
+/// Construct the floor rate-1/4 LDPC parity-check matrix as an IRA /
+/// dual-diagonal (accumulator) code: an invertible lower-bidiagonal
+/// parity half (so the systematic encoder needs no column pivoting)
+/// plus an exact degree-3 data half. Deterministic given [`SEED`].
 ///
-/// Deterministic given the [`SEED`] constant. Returns an (n-k) × n
-/// matrix with regular column weight 3 and regular row weight 4.
-///
-/// NOTE: this configuration-model construction does not guarantee
-/// rank-full `H` — the floor code (n=2048, k=512) reliably produces
-/// rank-deficient matrices under random sampling. The
-/// [`crate::encode::Encoder`] currently panics on the floor code;
-/// the proper fix is a PEG (progressive-edge-growth) or
-/// column-swap-pivot construction tracked by the tuxlink-bbin
-/// follow-up. Structural tests (weights, determinism) work on the
-/// rank-deficient H as-is.
+/// Conceptual primitive: irregular-repeat-accumulate codes
+/// (Lin/Costello, open foundations). No prior-modem format examined
+/// (ADR 0014).
 pub fn build() -> ParityCheckMatrix {
-    build_with_seed(SEED).expect("structural construction must succeed with the pinned SEED")
-}
-
-/// Single seed attempt at the configuration-model construction.
-/// Returns `None` if `MAX_RESHUFFLE` attempts exhausted without
-/// producing a duplicate-free row partition.
-fn build_with_seed(seed: u64) -> Option<ParityCheckMatrix> {
-    let m = N - K;
+    let m = N - K; // parity rows = 1536
     debug_assert_eq!(
-        N * COL_WEIGHT,
-        m * ROW_WEIGHT,
-        "regular construction balance"
+        K * COL_WEIGHT,
+        m,
+        "exact degree-3 balance requires K*COL_WEIGHT == m"
     );
 
-    let total_edges = m * ROW_WEIGHT;
-    debug_assert_eq!(total_edges, N * COL_WEIGHT);
-
-    // Configuration-model: for each column c, emit COL_WEIGHT stubs
-    // labeled c; shuffle all stubs; partition into m rows of
-    // ROW_WEIGHT each. Each column ends up with exactly COL_WEIGHT
-    // stubs (in some rows); each row ends up with exactly ROW_WEIGHT
-    // stubs (some columns).
-    let mut stubs: Vec<usize> = (0..N)
+    // Data half: COL_WEIGHT copies of each data column, deterministically
+    // shuffled, then exactly one data edge assigned per check row.
+    let mut data_edges: Vec<usize> = (0..K)
         .flat_map(|c| std::iter::repeat(c).take(COL_WEIGHT))
         .collect();
+    let mut rng = ChaCha8Rng::seed_from_u64(SEED);
+    data_edges.shuffle(&mut rng);
+    debug_assert_eq!(data_edges.len(), m);
 
-    let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    stubs.shuffle(&mut rng);
-
-    for _attempt in 0..32 {
-        let mut rows: Vec<Vec<usize>> = Vec::with_capacity(m);
-        let mut ok = true;
-        for r in 0..m {
-            let mut row: Vec<usize> = stubs[r * ROW_WEIGHT..(r + 1) * ROW_WEIGHT].to_vec();
-            row.sort_unstable();
-            let pre_dedup = row.len();
-            row.dedup();
-            if row.len() != pre_dedup {
-                ok = false;
-                break;
-            }
-            rows.push(row);
+    // Each check row i: one data edge + dual-diagonal parity (columns K..N).
+    let mut rows: Vec<Vec<usize>> = Vec::with_capacity(m);
+    for (i, &data_edge) in data_edges.iter().enumerate() {
+        let mut row = Vec::with_capacity(3);
+        row.push(data_edge); // data edge (column < K)
+        if i > 0 {
+            row.push(K + i - 1); // subdiagonal parity
         }
-        if ok {
-            return Some(ParityCheckMatrix { n: N, k: K, rows });
-        }
-        stubs.shuffle(&mut rng);
+        row.push(K + i); // diagonal parity
+        row.sort_unstable(); // parity_matrix stores rows sorted
+        rows.push(row);
     }
-    None
+    ParityCheckMatrix { n: N, k: K, rows }
 }
 
 #[cfg(test)]
@@ -89,44 +68,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn floor_h_has_correct_dimensions() {
+    fn build_is_encodable() {
         let h = build();
+        assert!(
+            crate::encode::Encoder::try_new(&h).is_ok(),
+            "IRA dual-diagonal build must be encodable"
+        );
         assert_eq!(h.n, N);
         assert_eq!(h.k, K);
-        assert_eq!(h.rows.len(), N - K);
     }
 
     #[test]
-    fn floor_h_is_regular_row_weight() {
-        let h = build();
-        for row in &h.rows {
-            assert_eq!(row.len(), ROW_WEIGHT);
-            let mut sorted = row.clone();
-            sorted.sort_unstable();
-            assert_eq!(row, &sorted, "rows must be sorted");
-            sorted.dedup();
-            assert_eq!(sorted.len(), row.len(), "rows must be duplicate-free");
-        }
+    fn build_is_deterministic() {
+        assert_eq!(
+            build().rows,
+            build().rows,
+            "construction must be reproducible"
+        );
     }
 
     #[test]
-    fn floor_h_is_regular_column_weight() {
+    fn data_degree_three_and_parity_dual_diagonal() {
         let h = build();
-        let mut col_weights = vec![0usize; N];
+        let mut col_deg = vec![0usize; N];
         for row in &h.rows {
             for &c in row {
-                col_weights[c] += 1;
+                col_deg[c] += 1;
             }
         }
-        for (c, w) in col_weights.iter().enumerate() {
-            assert_eq!(*w, COL_WEIGHT, "column {c} weight {w}");
+        for (c, &deg) in col_deg.iter().enumerate().take(K) {
+            assert_eq!(deg, 3, "data column {c} must have degree 3");
         }
-    }
-
-    #[test]
-    fn floor_h_is_deterministic() {
-        let h1 = build();
-        let h2 = build();
-        assert_eq!(h1.rows, h2.rows);
+        for (i, row) in h.rows.iter().enumerate() {
+            let data_edges = row.iter().filter(|&&c| c < K).count();
+            assert_eq!(
+                data_edges, 1,
+                "check row {i} must carry exactly one data edge"
+            );
+            assert!(row.contains(&(K + i)), "row {i} missing diagonal parity");
+            if i > 0 {
+                assert!(
+                    row.contains(&(K + i - 1)),
+                    "row {i} missing subdiagonal parity"
+                );
+            }
+        }
     }
 }
