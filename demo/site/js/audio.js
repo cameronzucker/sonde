@@ -76,7 +76,9 @@ export function createAudioPlayer({ gain = 0.3 } = {}) {
     stop();
     source = ctx.createBufferSource();
     source.buffer = buffer;
-    source.connect(gainNode);
+    // Route through the analyser (analyser → gain → destination) so the live
+    // waterfall sees the signal. Connecting straight to gain would bypass it.
+    source.connect(analyser);
     source.onended = () => {
       source = null;
       if (onEndedCb) onEndedCb();
