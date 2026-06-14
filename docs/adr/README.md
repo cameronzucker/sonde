@@ -4,7 +4,7 @@ This directory holds **Architecture Decision Records (ADRs)** — short, dated d
 
 ADRs are not a replacement for design documents, specs, or the plans under `docs/superpowers/plans/`. They are the **record** of what was decided, written when the decision is fresh, so future contributors (and future AI agents) can reconstruct the reasoning without spelunking through commit messages or chat logs.
 
-Sonde is a sibling of [Tuxlink](https://github.com/cameronzucker/tuxlink) and adopts its engineering discipline; this ADR log mirrors Tuxlink's `docs/adr/` conventions. Where Sonde deliberately deviates from Tuxlink (notably the integration-branch choice — see [ADR 0002](0002-git-workflow-and-governance.md)), the deviation is recorded as an explicit decision rather than left as an undocumented difference.
+Sonde is a sibling of Tuxlink (private) and adopts its engineering discipline; this ADR log mirrors Tuxlink's `docs/adr/` conventions. Where Sonde deliberately deviates from Tuxlink (notably the integration-branch choice — see [ADR 0002](0002-git-workflow-and-governance.md)), the deviation is recorded as an explicit decision rather than left as an undocumented difference.
 
 ## When to write an ADR
 
