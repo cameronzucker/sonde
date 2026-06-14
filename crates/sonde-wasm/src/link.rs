@@ -63,6 +63,7 @@ fn build_symbols(
             t_start_s: sample_start as f32 / sr,
             t_end_s: sample_end as f32 / sr,
             bytes: chunk.to_vec(),
+            rx_bytes: Vec::new(),
             byte_start: payload_byte,
             byte_end,
             field,
@@ -139,18 +140,24 @@ pub fn run_link_core(
     // Channel.
     let (observed_real, clean_c, observed_c) = apply_channel(&tx, snr_db, condition, seed);
 
-    // Decode.
-    let (recovered_ok, ber) = match floor.receive_multi_with_sync(&observed_real) {
-        Ok((_start, recovered)) => {
-            let ok = recovered == payload;
-            (ok, bit_error_rate(&recovered, payload))
-        }
-        Err(_) => (false, 1.0),
-    };
+    // Decode (detailed: payload + per-symbol RX bytes).
+    let (recovered_ok, ber, recovered_bytes, rx_symbols): (bool, f32, Vec<u8>, Vec<Vec<u8>>) =
+        match floor.receive_multi_detailed(&observed_real) {
+            Ok(frame) => {
+                let ok = frame.payload == payload;
+                let ber = bit_error_rate(&frame.payload, payload);
+                (ok, ber, frame.payload, frame.symbols)
+            }
+            Err(_) => (false, 1.0, Vec::new(), Vec::new()),
+        };
 
     let measured_snr_db = mean_band_snr(&clean_c, &observed_c);
 
-    let symbols = build_symbols(payload, cap, symbol_size, offsets);
+    let mut symbols = build_symbols(payload, cap, symbol_size, offsets);
+    // Attach per-symbol RX bytes (aligned by index; empty when sync failed).
+    for (i, sym) in symbols.iter_mut().enumerate() {
+        sym.rx_bytes = rx_symbols.get(i).cloned().unwrap_or_default();
+    }
     let sr = SAMPLE_RATE_HZ as f32;
     let time_to_deliver_s = total_samples as f32 / sr;
     let throughput_bps = (payload.len() as f32 * 8.0) / time_to_deliver_s;
@@ -163,6 +170,7 @@ pub fn run_link_core(
         ber,
         measured_snr_db,
         payload_len: payload.len(),
+        recovered_bytes,
         preamble_samples: PREAMBLE_LEN_SAMPLES,
         symbol_size_samples: symbol_size,
         total_samples,
@@ -256,6 +264,34 @@ mod tests {
             payload.len(),
             "last byte_end clamps to payload len"
         );
+    }
+
+    #[test]
+    fn clean_link_exposes_recovered_and_rx_bytes() {
+        let payload: Vec<u8> = (0..120).map(|i| (i % 251) as u8).collect();
+        let off = offsets_for(payload.len());
+        let r = run_link_core(&payload, &off, "floor-wblo", 80.0, "none", 1).unwrap();
+        assert_eq!(r.recovered_bytes, payload);
+        for s in &r.symbols {
+            assert_eq!(s.rx_bytes.len(), s.bytes.len());
+            assert_eq!(
+                s.rx_bytes, s.bytes,
+                "clean path: rx should equal tx for sym {}",
+                s.idx
+            );
+        }
+    }
+
+    #[test]
+    fn failed_sync_yields_empty_recovered_and_rx() {
+        let payload: Vec<u8> = (0..120).map(|i| (i % 251) as u8).collect();
+        let off = offsets_for(payload.len());
+        let r = run_link_core(&payload, &off, "floor-wblo", -6.0, "poor", 3).unwrap();
+        // Invariant: if the frame didn't recover, recovered_bytes + all rx_bytes are empty.
+        if !r.recovered_ok {
+            assert!(r.recovered_bytes.is_empty());
+            assert!(r.symbols.iter().all(|s| s.rx_bytes.is_empty()));
+        }
     }
 
     #[test]

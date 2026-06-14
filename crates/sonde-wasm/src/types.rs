@@ -38,9 +38,12 @@ pub struct SymbolRec {
     pub sample_end: usize,
     pub t_start_s: f32,
     pub t_end_s: f32,
-    /// The payload bytes this symbol is intended to carry (ground truth from
-    /// the encoded stream; see plan note on per-symbol decode).
+    /// The payload bytes this symbol is intended to carry (ground truth /
+    /// transmitted bytes from the encoded stream).
     pub bytes: Vec<u8>,
+    /// The bytes actually DECODED for this symbol on the RX side (same length
+    /// as `bytes` when decode succeeded; empty when the frame failed to sync).
+    pub rx_bytes: Vec<u8>,
     pub byte_start: usize,
     pub byte_end: usize,
     pub field: String,
@@ -64,6 +67,10 @@ pub struct LinkResult {
     pub ber: f32,
     pub measured_snr_db: f32,
     pub payload_len: usize,
+    /// The full payload actually recovered on the RX side. Equals the original
+    /// payload at high SNR (BER 0); differs (corrupted) at marginal SNR; empty
+    /// when the frame failed to sync.
+    pub recovered_bytes: Vec<u8>,
     pub preamble_samples: usize,
     pub symbol_size_samples: usize,
     pub total_samples: usize,
