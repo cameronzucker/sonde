@@ -1,9 +1,22 @@
 [package]
 name = "sonde-wasm"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.75"
-# Placeholder — Task 5 will expand this into the full WASM DSP engine crate.
+edition.workspace = true
+rust-version.workspace = true
 
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sonde-phy = { path = "../sonde-phy" }
+hf-channel-sim = { path = "../../hf-channel-sim" }
+rustfft.workspace = true
+num-complex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+wasm-bindgen.workspace = true
+
+# getrandom is pulled transitively via hf-channel-sim's `rand`. On
+# wasm32-unknown-unknown it must use the browser entropy source to compile.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = ["js"] }
