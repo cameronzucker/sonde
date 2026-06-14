@@ -46,7 +46,12 @@ fn floor_fec_decodes_where_identity_fails() {
     let clean = tx.transmit_multi_with_preamble(payload).unwrap();
     let noisy = impair(&clean, snr_db, seed);
 
-    // Identity (no-FEC) receiver must FAIL on this capture.
+    // Identity (no-FEC) receiver must FAIL on this capture. NOTE: this negative
+    // control conflates two effects — IdentityFec's 74-bit framing differs from
+    // FloorRate14's, so it cannot even parse the coded stream's length header,
+    // *and* it has no coding gain against the AWGN. It is an anti-island guard
+    // (the coded output is provably not trivially decodable as uncoded); the
+    // load-bearing coding-gain proof is the positive FEC-decode assertion below.
     let id_rx = WidebandLowDensityFloor::new(); // IdentityFec baseline
     let identity_ok =
         matches!(id_rx.receive_multi_with_sync(&noisy), Ok((_, ref p)) if p == payload);
