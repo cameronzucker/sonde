@@ -38,7 +38,7 @@ rand_chacha = "0.3"
 proptest = "1"
 criterion = "0.8"
 hound = "3"           # .wav read/write for audio_loopback_check + bench-rig captures
-cpal = "0.15"         # feature-gated; default-off
+cpal = "0.18"         # feature-gated; default-off
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
