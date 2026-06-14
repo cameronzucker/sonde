@@ -1,204 +1,211 @@
-# Design: Modem Link/MAC (#5) + ARQ (#6) + host surface (#8) — MVP
+# Design: Modem Link layer — connected-mode selective-repeat ARQ (#5/#6/#8)
 
-> Status: design v2 (post-Codex-round-1, half-duplex realignment). Implements the canonical
-> subsystem specs (`tuxlink docs/superpowers/specs/2026-05-31-clean-sheet-modem-{5-link-mac,6-arq,8-host-protocol,overview}.md`).
-> bd epic `sonde-lcw`; MVP = `sonde-o0s` (#5) + `sonde-pwh` (#6-MVP) + minimal `sonde-a0p` (#8).
-> Moniker: marten-grouse-cove.
+> Status: design v3 (post operator audit "gate on physics, not artifacts" + course-correction
+> to the full connected-mode link). Implements `tuxlink docs/superpowers/specs/2026-05-31-clean-sheet-modem-{5-link-mac,6-arq,8-host-protocol,overview}`.
+> bd epic `sonde-lcw`. Moniker: marten-grouse-cove.
+>
+> **Discipline:** no capability is "done" until a gate proves it. A clean loopback round-trip
+> and green CI are NOT evidence. This layer's gate is **reliable in-order delivery over a
+> realistic lossy channel + connection establish/teardown** (§8). Results are labeled
+> "link-correct over channel model X," never "HF-viable" — over-the-real-PHY viability is
+> integration work gated on the PHY physics gates (program items 0–3), owned elsewhere.
 
-## 0. The operating model — half-duplex, push-to-talk, turn-taking (read first)
+## 0. Operating model — half-duplex, push-to-talk, turn-taking
 
-This is an **amateur HF data link in the VARA/ARDOP vein — NOT a packet network.** The
-physical reality the whole design serves:
+One rig, half-duplex at best (often simplex): a station transmits **or** receives, never both,
+and is deaf while keyed. One station transmits at a time; overlaps **collide**. Turnaround
+(drop PTT → peer keys up) is explicit and expensive. **Selective-repeat here is window-PER-OVER,
+turn-taking — never full-duplex pipelining.** A station with the floor sends a burst (window) of
+frames in one over, reverses, and the peer replies in its over with one cumulative+selective ACK.
+(Per ADR 0014 this uses the conceptual half-duplex-ARQ primitive as background; no examination of
+VARA/ARDOP internals. "More robust than VARA" is a clean-sheet design posture, §7.)
 
-- **One rig, one channel, half-duplex at best (often effectively simplex).** A station is
-  either transmitting **or** receiving — never both. While keyed (PTT down) the station is
-  **deaf**.
-- **Strictly one station transmits at a time.** Two overlapping transmissions **collide**
-  and are mutually destroyed — there is no "both buffered through."
-- **Turnaround is explicit and expensive.** Sender drops PTT → peer keys up → peer transmits.
-  This dominates HF latency; the protocol is built around taking turns, not pipelining.
-- **No free reverse signal.** A sender cannot hear an ACK while transmitting. Confirmation
-  only arrives in a *later, separate over* after the sender has turned around to listen.
+## 1. Architecture posture
 
-Everything below is turn-taking by construction. The full selective-repeat ARQ (#6-full,
-OFDM) still obeys this — it fills one *over* with a window of frames, then listens for one
-ACK over; it does not pipeline against a full-duplex pipe. (Per ADR 0014 this draws on the
-*conceptual* half-duplex-ARQ primitive as background only; no examination of VARA/ARDOP
-internals.)
+The **modem owns** the link: framing, station ID, sequence numbers, the connection state machine,
+selective-repeat ARQ, retransmission, turnaround, link adaptation. New crate **`crates/sonde-link`**.
+Tuxlink is the client; no link code in tuxlink. Generic over `P: PhyTransport`
+(`sonde_phy::phy_api`) so it runs over any PHY/transport double unchanged.
 
-## 1. Architecture posture (non-negotiable)
+## 2. Seam facts (current `origin/main`)
+- `send_frame(&[u8], ModeHint)->TxToken` queues opaque bytes (= one serialized link frame);
+  returns on enqueue, not TX-complete.
+- `poll_rx()->Option<RxFrame>`; `RxFrame::payload()` = the peer's bytes; a failed/absent decode =
+  `poll_rx` returns nothing (no usable `decode_ok`). Remote loss ⇒ inferred from a missing reply
+  within a deadline.
+- `channel_quality()->ChannelQualityReport` (FER, aggregate SNR) — consumed by link adaptation (§6).
+- **The link gate is at the frame level (PhyTransport boundary), decoupled from the not-yet-valid
+  waveform.** A real-SondePhy *wiring smoke test* (clean path) proves the generic link drives the
+  real trait (anti-island), labeled as wiring only — not a robustness/viability claim.
 
-The **modem owns** framing, station ID, sequence numbers, connection state, ACK/retransmit,
-and turnaround — a new crate **`crates/sonde-link`**. Tuxlink is the client; no link code in
-tuxlink. The host drives the modem over a thin host surface (#8); the modem runs the link
-internally. The link is generic over `P: PhyTransport` (`sonde_phy::phy_api`), so it runs
-over `SondePhy` (production) and `NullPhy` (loopback) unchanged.
+## 3. Frame format (#5)
 
-## 2. Seam facts (verified on current `origin/main`)
-
-- `send_frame(&[u8], ModeHint)->TxToken` queues opaque bytes (= the serialized link frame);
-  **returns on enqueue, not TX-completion** (runtime.rs:113) — timeouts must budget for
-  enqueue + encode + airtime + turnaround.
-- `poll_rx()->Option<RxFrame>`; `RxFrame::payload()` = the bytes the peer sent.
-- **A failed/absent decode = `poll_rx` returns nothing** (`do_rx` hardcodes `decode_ok=true`,
-  runtime.rs:208; `decode_scan`→`None` on no/failed frame). So remote loss is detectable
-  **only by absence of a confirming over within a deadline** — exactly the FT8 model.
-- `LoopbackRadio` is **self-echo**, not an A↔B channel → we build a shared half-duplex medium (§7).
-- **RX-window limit (filed, out of scope):** `SondePhy` decodes one ≤12k-sample capture per
-  window with no cross-window reassembly; a full floor frame is larger. Tracked as a separate
-  PHY-runtime bug. The MVP's test medium delivers one complete *over* as a single captured
-  burst (models "the receiver's capture spans the over") — this still drives the **real**
-  `FloorWaveform` encode/decode, so the E2E is not an island; only multi-window reassembly is
-  deferred.
-
-## 3. #5 Link/MAC frame (resolves spec open questions)
-
-Variable-length, big-endian, one frame = one PHY `send_frame` = one over.
+Big-endian, variable-length, one frame = one PHY `send_frame`. Exact-length, CRC-first parse.
 
 ```
-off  field         size  notes
-0    MAGIC 0x53 4C  2     "SL" link sanity
-2    VER           1     = 1; link-version hook
-3    FRAME_TYPE    1     0x01 DATA · 0x02 ACK   (reserve 0x10/0x11/0x12 CONN/CONN_ACK/DISC, #6-full)
-4    SRC callsign  10    ASCII, NUL-pad. Part-97 station ID in EVERY frame (validated, §3.2)
-14   DST callsign  10    ASCII, NUL-pad
-24   SEQ           4     u32. DATA: message seq. ACK: the acked seq (PAYLOAD_LEN=0)
-28   PAYLOAD_LEN   2     u16
-30   PAYLOAD       N
-30+N CRC32         4     IEEE, over bytes [0 .. 30+N)
+off field        size  notes
+0   MAGIC 53 4C   2
+2   VER           1    = 1
+3   TYPE          1    1 DATA · 2 ACK · 3 NAK(optional, ACK SACK is primary) · 4 CONN · 5 CONN_ACK · 6 DISC · 7 DISC_ACK · 8 KEEPALIVE
+4   SRC callsign  10   Part-97 station ID, validated, EVERY frame
+14  DST callsign  10
+24  CONN_ID       2    u16 session id (CONN-negotiated; rejects cross-session/half-open frames)
+26  SEQ           4    u32. DATA: frame seq. control: context seq (e.g. CONN proposed-initial-seq)
+30  ACK_THROUGH   4    u32 cumulative in-order-received high-water (ACK/data-piggyback); 0 if n/a
+34  SACK          4    u32 bitmap: bit i set ⇒ (ACK_THROUGH+1+i) received out-of-order
+38  LEN           2    u16 payload length
+40  PAYLOAD       N
+40+N CRC32        4    IEEE, over [0 .. 40+N)
 ```
 
-Header = 34 bytes. **Parsing is exact-length** (Codex #8): treat `RxFrame.payload()` as one
-complete datagram; require `buf.len() == 34 + PAYLOAD_LEN` and a passing CRC **before** any
-field is trusted; otherwise drop. A corrupted `PAYLOAD_LEN` therefore can't walk the CRC
-offset — length mismatch → drop.
+Header = 44 bytes. **Parse rule:** require `buf.len() == 44+LEN` AND CRC valid **before** trusting
+any field; else drop. A corrupted LEN ⇒ length mismatch ⇒ drop (CRC offset can't walk).
+`Callsign` is validated (`[A-Z0-9/]`, 1–10, NUL-pad). **Link MTU per over-frame** = `u16::MAX-44`;
+host messages above the per-message cap are fragmented across DATA frames (seq-ordered) and
+reassembled in-order at the receiver.
 
-- **Station ID (§5.Q2): explicit per-frame, validated** (Codex #11). `Callsign` is a parsed,
-  validated type (nonempty, ASCII, `[A-Z0-9/]`, ≤10), not opaque bytes. Local SRC must be a
-  legal callsign in amateur mode — the MAC is the Part-97 enforcement point. (Opaque/arbitrary
-  addressing, if ever needed, becomes a *separate* future address field, not this one.)
-- **SEQ u32** (§5.Q8): wide up-front; the v2.0→v2.2 retrofit is the warning. Pre-sizes #6-full's window space.
-- **CRC32** (§5.Q5): stronger than CRC-16-CCITT; `crc` crate already a workspace dep.
-- **Link MTU** (Codex #7): the floor caps PHY input at `u16::MAX`, and PHY input is the *whole*
-  frame, so `FLOOR_LINK_MTU = u16::MAX - 34`. Host messages above MTU are rejected before
-  serialization (fragmentation is a later concern).
+## 3.5 Turn ownership — explicit in-band token (Codex convergence: the core fix)
 
-## 4. #6-MVP — floor reliability: whole-message confirmation, turn-taking
+The `PhyTransport` seam offers **no carrier-sense and no TX-complete signal** —
+`poll_rx`/`send_frame` only yield decoded frames or nothing, and the `SondePhy`
+worker is TX-priority (an early retransmit crowds out the ACK-receive window).
+Turn ownership therefore cannot rely on "hearing the peer go quiet." It is passed
+**explicitly in-band**:
+- A `FLAGS` byte (frame offset 4) carries `END_OF_OVER` (bit 0). The **last frame
+  of an over** sets it; receiving it passes the floor to the peer.
+- **The connection initiator owns the first floor** after `CONN_ACK` — deterministic,
+  no split-brain.
+- A **turn-recovery timer** (mode-derived, §6) runs while LISTENING: if the floor
+  token (or the peer's whole over) is lost, the previous holder re-takes the floor
+  and retransmits — it never waits forever. Simultaneous re-takes resolve by the
+  **callsign tie-break** (same ordering as connect-collision) + jittered backoff.
 
-**Mode-conditional ARQ** (overview §5.A.2): the floor does **not** run the selective-repeat
-ARQ state machine. It uses the minimal turn-taking confirmation:
+## 4. Connection state machine (#6 — the top failure mode; Codex-converge this)
 
-- Sender transmits the whole DATA frame in one over, **drops PTT, turns around, listens**.
-- Receiver, on a clean decode addressed to it, **delivers once** and, in its **own next over**,
-  transmits a single **ACK** (positive confirmation; SEQ=acked seq, no payload). It **never
-  NACKs**.
-- Sender, if no matching ACK arrives within the cycle deadline, **resends the whole message**;
-  repeat up to `MAX_RETRIES`, then `Err(Unacked)`.
+Per-peer session. States and the half-duplex floor sub-state are explicit.
 
-**Codex #10 disposition (intentional, documented):** the canonical spec says the floor has
-"no ARQ *state machine*" and "the receiver doesn't NACK." We honor both literally — there is
-**no window, no selective NACK, no per-frame retransmission**, only a single positive
-whole-message ACK and resend-until-confirmed. This is the JS8-style end-of-message
-confirmation ("RR73"-shaped), not selective-repeat ARQ (which stays reserved for OFDM
-#6-full). A sender that wants pure fire-and-forget (fixed N repeats, zero reverse traffic) is
-a future flavor; the MVP delivers the *confirmed* whole-message exchange the deliverable asks
-for, because "retry on a forced decode failure" requires the sender to learn of non-delivery,
-and on a half-duplex link the only such signal is absence-of-confirmation.
+```
+States:  CLOSED → CONNECTING → CONNECTED → DISCONNECTING → CLOSED
+Floor (in CONNECTED): SENDING_OVER ⇄ LISTENING  (whose turn to key up)
 
-**Turnaround / convergence (Codex #3, #4):**
-- One station transmits at a time; the shared medium (§7) enforces mutual exclusion and
-  collides overlaps. `SondePhy`'s worker is TX-priority and only receives when idle, so a
-  station is naturally deaf during its own over.
-- The cycle deadline is **enqueue-relative and conservative**: budgets enqueue + encode +
-  DATA airtime + turnaround + peer decode + ACK airtime. MVP uses a generous fixed base.
-- Retry backoff is **randomized** (base + per-retry jitter) to break the lost/late-ACK
-  livelock where a resend keeps colliding in-phase with the peer's delayed ACK.
-- A real TX-complete/airtime signal (via `TxToken`) is a follow-up; noted, not blocking.
+Events: HostConnect, HostSend(bytes), HostDisconnect, Rx(frame), Timer(kind)
 
-**Bounded dedup (Codex #9):** stop-and-wait whole-message ⇒ track **last-accepted SEQ per
-source** + a small replay window, not an unbounded `(src,seq)` set. A duplicate (lost-ACK
-resend) is re-ACKed but **not re-delivered** (idempotent).
+CLOSED:
+  HostConnect      → send CONN(conn_id=rand, init_seq); start connect-retry timer; → CONNECTING
+  Rx(CONN)         → accept: send CONN_ACK; adopt conn_id; → CONNECTED (LISTENING/peer has floor per tie-break)
+  Rx(other)        → drop (optionally RST to clear a stale half-open peer)
+CONNECTING:
+  Rx(CONN_ACK)     → → CONNECTED (we hold the floor: SENDING_OVER)
+  Rx(CONN) collide → tie-break by callsign ordering: higher wins CONNECTING role, lower becomes acceptor → CONNECTED
+  Timer(connect)   → retransmit CONN up to MAX_CONN_RETRIES, jittered backoff; exhausted → CLOSED(Err)
+CONNECTED:
+  HostSend         → enqueue into send window
+  SENDING_OVER     → transmit up to WINDOW unacked/retx DATA frames this over; reverse → LISTENING; start over-timer
+  Rx(DATA)         → buffer; deliver in-order; (acceptor side) accumulate ACK/SACK for our next over
+  LISTENING + got peer's over end → take floor: send ACK/SACK (+ piggyback our DATA) → SENDING_OVER
+  Timer(over)      → peer's reply over not heard: retransmit unacked window next over; RTT-track; after
+                     MAX_LINK_RETRIES consecutive silent overs → link dead → CLOSED(Err: PeerLost)
+  Idle (no data, no traffic) → KEEPALIVE each keepalive-interval; survives DEAD_OVERS_TOLERATED silent overs
+  HostDisconnect / Rx(DISC) → drain or abort per policy → send DISC → DISCONNECTING
+DISCONNECTING:
+  Rx(DISC_ACK) or Rx(DISC) → → CLOSED(Ok)
+  Timer(disc)      → retransmit DISC up to MAX_DISC_RETRIES → CLOSED(Ok, best-effort)
+```
 
-## 5. #6-full selective-repeat ARQ (design-only, gated; `sonde-5yg`)
+Hardening (the spec's watched SM bugs): CONN/CONN collision tie-break (deterministic by callsign);
+half-open rejection via CONN_ID; idempotent retransmit of CONN/DISC; DISC-during-data handled;
+no both-transmit (floor ownership is explicit, one holder). All transitions table-driven + exhaustively
+unit-tested (collision, half-open, lost-handshake, lost-ACK, reordered DATA, duplicate DATA).
 
-OFDM-family, not yet built. Connection-oriented (CONN/CONN_ACK/DISC). Each *over* carries a
-**window** of frames; the peer replies in its over with one cumulative+selective ACK
-(SACK-style bitmap); sender retransmits only gaps next over. Window sized to fill one over at
-the link-adaptation-chosen rate (u32 seq pre-sizes it). RTT-tracked (EWMA) cycle timer;
-NACK-free (selective ACK, not NACK storms, §8). Implemented later as a unit-tested state
-machine; on-air waits for the OFDM waveform. Still strictly turn-taking — a window per over,
-never full-duplex pipelining.
+## 5. Selective-repeat ARQ (#6, half-duplex, window-per-over)
 
-## 6. #8 host surface — minimal in-process slice (`sonde-a0p`)
+- **Sender:** send window of up to `W` unacked DATA frames; transmits new + retransmit-needed frames
+  in its over; on the peer's ACK/SACK, slides the cumulative high-water and clears SACKed frames;
+  retransmits only the **gaps** (cumulative+SACK) next over (burst-error-friendly — no go-back-N waste).
+- **Receiver:** buffers out-of-order DATA up to `W`; delivers **in-order** to host (never out of order,
+  never duplicated, never corrupt — CRC-gated); replies with cumulative `ACK_THROUGH` + `SACK` bitmap.
+- **No NAK storms:** ACK/SACK carries the negative information implicitly; explicit NAK frame optional/
+  rate-limited. u32 seq ⇒ no wrap. `W` sized by link adaptation (§6); RTT-tracked over-timer (EWMA) +
+  jittered bounded backoff (half-duplex phase-lock-safe).
+- **Floor degenerate strategy:** under the floor mode the same router selects `ArqStrategy::WholeMessage`
+  — `W=1`, no SACK, no NAK, resend-whole-until-ACKed (the canonical floor "no NACK" model). One code
+  path, two strategies.
 
-`enum HostCommand { Send{dst, bytes}, Poll, ... }` → `enum HostEvent { Delivered{src,bytes},
-SendResult{seq, ok}, ... }`, mapping 1:1 onto `Station`. This is the vocabulary a later
-two-port TCP daemon serializes; MVP keeps it in-process. CONN/DISC commands land with #6-full.
+## 6. Link adaptation + mode-derived timing (#7 plumbing)
+`route(payload_len, &ChannelQualityReport) -> (ModeHint, ArqStrategy, WindowParams)`. Consumes FER +
+SNR: high FER ⇒ shrink `W`, lengthen timers, and **degrade down the ladder** rather than dropping the
+link.
 
-## 7. Test strategy — wired through the REAL PhyTransport, faithfully half-duplex
+**The ladder now extends to a deep-robustness (FT8-class) floor** (operator FYSA: `floor-nfsk`
+promoted from a manual crowded-band sidecar to the bottom rung of `MainAuto`):
 
-**`SharedChannel` test medium (replaces the v1 two-queue design — Codex #2):** ONE shared
-medium, not two independent queues. Properties it enforces:
-- **Mutual exclusion + collision:** if a station calls `transmit` while the channel is busy
-  with another station's over, **both overs are destroyed** (the medium records a collision;
-  neither is delivered). Models "you cannot both talk at once."
-- **Deaf while transmitting:** a station never captures an over that was on the air during its
-  own transmit.
-- **One over delivered as one captured burst** to the listening peer (the documented
-  RX-window simplification, §2).
-Two stations, **each with its own `SondePhy`** over its own `SharedChannel` endpoint.
+```
+OFDM (fast → slow)  →  floor-wblo (BPSK wide low-density)  →  deep-floor nFSK (narrow, slow, ~FT8 −21 dB)
+   selective-repeat, W>1            WholeMessage, W=1                 WholeMessage, W=1
+```
 
-**Forced-loss double `DropNthOver`:** wraps an endpoint and silently drops the Nth over a
-station transmits (models a missed decode), to exercise whole-message retry.
+**All link timers are MODE-DERIVED (airtime-aware), not flat** — this is mandatory because a
+deep-floor over is ~tens of seconds, vs sub-second for OFDM. A `ModeProfile { over_airtime,
+per_over_mtu, .. }` (supplied by the PHY/MAC; link-side defaults until the PHY exposes it) scales:
+- turn-recovery timer, retransmit/over timer, keepalive interval — all = f(over_airtime).
+- per-over MTU — deep-floor carries only tens of bytes/over ⇒ a long message fragments across **many
+  slow overs** (minutes); u32 seq won't wrap.
+- **Long ride-through:** `DEAD_OVERS_TOLERATED × over_airtime` at the bottom rung = minutes of
+  keepalive persistence before `PeerLost`. The link **trickles instead of failing.**
 
-**Tests (TDD):**
-1. Frame codec units: serialize↔deserialize round-trip; CRC rejects corruption; exact-length
-   parse rejects truncation/over-length; `Callsign` validation; ACK encoding (SEQ=acked, LEN=0).
-2. Station logic over `NullPhy`: duplicate DATA re-ACKs without re-delivering; ACK releases the
-   sender; wrong-DST dropped; bounded dedup.
-3. **E2E deliverable over `SondePhy<FloorWaveform, SharedChannel>`:** B runs a **concurrent
-   pump thread** (Codex #5) draining its link + emitting ACKs; A calls `send_message("B", payload)`
-   (blocks, internally polling for the ACK) with **A's first over dropped** (`DropNthOver(1)`).
-   Assert: B delivers `payload` **exactly once**, and A returns `Ok` after exactly one retry.
-   This exercises the real `SondePhy` worker + real `FloorWaveform` LDPC encode/decode over a
-   faithfully half-duplex medium (anti-island).
+The link does NOT hardcode mode specifics; it reads the `ModeProfile`, so it is correct across the
+whole ladder the moment the deep-floor mode lands (that PHY work is owned elsewhere, gated on the
+operator's measured decode-rate-vs-SNR-in-2.5-kHz gate near FT8's −21 dB). Single mode available
+today ⇒ window/timer adaptation is live and unit-tested over mode profiles; the actual mode-STEP is
+exercised as soon as >1 profile exists, and is stubbed-but-not-faked until then.
 
-`SharedChannel`/`DropNthOver` live in `sonde-link`'s test support, implementing the real
-`Radio` trait — `SondePhy` is unmodified.
+## 7. "More robust than VARA" — clean-sheet robustness levers (design goals the gate checks)
+1. **No silent corruption/loss:** CRC-32 per frame + hard in-order/no-dup/no-corrupt delivery invariant.
+2. **Burst tolerance:** SACK selective-repeat retransmits only gaps; survives multi-over deep fades.
+3. **Survive worse channels before death:** `DEAD_OVERS_TOLERATED` keepalive ride-through; link declares
+   death explicitly (and reports it) rather than corrupting or hanging.
+4. **No phase-lock collisions:** jittered bounded backoff on a half-duplex shared channel.
+5. **Graceful degradation** to slower/floor mode via ChannelQualityReport, not connection drop.
+6. **Wide u32 seq** (no wrap under long sessions); negotiated `CONN_ID` rejects stale/half-open frames.
+7. **Idempotent handshakes** (connect/teardown survive lost control frames).
 
-## 8. Crate layout
+## 8. The gate — realistic lossy channel (replaces the clean loopback)
 
-`crates/sonde-link/`: `frame.rs` (LinkFrame/FrameType/Callsign/CRC/exact-parse), `station.rs`
-(Station<P>: send_message, poll/pump, whole-message confirm, bounded dedup), `mac.rs`
-(`route(len, quality)->(ModeHint, ArqStrategy)` — MVP hardcodes Floor+WholeMessage),
-`host.rs` (HostCommand/HostEvent), `arq/selective_repeat.rs` (gated #6-full), `tests/`
-(`SharedChannel`, `DropNthOver`, e2e). Deps: `sonde-phy`, `crc`; dev-dep `sonde-phy-runtime`.
+`HalfDuplexLossyLink` test harness: a shared **frame-level** medium with two `PhyTransport`
+endpoints (decoupled from the waveform, per the audit). Injects, deterministically (seeded):
+- **Bursty/correlated loss** — Gilbert–Elliott good/bad states (bad = deep-fade burst dropping
+  consecutive frames/overs), NOT uniform random.
+- **Byte corruption** — flips in-frame; CRC must catch ⇒ frame dropped (never delivered corrupt).
+- **Variable RTT** — per-over delay distribution (multi-second tail).
+- **Collisions** — overlapping overs destroy both (turn discipline must avoid; harness can force).
 
-## 9. RADIO-1 / Part 97
-No real radio keyed; all tests use in-memory doubles implementing `Radio`. Station ID is in
-every frame by construction and validated; the MAC is the enforcement point, satisfied before
-any on-air path exists. On-air smoke is operator-run.
+**Acceptance gates (each is a test that must pass):**
+- G1 **Reliable in-order delivery:** a multi-frame message over a channel at a defined burst-loss +
+  corruption rate is delivered **byte-exact, in order, no dups** (or the link reports failure — never
+  silent corruption).
+- G2 **Connection establish/teardown** completes under control-frame loss (retransmitted handshakes).
+- G3 **Burst recovery:** a deep-fade burst of K consecutive lost overs is recovered by selective-repeat
+  once the channel reopens.
+- G4 **Honest failure:** sustained loss past `DEAD_OVERS_TOLERATED` ⇒ explicit `PeerLost`, no hang, no
+  partial/corrupt delivery.
+- G5 **Wiring smoke (labeled, not a viability claim):** the generic link drives a real `SondePhy` +
+  `FloorWaveform` over a clean medium for one message — proves the trait integration isn't an island.
 
-## 10. Codex round-1 disposition
-P0 #1 RX-window → filed as separate PHY-runtime bug; test medium delivers one-over-burst,
-documented (§2). P0 #2 half-duplex medium → `SharedChannel` with mutual-exclusion/collision
-(§7). P1 #3 livelock → randomized backoff + collision model (§4). P1 #4 timeout sizing →
-enqueue-relative conservative budget (§4). P1 #5 concurrent pump → B pump thread (§7). P2 #6
-ACK-timeout-only → accepted (§2). P1 #7 MTU → `u16::MAX-34` enforced (§3). P2 #8 exact-length
-parse + ACK semantics → §3. P1 #9 bounded dedup → last-seq+replay window (§4). P1 #10 floor
-ACK vs "no ARQ" → documented intentional minimal confirmation (§4). P2 #11 callsign validation
-→ validated `Callsign` (§3).
+Results are reported as "link-correct over channel model {params}", never as HF throughput/viability.
 
-## 11. Codex round-2 disposition (no P0s — half-duplex rework confirmed sound)
-- P1: `SharedChannel::receive` is **non-blocking/bounded** — returns silence immediately when
-  idle, so a worker never blocks in receive while a TX is queued. Unit-tested.
-- P1: the E2E is labeled a **"whole-over capture shim"**; a separate `#[ignore]`d bounded-window
-  test documents the deferred PHY-runtime reassembly bug (the filed sibling issue).
-- P1: the cycle deadline is **airtime-aware** — `turnaround_base + 2 * frame_len /
-  FLOOR_EST_BYTES_PER_SEC` — scaling with message size, not a flat timeout. Retry backoff is
-  **deterministic exponential** (base × retry) to break lost/late-ACK phase-lock without RNG
-  nondeterminism. Real TX-complete/airtime signaling via `TxToken` remains a follow-up.
-- P2: direct medium tests — overlap destroys both overs, no TX self-capture, lost/collided ACK
-  → duplicate DATA re-ACK without re-deliver.
-- P2: naming — the floor path is `WholeMessageConfirm` "floor confirmation/retry," never "ARQ
-  state machine"; selective-repeat ARQ naming is reserved for the OFDM #6-full path.
+## 9. Crate layout
+`crates/sonde-link/`: `frame.rs` (types/Callsign/CRC/exact-parse/fragmentation), `conn.rs`
+(connection state machine), `arq.rs` (selective-repeat sender/receiver + floor degenerate),
+`mac.rs` (`route`), `adapt.rs` (ChannelQualityReport→params), `host.rs` (HostCommand/HostEvent),
+`tests/` (`HalfDuplexLossyLink` Gilbert–Elliott harness; G1–G5). Deps: `sonde-phy`, `crc`, `thiserror`;
+dev-dep `sonde-phy-runtime`, `sonde-fec`.
+
+## 10. RADIO-1 / Part 97
+No real radio keyed; all tests are in-memory doubles. Station ID validated + in every frame; the MAC
+is the enforcement point. On-air smoke is operator-run, post PHY-physics gates.
+
+## 11. Scope honesty
+This push lands: the design (Codex-converged SM), frame codec, connection state machine,
+selective-repeat ARQ, the lossy-channel harness, and gates G1–G5 it can pass. Link adaptation mode-STEP,
+HARQ, and over-the-real-PHY viability are explicitly deferred/gated and will be labeled as such in the
+handoff — not claimed done.

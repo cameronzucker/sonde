@@ -1,0 +1,24 @@
+[package]
+name = "sonde-link"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Modem-owned Link/MAC + reliability for sonde (subsystems #5/#6/#8): half-duplex framing with Part-97 station ID and u32 sequence numbers, the robustness-floor whole-message confirmation/retry (FT8-pattern, no NACK), and a minimal host command surface. Drives the real PhyTransport seam; selective-repeat ARQ for the OFDM family is designed but gated."
+
+[dependencies]
+# The PhyTransport seam (send_frame/poll_rx/channel_quality), ModeHint, RxFrame,
+# PhyError. The link layer is generic over P: PhyTransport, so it runs over
+# SondePhy (production) and NullPhy (loopback) unchanged.
+sonde-phy.workspace = true
+# CRC-32 over each link frame (defense-in-depth above the floor FEC).
+crc.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# E2E only: drive the link through the REAL SondePhy half-duplex worker +
+# FloorWaveform LDPC encode/decode over an in-memory shared half-duplex medium.
+sonde-phy-runtime = { path = "../sonde-phy-runtime" }
+sonde-fec.workspace = true
