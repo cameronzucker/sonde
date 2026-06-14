@@ -1,0 +1,13 @@
+{
+  "name": "sonde-demo-tests",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Playwright smoke-test harness for the Sonde interactive demo page.",
+  "type": "module",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.48.2"
+  }
+}
