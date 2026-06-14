@@ -37,6 +37,7 @@ Verdicts: 🟢 REAL · 🟡 PARTIAL · 🔴 STUB/FAKED · ⚫ ABSENT.
 2. There is **effectively no synchronization** in the loop — the capability that makes a modem work when RX doesn't share TX's clock/carrier — and tests hide this by bypassing sync.
 3. The **performance numbers are physically meaningless** (non-standard SNR, processing-gain inflation, discarded noise, throughput on failed links, no BER-vs-theory). This is the mechanism behind "those rates at those SNRs are impossible": the SNR axis is not a real HF SNR.
 4. There is **no system above the PHY** (no link layer/ARQ), and **nothing has been on-air**.
+5. The **adaptation ladder doesn't extend to a weak-signal floor**. Its lowest rung is a wide-band mid-rate mode that fails ~15–20 dB above FT8's decode floor, so marginal links die instead of dropping to a usable trickle — contrary to the EmComm intent. See §5 P3b.
 
 The gaps are known and tractable, not mysterious. This is recoverable — but only by changing what the process gates on.
 
@@ -65,6 +66,12 @@ Build in this order. Each gate must be met before the item is "done."
 **P3 — Integrate + validate the coded mode over fading.** *(epic `sonde-64w`)*
 - Compose FloorRate14 LDPC + equalizer + real sync into one mode; estimate `n0` (drop hardcoded 0.1); add time/Doppler tracking.
 - **Gate:** stated success-rate over Watterson Good/Moderate/Poor at stated Eb/N0, **and** a coded-vs-uncoded BER curve showing the expected LDPC coding gain in dB.
+
+**P3b — Deep-robustness (FT8-class) floor + adapt *down*, don't fail.** *(epic `sonde-64w`)*
+- **Problem:** the auto ladder (`modes.rs::resolve`) bottoms out at `floor-wblo` — a wide-band (~2.3 kHz), ~1.4 kbps BPSK mode whose stated posture is *"go wider, not denser."* That is the wrong architecture for a low-SNR floor. It craps out **~15–20 dB above FT8's decode floor**: FT8 reaches ~**−21 dB** (2.5 kHz reference) by going **narrow (~50 Hz) + slow (~6 bps) + strong FEC + long integration**; spreading the same power across 46× the bandwidth at ~200× the bit rate cannot compete. So at marginal SNR the link **fails** instead of degrading — the opposite of the EmComm intent (a few bps that still delivers a SITREP at very low SNR beats a dead link).
+- **What exists:** the `floor-nfsk` 8-FSK primitive (`robustness_floor/narrow_fsk.rs`, "borrowed from FT8/JS8") is the right *idea* but is (a) a **stub** (`implemented:false`), (b) reachable only via the manual `FloorCrowdedBand` hint — **not** the `MainAuto` SNR ladder, and (c) ~450 Hz / noncoherent / no FEC, so even as designed it won't approach FT8's floor.
+- **Required:** build a genuine deep-robustness mode (narrow tens-of-Hz, long symbols, strong FEC, very low rate) and make it the **bottom rung of `MainAuto`**, so the link degrades to a low-rate trickle as SNR falls instead of dropping. Either tighten `floor-nfsk` toward FT8-class parameters (narrower tone spacing, coherent/longer integration, add FEC) or add a new mode beneath it.
+- **Gate (depends on P0):** a measured **decode-rate-vs-SNR curve in the standard 2.5 kHz reference** showing the deep-floor mode decodes within a stated margin of FT8's ~−21 dB — not "round-trips in loopback" — **and** `MainAuto` demonstrably *selects* it (not link failure) as SNR drops below the wide-band floor's usable range.
 
 **P4 — Link layer (currently absent).** *(epic `sonde-lcw`)*
 - Frame types (data/ACK/NAK/connect/disconnect), source/dest addressing, sequence numbers, **selective-repeat ARQ**, connected-mode state machine, link adaptation that consumes `ChannelQualityReport`.
