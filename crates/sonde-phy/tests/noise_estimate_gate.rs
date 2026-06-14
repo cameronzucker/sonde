@@ -56,9 +56,10 @@ fn analytic(real_sig: &[f32]) -> Vec<Complex<f32>> {
 }
 
 /// real audio → analytic → Watterson(condition) → AWGN(Eb/N0) → real audio.
-/// (No CFO/clock here — sonde-xhw.3 owns sync; this gate isolates the demod's
-/// noise scaling, so it slices at the known body offset via the production
-/// CFO=0 path.)
+/// No CFO/clock offset is injected — sonde-xhw.3 owns sync, so this gate
+/// isolates the demod's noise scaling. Decode still runs through the full
+/// production path (`receive_multi_with_sync`); at zero offset acquisition is
+/// trivial, leaving the per-bin LLR noise model as the only variable.
 fn through_channel(
     clean: &[f32],
     condition: ChannelCondition,
