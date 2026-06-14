@@ -158,9 +158,12 @@ impl FrameMode {
     }
 }
 
-/// Sample count of the preamble that `FrameMode::Sync` prepends. Mirrors
-/// [`sonde_phy::robustness_floor::wideband_lowdensity::PREAMBLE_LEN_SAMPLES`].
-pub const PREAMBLE_LEN_SAMPLES: usize = 192;
+/// Sample count of the preamble that `FrameMode::Sync` prepends. Re-exported
+/// from [`sonde_phy::robustness_floor::wideband_lowdensity::PREAMBLE_LEN_SAMPLES`]
+/// so the two never drift (the Schmidl-Cox repeated-pair preamble is 320
+/// samples as of sonde-xhw.3).
+pub const PREAMBLE_LEN_SAMPLES: usize =
+    sonde_phy::robustness_floor::wideband_lowdensity::PREAMBLE_LEN_SAMPLES;
 
 // ─── Payload resolution ─────────────────────────────────────────────
 
