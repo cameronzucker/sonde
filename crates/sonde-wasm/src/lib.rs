@@ -17,7 +17,8 @@ pub fn list_modes() -> String {
     serde_json::to_string(&modes::list_modes()).unwrap()
 }
 
-/// Sonde's Auto-mode recommendation (mode id string) for a measured SNR.
+/// Sonde's Auto-mode recommendation for a measured SNR. Returns the mode id as
+/// a PLAIN string (not JSON-quoted) — callers use it directly, not via JSON.parse.
 #[wasm_bindgen]
 pub fn recommend_mode(snr_db: f32) -> String {
     modes::recommend_mode(snr_db)
@@ -37,11 +38,13 @@ pub fn run_link(
 ) -> String {
     let offsets: types::FieldOffsets = match serde_json::from_str(offsets_json) {
         Ok(o) => o,
-        Err(e) => return format!("{{\"error\":\"bad offsets json: {e}\"}}"),
+        Err(e) => {
+            return serde_json::json!({ "error": format!("bad offsets json: {e}") }).to_string()
+        }
     };
     match link::run_link_core(payload, &offsets, mode_id, snr_db, condition, seed as u64) {
         Ok(r) => serde_json::to_string(&r).unwrap(),
-        Err(e) => format!("{{\"error\":\"{e}\"}}"),
+        Err(e) => serde_json::json!({ "error": e.to_string() }).to_string(),
     }
 }
 
@@ -81,5 +84,12 @@ mod tests {
         let offsets = r#"{"total_len":3,"fields":[],"image_byte_len":0}"#;
         let json = run_link(&payload, offsets, "ofdm-mid", 80.0, "none", 1);
         assert!(json.contains("error"));
+    }
+
+    #[test]
+    fn recommend_mode_returns_plain_mode_id() {
+        // High SNR clamps to floor-wblo today (OFDM modes unimplemented).
+        assert_eq!(recommend_mode(30.0), "floor-wblo");
+        assert_eq!(recommend_mode(-5.0), "floor-wblo");
     }
 }
