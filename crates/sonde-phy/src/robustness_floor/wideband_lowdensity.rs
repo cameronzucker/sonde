@@ -21,6 +21,20 @@ use crate::sync::preamble::{PreambleDetector, PreambleGenerator};
 /// pin in [`crate::sync::preamble`].
 pub const PREAMBLE_LEN_SAMPLES: usize = 192;
 
+/// Result of [`WidebandLowDensityFloor::receive_multi_detailed`]: the recovered
+/// payload plus every symbol's full decoded bytes (untrimmed, `data_bytes_per_symbol`
+/// each), for callers (e.g. demo/visualization) that need per-symbol RX data.
+#[derive(Debug, Clone)]
+pub struct DecodedFrame {
+    /// Sample index where the preamble was detected.
+    pub preamble_start: usize,
+    /// The recovered payload (length-prefixed framing stripped + truncated).
+    pub payload: Vec<u8>,
+    /// Per-symbol decoded bytes in transmit order (each `data_bytes_per_symbol`
+    /// long, including the 2-byte length header in symbol 0 and any trailing pad).
+    pub symbols: Vec<Vec<u8>>,
+}
+
 /// Default robustness floor: wide-band OFDM, BPSK on every occupied
 /// sub-carrier. Strategic posture is "go wider, not denser" — see
 /// overview §5.A.1.
@@ -333,6 +347,67 @@ impl WidebandLowDensityFloor {
         // Truncate to declared length (skip header).
         let payload = stream[2..2 + declared_len].to_vec();
         Ok(payload)
+    }
+
+    /// Like [`Self::receive_multi_with_sync`], but also returns each symbol's
+    /// full decoded bytes. Additive convenience for per-symbol RX inspection;
+    /// the payload result is identical to `receive_multi_with_sync`.
+    pub fn receive_multi_detailed(&self, samples: &[f32]) -> Result<DecodedFrame, PhyError> {
+        let detector = PreambleDetector::new();
+        let detection = detector.scan(samples).ok_or_else(|| {
+            PhyError::FrameDetect(
+                "preamble not detected in input (signal too weak or no preamble present)"
+                    .to_string(),
+            )
+        })?;
+        let body_start = detection.start_sample + PREAMBLE_LEN_SAMPLES;
+        if body_start >= samples.len() {
+            return Err(PhyError::FrameDetect(format!(
+                "preamble detected at sample {} but no body samples follow",
+                detection.start_sample
+            )));
+        }
+        let body = &samples[body_start..];
+        let symbol_size = self.symbol_size_samples();
+        let cap = self.data_bytes_per_symbol();
+        if body.len() < symbol_size {
+            return Err(PhyError::FrameDetect(format!(
+                "input shorter than one symbol: have {} samples, need {symbol_size}",
+                body.len()
+            )));
+        }
+        let first = self.decode_symbol_bytes(&body[..symbol_size]);
+        if first.len() < 2 {
+            return Err(PhyError::FrameDetect(
+                "first symbol decoded fewer than 2 bytes — cannot read length header".into(),
+            ));
+        }
+        let declared_len = ((first[0] as usize) << 8) | (first[1] as usize);
+        let total_len = 2 + declared_len;
+        let symbols_needed = total_len.div_ceil(cap);
+        if body.len() < symbols_needed * symbol_size {
+            return Err(PhyError::FrameDetect(format!(
+                "declared length {declared_len} requires {symbols_needed} symbols, \
+                 have {} samples",
+                body.len()
+            )));
+        }
+        let mut symbols: Vec<Vec<u8>> = Vec::with_capacity(symbols_needed);
+        let mut stream: Vec<u8> = Vec::with_capacity(symbols_needed * cap);
+        symbols.push(first.clone());
+        stream.extend_from_slice(&first);
+        for s in 1..symbols_needed {
+            let start = s * symbol_size;
+            let chunk = self.decode_symbol_bytes(&body[start..start + symbol_size]);
+            stream.extend_from_slice(&chunk);
+            symbols.push(chunk);
+        }
+        let payload = stream[2..2 + declared_len].to_vec();
+        Ok(DecodedFrame {
+            preamble_start: detection.start_sample,
+            payload,
+            symbols,
+        })
     }
 }
 
@@ -792,5 +867,44 @@ mod tests {
                 "preamble sample {i} differs: got {got}, want {want}"
             );
         }
+    }
+
+    // ─── receive_multi_detailed (per-symbol RX bytes, demo accessor) ─────────
+
+    #[test]
+    fn receive_multi_detailed_clean_returns_payload_and_per_symbol_bytes() {
+        let floor = WidebandLowDensityFloor::new();
+        let cap = floor.data_bytes_per_symbol();
+        let payload: Vec<u8> = (0..20).map(|i| (i % 251) as u8).collect();
+        let samples = floor.transmit_multi_with_preamble(&payload).unwrap();
+        let frame = floor.receive_multi_detailed(&samples).unwrap();
+        assert_eq!(frame.preamble_start, 0);
+        assert_eq!(frame.payload, payload);
+        let expected_symbols = (2 + payload.len()).div_ceil(cap);
+        assert_eq!(frame.symbols.len(), expected_symbols);
+        assert!(frame.symbols.iter().all(|s| s.len() == cap));
+        let mut stream: Vec<u8> = frame.symbols.concat();
+        let recovered = stream.split_off(2);
+        assert_eq!(&recovered[..payload.len()], payload.as_slice());
+    }
+
+    #[test]
+    fn receive_multi_detailed_rejects_silence() {
+        let floor = WidebandLowDensityFloor::new();
+        let silence = vec![0.0_f32; 20_000];
+        assert!(matches!(
+            floor.receive_multi_detailed(&silence),
+            Err(PhyError::FrameDetect(_))
+        ));
+    }
+
+    #[test]
+    fn receive_multi_detailed_matches_receive_multi_with_sync_payload() {
+        let floor = WidebandLowDensityFloor::new();
+        let payload: Vec<u8> = (0..100).map(|i| (i * 3 % 251) as u8).collect();
+        let samples = floor.transmit_multi_with_preamble(&payload).unwrap();
+        let (_s, p1) = floor.receive_multi_with_sync(&samples).unwrap();
+        let frame = floor.receive_multi_detailed(&samples).unwrap();
+        assert_eq!(p1, frame.payload);
     }
 }
