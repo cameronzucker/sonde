@@ -70,6 +70,7 @@ Sonde has several Claude Code sessions live at once, so two branches can grab th
 | [0002](0002-git-workflow-and-governance.md) | Git workflow and governance (main-as-integration, per-task branches, no-squash, worktrees, destructive-git ban) | Accepted |
 | [0003](0003-sonde-phy-runtime-adapter.md) | SondePhy runtime adapter architecture | Accepted |
 | [0004](0004-adr-numbering-under-concurrency.md) | Allocate ADR numbers by claim-next, renumber-on-collision | Accepted |
+| [0005](0005-semver-via-release-please.md) | Project-level SemVer via release-please (simple release-type) | Accepted |
 
 ## References
 
