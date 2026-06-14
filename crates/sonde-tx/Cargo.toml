@@ -18,7 +18,10 @@ sonde-rig-rts.workspace = true
 libc = "0.2"
 
 [dev-dependencies]
-# none — Mock writer + AudioBuffer-only tests cover the testable surface.
+hf-channel-sim.workspace = true
+num-complex.workspace = true
+# Receive side, for the end-to-end operational differential gate only.
+sonde-rx = { path = "../sonde-rx" }
 
 [[bin]]
 name = "sonde-tx"
