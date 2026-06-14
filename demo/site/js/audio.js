@@ -99,5 +99,5 @@ export function createAudioPlayer({ gain = 0.3 } = {}) {
     onEndedCb = cb;
   }
 
-  return { load, play, stop, setMuted, isMuted, isPlaying, onEnded };
+  return { load, play, stop, setMuted, isMuted, isPlaying, onEnded, getAnalyser };
 }
