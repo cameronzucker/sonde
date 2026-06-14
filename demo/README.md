@@ -75,12 +75,20 @@ require a real HTTP origin (CORS). Always serve over HTTP.
 
 ## Host on GitHub Pages
 
-The page is fully static. Point Pages at `demo/site/` (or copy that directory
-to your Pages branch). Because `site/pkg/` is gitignored, the wasm bundle must
-be produced **before** publishing: run `./demo/build-assets.sh` in your Pages
-build/CI step, or build locally and copy `site/pkg/` into the published tree.
-`payload.bin` + `payload.offsets.json` are committed, so only `pkg/` needs to be
-present at publish time.
+**Automated:** [`.github/workflows/pages.yml`](../.github/workflows/pages.yml)
+builds the wasm bundle and deploys `demo/site/` to Pages on every push to `main`
+that touches the demo (or via manual `workflow_dispatch`). **One-time operator
+setup:** repo *Settings → Pages → Build and deployment → Source = "GitHub
+Actions"*. Until that is set, the workflow's deploy job fails.
+
+The page is fully static and uses only relative asset paths, so it works under a
+project-Pages subpath (`https://<user>.github.io/sonde/`). Because `site/pkg/` is
+gitignored, the wasm bundle is built at deploy time via
+[`build-wasm-bundle.sh`](build-wasm-bundle.sh) (shared with the workflow);
+`payload.bin` + `payload.offsets.json` are committed, so only `pkg/` is built.
+
+**Manual:** run `./demo/build-assets.sh` (or just `./demo/build-wasm-bundle.sh`
+if `payload.bin` already exists), then serve / copy `demo/site/`.
 
 ## Run the smoke test
 

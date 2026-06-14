@@ -26,7 +26,6 @@ printf 'Source: NOAA Emergency Response Imagery (2020 Hurricane Laura), public d
 # --- 2. Build the SITREP payload ---
 cargo run --release -p sonde-demo-builder -- "$OUT/source.jpg" "$OUT" --target-bytes 5000 --max-dim 200
 
-# --- 3. Build the wasm bundle ---
-cargo build --release -p sonde-wasm --target wasm32-unknown-unknown
-wasm-bindgen target/wasm32-unknown-unknown/release/sonde_wasm.wasm --out-dir "$PKG" --target web
+# --- 3. Build the wasm bundle (shared with .github/workflows/pages.yml) ---
+"$(dirname "$0")/build-wasm-bundle.sh"
 echo "assets built: $OUT (payload.bin, payload.offsets.json), $PKG (sonde_wasm.js + _bg.wasm)"

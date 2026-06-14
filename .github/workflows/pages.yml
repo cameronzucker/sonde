@@ -1,0 +1,101 @@
+name: Deploy demo to GitHub Pages
+
+# Publishes the interactive demo (demo/site/) to GitHub Pages. The static page
+# is committed (HTML/CSS/JS + vendored Three.js + the committed SITREP payload),
+# but the WASM bundle (demo/site/pkg/) is gitignored and must be BUILT here at
+# deploy time — that build is the whole reason this workflow exists.
+#
+# One-time setup (operator): repo Settings → Pages → Build and deployment →
+# Source = "GitHub Actions". Until then this workflow's deploy job will fail.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - demo/**
+      - crates/sonde-wasm/**
+      - crates/sonde-demo-builder/**
+      - .github/workflows/pages.yml
+  workflow_dispatch: {}
+
+# Least privilege for the OIDC-based Pages deployment.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time; let an in-flight deploy finish rather than cancel it.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # cpal -> alsa-sys wants ALSA headers + pkg-config before any cargo step
+      # (see ci.yml). Not needed for the wasm32 build, kept for parity/safety.
+      - name: Install ALSA dev libraries
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+
+      - name: Install Rust toolchain (with wasm target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # The wasm-bindgen CLI version MUST equal the wasm-bindgen crate version
+      # the workspace resolves to — a mismatch produces an incompatible JS/wasm
+      # pair that fails at load. Resolve it from the dependency graph rather than
+      # pinning a literal (Cargo.lock is gitignored, so we can't read it).
+      - name: Resolve wasm-bindgen version
+        id: wb
+        run: |
+          VER=$(cargo metadata --format-version=1 \
+            | jq -r '[.packages[] | select(.name == "wasm-bindgen")][0].version')
+          if [ -z "$VER" ] || [ "$VER" = "null" ]; then
+            echo "::error::could not resolve wasm-bindgen version from cargo metadata"
+            exit 1
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "Resolved wasm-bindgen = $VER"
+
+      - name: Cache wasm-bindgen-cli
+        id: wb-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/wasm-bindgen
+          key: wasm-bindgen-cli-${{ runner.os }}-${{ steps.wb.outputs.version }}
+
+      - name: Install wasm-bindgen-cli (matching the crate version)
+        if: steps.wb-cache.outputs.cache-hit != 'true'
+        run: cargo install wasm-bindgen-cli --version "${{ steps.wb.outputs.version }}"
+
+      - name: Build the wasm bundle
+        run: ./demo/build-wasm-bundle.sh
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: demo/site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
