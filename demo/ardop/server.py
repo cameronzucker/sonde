@@ -13,11 +13,17 @@ No real radio: WAV files only (see ardop_channel.py). ardopcf is external/refere
 """
 import argparse
 import json
+import re
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 from ardop_channel import FRAMES, run_once
+
+# This endpoint runs an external modem; do NOT open it to arbitrary web origins
+# (a wildcard CORS + any query bug = a remote command path). Reflect only
+# localhost origins, and validate inputs server-side regardless (see ardop_channel).
+_ALLOWED_ORIGIN_RE = re.compile(r"https?://(localhost|127\.0\.0\.1)(:\d+)?")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -25,7 +31,11 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")  # demo frontend (static) calls this
+        # Reflect the Origin only for localhost (the demo's origin); never wildcard.
+        origin = self.headers.get("Origin")
+        if origin and _ALLOWED_ORIGIN_RE.fullmatch(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -44,6 +54,8 @@ class Handler(BaseHTTPRequestHandler):
                     seed=int(q.get("seed", ["1"])[0]),
                 )
                 return self._send(200, res)
+            except ValueError as e:  # rejected/invalid input → client error
+                return self._send(400, {"error": str(e)})
             except Exception as e:  # surface failures as JSON, don't 500 silently
                 traceback.print_exc()
                 return self._send(500, {"error": str(e)})

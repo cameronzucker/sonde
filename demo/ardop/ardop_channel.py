@@ -18,6 +18,14 @@ import re
 import subprocess
 import tempfile
 
+# Allowlists / patterns — these values are embedded in ardopcf's `--hostcommands`
+# string (which ardopcf parses as `;`-separated commands) and in subprocess args,
+# so every externally-influenced value is validated before use. ardopcf host
+# commands can drive PTT/CAT, so an unvalidated `frame` is a real injection path.
+CONDITIONS = {"none", "good", "moderate", "poor", "flutter"}
+_SESSIONID_RE = re.compile(r"[0-9a-fA-F]{1,2}")
+_DATA_RE = re.compile(r"[0-9a-fA-F]*")
+
 ARDOPCF = os.environ.get(
     "ARDOPCF", os.path.expanduser("~/Code/ardopcf-spike/build/linux/ardopcf")
 )
@@ -38,11 +46,21 @@ FRAMES = [
 
 def tx_wav(frame, data, tmp, sessionid="ff", drivelevel=80):
     """Encode `data` (bytes) as one ARDOP `frame`; return the TX WAV path."""
+    # Validate everything that lands in the `--hostcommands` string (injection guard).
+    if frame not in FRAMES:
+        raise ValueError(f"unknown frame {frame!r} (not in allowlist)")
+    if not _SESSIONID_RE.fullmatch(sessionid):
+        raise ValueError(f"bad sessionid {sessionid!r} (expect 1-2 hex digits)")
+    if not (isinstance(drivelevel, int) and 1 <= drivelevel <= 100):
+        raise ValueError(f"bad drivelevel {drivelevel!r} (expect int 1..100)")
+    datahex = data.hex()
+    if not _DATA_RE.fullmatch(datahex):  # bytes.hex() is always hex, belt-and-suspenders
+        raise ValueError("payload is not clean hex")
     r = subprocess.run(
         [ARDOPCF, "--nologfile", "--logdir", tmp, "--writetxwav", "-i", "-1", "-o", "-1",
          "--hostcommands",
          f"CONSOLELOG 2;MYCALL N0CALL;DRIVELEVEL {drivelevel};"
-         f"TXFRAME {frame} {data.hex()} 0x{sessionid};CLOSE"],
+         f"TXFRAME {frame} {datahex} 0x{sessionid};CLOSE"],
         capture_output=True, check=True)
     m = re.search(r"Opening WAV file for writing: (\S+)", r.stdout.decode("iso-8859-1"))
     if not m:
@@ -52,6 +70,11 @@ def tx_wav(frame, data, tmp, sessionid="ff", drivelevel=80):
 
 def apply_channel(src, dst, snr_db, condition="none", seed=1):
     """Run the TX WAV through hf-channel-sim (AWGN [+ Watterson]) -> impaired WAV."""
+    if condition not in CONDITIONS:
+        raise ValueError(f"unknown condition {condition!r} (not in allowlist)")
+    # Coerce numerics so a hostile string can't reach the subprocess arg.
+    snr_db = float(snr_db)
+    seed = int(seed)
     subprocess.run(
         [WAVCHAN, "--input", src, "--output", dst,
          f"--snr-db={snr_db}", f"--condition={condition}", f"--seed={seed}"],
