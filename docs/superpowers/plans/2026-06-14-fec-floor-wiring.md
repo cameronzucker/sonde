@@ -41,120 +41,150 @@ cargo fmt --all --check
 
 ## Phase A — Working rate-1/4 floor LDPC (`sonde-fec`)
 
-### Task A1: Seed-search construction for a rank-full floor H
+### Task A1: IRA / dual-diagonal full-rank floor construction
 
 **Files:**
 - Modify: `crates/sonde-fec/src/codes/floor_rate14.rs`
 
-The existing `build_with_seed(seed) -> Option<ParityCheckMatrix>` produces a structurally-valid (weights correct) H but, at the fixed `SEED`, its right half is rank-deficient so `Encoder::try_new` fails. `Encoder::try_new` is the authoritative rank oracle. Iterate a deterministic seed sequence until one yields an H that `Encoder::try_new` accepts.
+> **Why not seed-search:** the original (3,4)-regular configuration-model H is
+> reliably non-encodable — its right-half square submatrix is singular over
+> GF(2). Empirical seed-search exhausted 4096 seeds with **zero** rank-full
+> results (`Encoder::try_new` panicked: "no rank-full floor H within 4096
+> seeds"). Rank is invariant under parity-column permutation, so pivoting cannot
+> fix it. Fix = constructive **IRA / dual-diagonal** code (Codex-converged, spec
+> §4): an invertible bidiagonal parity half + an exact degree-3 data half. The
+> existing systematic `Encoder` and SPA `Decoder` need **no changes**.
 
-- [ ] **Step 1: Write the failing test** — append to the `tests` module in `floor_rate14.rs`:
+- [ ] **Step 1: Write the failing tests** — replace any seed-search tests in the
+  `tests` module of `floor_rate14.rs` with:
 
 ```rust
     #[test]
-    fn seed_search_finds_rank_full_floor_h() {
-        // Riskiest-first spike: a rank-full floor H must exist within the
-        // bounded seed budget. If this fails, seed-search is NOT a viable
-        // fix and the slice must escalate to a PEG construction (a new task,
-        // out of this plan) — STOP and surface that.
-        let h = build_rank_full();
-        // The encoder is the rank oracle: success ⇒ right half is full-rank.
+    fn build_is_encodable() {
+        let h = build();
         assert!(
             crate::encode::Encoder::try_new(&h).is_ok(),
-            "build_rank_full produced a rank-deficient H"
+            "IRA dual-diagonal build must be encodable"
         );
         assert_eq!(h.n, N);
         assert_eq!(h.k, K);
     }
 
     #[test]
-    fn rank_full_construction_is_deterministic() {
-        let a = build_rank_full();
-        let b = build_rank_full();
-        assert_eq!(a.rows, b.rows, "construction must be reproducible");
+    fn build_is_deterministic() {
+        assert_eq!(build().rows, build().rows, "construction must be reproducible");
+    }
+
+    #[test]
+    fn data_degree_three_and_parity_dual_diagonal() {
+        let h = build();
+        let mut col_deg = vec![0usize; N];
+        for row in &h.rows {
+            for &c in row {
+                col_deg[c] += 1;
+            }
+        }
+        for c in 0..K {
+            assert_eq!(col_deg[c], 3, "data column {c} must have degree 3");
+        }
+        for (i, row) in h.rows.iter().enumerate() {
+            let data_edges = row.iter().filter(|&&c| c < K).count();
+            assert_eq!(data_edges, 1, "check row {i} must carry exactly one data edge");
+            assert!(row.contains(&(K + i)), "row {i} missing diagonal parity");
+            if i > 0 {
+                assert!(row.contains(&(K + i - 1)), "row {i} missing subdiagonal parity");
+            }
+        }
     }
 ```
 
 - [ ] **Step 2: Run to verify it fails**
 
 Run: `cargo test -p sonde-fec --lib floor_rate14`
-Expected: FAIL — `cannot find function build_rank_full`.
+Expected: FAIL — the old config-model `build()` is non-encodable and has no
+degree-3 data structure.
 
-- [ ] **Step 3: Implement `build_rank_full`** — add to `floor_rate14.rs` (above the `tests` module). Reuse the existing private `build_with_seed`:
+- [ ] **Step 3: Rewrite `build()`** — replace the body of `build()` and delete the
+  now-dead `build_with_seed` + `MAX_RESHUFFLE` + `ROW_WEIGHT` (keep `N`, `K`,
+  `SEED`, `COL_WEIGHT = 3`). Update the module doc comment to describe the IRA
+  construction (drop the stale rank-deficiency note):
 
 ```rust
-/// Maximum seeds to try before giving up on seed-search.
-const MAX_RANK_SEARCH_SEEDS: u64 = 4096;
-
-/// Construct a floor rate-1/4 H whose right half is full-rank (so the
-/// systematic [`crate::encode::Encoder`] accepts it), by iterating a
-/// deterministic seed sequence derived from [`SEED`]. Reproducible:
-/// always returns the H from the first accepting seed.
+/// Construct the floor rate-1/4 LDPC parity-check matrix as an IRA /
+/// dual-diagonal (accumulator) code: an invertible lower-bidiagonal
+/// parity half (so the systematic encoder needs no column pivoting)
+/// plus an exact degree-3 data half. Deterministic given [`SEED`].
 ///
-/// # Panics
-/// Panics if no seed in `0..MAX_RANK_SEARCH_SEEDS` yields a rank-full H —
-/// that would mean seed-search is not viable and a PEG construction is
-/// required (tuxlink-bbin escalation).
-pub fn build_rank_full() -> ParityCheckMatrix {
-    for i in 0..MAX_RANK_SEARCH_SEEDS {
-        let seed = SEED ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        if let Some(h) = build_with_seed(seed) {
-            if crate::encode::Encoder::try_new(&h).is_ok() {
-                return h;
-            }
+/// Conceptual primitive: irregular-repeat-accumulate codes
+/// (Lin/Costello, open foundations). No prior-modem format examined
+/// (ADR 0014).
+pub fn build() -> ParityCheckMatrix {
+    let m = N - K; // parity rows = 1536
+    debug_assert_eq!(K * COL_WEIGHT, m, "exact degree-3 balance requires K*COL_WEIGHT == m");
+
+    // Data half: COL_WEIGHT copies of each data column, deterministically
+    // shuffled, then exactly one data edge assigned per check row.
+    let mut data_edges: Vec<usize> = (0..K)
+        .flat_map(|c| std::iter::repeat(c).take(COL_WEIGHT))
+        .collect();
+    let mut rng = ChaCha8Rng::seed_from_u64(SEED);
+    data_edges.shuffle(&mut rng);
+    debug_assert_eq!(data_edges.len(), m);
+
+    // Each check row i: one data edge + dual-diagonal parity (columns K..N).
+    let mut rows: Vec<Vec<usize>> = Vec::with_capacity(m);
+    for i in 0..m {
+        let mut row = Vec::with_capacity(3);
+        row.push(data_edges[i]); // data edge (column < K)
+        if i > 0 {
+            row.push(K + i - 1); // subdiagonal parity
         }
+        row.push(K + i); // diagonal parity
+        row.sort_unstable(); // parity_matrix stores rows sorted
+        rows.push(row);
     }
-    panic!(
-        "no rank-full floor H within {MAX_RANK_SEARCH_SEEDS} seeds — \
-         escalate to PEG construction (tuxlink-bbin)"
-    );
+    ParityCheckMatrix { n: N, k: K, rows }
 }
 ```
 
 - [ ] **Step 4: Run to verify it passes**
 
 Run: `cargo test -p sonde-fec --lib floor_rate14`
-Expected: PASS, both new tests. (If `seed_search_finds_rank_full_floor_h` FAILS, STOP — escalate per the test's comment.)
+Expected: PASS, 3 tests — fast (single deterministic build; encoder check ~tens of ms).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add crates/sonde-fec/src/codes/floor_rate14.rs
-git commit -m "feat(sonde-fec): rank-full floor rate-1/4 H via deterministic seed-search
+git commit -m "feat(sonde-fec): IRA dual-diagonal rate-1/4 floor code (encodable by construction)
 
 Agent: mesa-falcon-basil
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ```
 
-### Task A2: Route `CodeFamily::FloorRate14` to the rank-full build + un-ignore encoder test
+### Task A2: Un-ignore the floor encoder test
 
 **Files:**
-- Modify: `crates/sonde-fec/src/codes/mod.rs:72` (the `CodeFamily::FloorRate14 => floor_rate14::build()` arm)
 - Modify: `crates/sonde-fec/src/encode.rs:210-213` (remove `#[ignore]`)
 
-- [ ] **Step 1: Un-ignore the encoder test** — in `encode.rs`, delete the `#[ignore = "..."]` attribute on `encoder_handles_floor_rate14` (lines ~210-212), leaving the `#[test] fn encoder_handles_floor_rate14()` intact.
+`codes/mod.rs` already routes `CodeFamily::FloorRate14 => floor_rate14::build()`,
+and `build()` is now encodable — so there is **no routing change**, only the test
+un-ignore.
 
-- [ ] **Step 2: Run to verify it now fails** (build still uses rank-deficient fixed seed)
+- [ ] **Step 1: Un-ignore the encoder test** — in `encode.rs`, delete the
+  `#[ignore = "..."]` attribute on `encoder_handles_floor_rate14` (lines
+  ~210-212), leaving `#[test] fn encoder_handles_floor_rate14()` intact.
 
-Run: `cargo test -p sonde-fec --lib encoder_handles_floor_rate14`
-Expected: FAIL — `Encoder::new` panics with `RankDeficient` (the build still routes to the fixed-seed `build()`).
-
-- [ ] **Step 3: Route the family to the rank-full build** — in `codes/mod.rs`, change the match arm:
-
-```rust
-        CodeFamily::FloorRate14 => floor_rate14::build_rank_full(),
-```
-
-- [ ] **Step 4: Run to verify it passes**
+- [ ] **Step 2: Run to verify it passes**
 
 Run: `cargo test -p sonde-fec --lib encoder_handles_floor_rate14`
-Expected: PASS (all-zero info → all-zero codeword, k=512, n=2048).
+Expected: PASS — `build()` is encodable; all-zero info → all-zero codeword, k=512, n=2048.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
-git add crates/sonde-fec/src/codes/mod.rs crates/sonde-fec/src/encode.rs
-git commit -m "feat(sonde-fec): FloorRate14 family uses rank-full build; un-ignore encoder test
+git add crates/sonde-fec/src/encode.rs
+git commit -m "test(sonde-fec): un-ignore floor encoder test — IRA build is encodable
 
 Agent: mesa-falcon-basil
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"

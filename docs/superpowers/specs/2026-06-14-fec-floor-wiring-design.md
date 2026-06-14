@@ -77,10 +77,27 @@ resolution is **dependency inversion**, matching the plan's wording ("PHY
 
 ## §4. Component A — make the rate-1/4 floor LDPC work (`sonde-fec`)
 
-- Replace the rank-deficient configuration-model `H` with a **full-rank
-  construction** (progressive-edge-growth, or a column-pivot that extracts a
-  full-rank parity submatrix), so `Encoder::try_new` succeeds and `encode` no
-  longer panics. This is the `tuxlink-bbin` fix, pulled into scope.
+**Construction: IRA / dual-diagonal (accumulator).** The original
+(3,4)-regular configuration-model H is reliably non-encodable: its right-half
+square submatrix is singular over GF(2), and **empirical seed-search exhausted
+4096 seeds with zero rank-full results** (confirmed by `Encoder::try_new`, the
+rank oracle). Rank is invariant under parity-column permutation, so encoder
+column-pivoting cannot fix a singular right half — the fix must be constructive.
+Adopted approach (Codex-reviewed, converged):
+
+- **Parity half `H_p`** (columns `k..n`, the m×m right submatrix): lower
+  **bidiagonal accumulator** — `H_p[i][i] = 1` for all `i`, plus `H_p[i][i-1] = 1`
+  for `i > 0`. Unit-diagonal triangular ⇒ invertible by construction, so
+  `Encoder::try_new` finds a pivot at every column with **no encoder change**.
+- **Data half `H_d`** (columns `0..k`): exact, not random-Poisson. Since
+  `512 × 3 = 1536 = m`, form a deterministic (fixed-seed) shuffled multiset of
+  three copies of each of the 512 data columns and assign exactly one data edge
+  per check row. Result: every data column has degree exactly 3, every check row
+  has exactly one data edge (no data-free checks — the key error-floor guard).
+- This makes the floor code an **irregular-repeat-accumulate (IRA)** code — a
+  textbook open primitive (Lin/Costello), consistent with ADR 0014; no
+  prior-modem format is examined. The existing SPA decoder is H-agnostic
+  (message-passing over the actual Tanner graph), so it needs **no change**.
 - Expose a concrete **`FloorRate14Codec`** type implementing `FecCodec`
   (`encode`, `decode_soft`, `rate` = 1/4, `block_info_bits`, `block_coded_bits`),
   reusing the existing CRC + interleaver + sum-product decoder machinery the way
