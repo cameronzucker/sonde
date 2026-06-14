@@ -21,7 +21,7 @@ authors = ["Cameron Zucker <cameronzucker@gmail.com>"]
 [workspace.dependencies]
 num-complex = "0.4"
 rustfft = "6"
-thiserror = "1"
+thiserror = "2"
 # Subsystem #1: path-dep until #1 publishes to crates.io as `hf-channel-sim` v0.1.
 # Once published, replace `path = ...` with `version = "0.1"`. Member crates
 # opt-in via `hf-channel-sim.workspace = true` under [dev-dependencies].
