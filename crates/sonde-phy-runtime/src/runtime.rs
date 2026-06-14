@@ -12,6 +12,7 @@
 //! TX is prioritised over RX so a queued frame never waits behind a long
 //! capture — half-duplex means we cannot do both at once anyway.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -22,7 +23,7 @@ use sonde_phy::modes::{ModeHint, ModeTable};
 use sonde_phy::phy_api::{ChannelQualityReport, PhyTransport, RxFrame, TxToken};
 
 use crate::radio::Radio;
-use crate::waveform::Waveform;
+use crate::waveform::{DecodeScan, Waveform};
 
 /// How many samples the worker captures per RX window when idle. ~0.25 s at
 /// 48 kHz — long enough to contain a short floor frame, short enough to stay
@@ -52,6 +53,10 @@ pub struct SondePhy {
     shutdown: Arc<Mutex<bool>>,
     worker: Option<JoinHandle<()>>,
     next_token: u64,
+    /// Frames queued for TX or actively being keyed. `send_frame` bumps this on
+    /// enqueue; the worker drops it when `Radio::transmit` returns (PTT
+    /// released). Read by [`PhyTransport::tx_in_flight`]. Shared with the worker.
+    in_flight: Arc<AtomicUsize>,
 }
 
 impl SondePhy {
@@ -66,9 +71,11 @@ impl SondePhy {
         let (frame_tx, rx_frames) = mpsc::channel::<RxFrame>();
         let quality = Arc::new(Mutex::new(QualitySnapshot::default()));
         let shutdown = Arc::new(Mutex::new(false));
+        let in_flight = Arc::new(AtomicUsize::new(0));
 
         let worker_quality = Arc::clone(&quality);
         let worker_shutdown = Arc::clone(&shutdown);
+        let worker_in_flight = Arc::clone(&in_flight);
         let worker = std::thread::spawn(move || {
             Worker {
                 waveform,
@@ -77,6 +84,7 @@ impl SondePhy {
                 frame_tx,
                 quality: worker_quality,
                 shutdown: worker_shutdown,
+                in_flight: worker_in_flight,
                 modes: ModeTable::default(),
             }
             .run();
@@ -89,6 +97,7 @@ impl SondePhy {
             shutdown,
             worker: Some(worker),
             next_token: 0,
+            in_flight,
         }
     }
 
@@ -112,12 +121,23 @@ impl Drop for SondePhy {
 
 impl PhyTransport for SondePhy {
     fn send_frame(&mut self, payload: &[u8], hint: ModeHint) -> Result<TxToken, PhyError> {
-        self.tx_jobs
+        // Count the frame as in-flight BEFORE handing it to the worker so the
+        // count is already live the instant `send_frame` returns — the link
+        // must never observe a queued over as "idle". The worker decrements it
+        // when `Radio::transmit` returns (PTT released).
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        if self
+            .tx_jobs
             .send(TxJob {
                 payload: payload.to_vec(),
                 hint,
             })
-            .map_err(|_| PhyError::AudioIo("phy worker has stopped".into()))?;
+            .is_err()
+        {
+            // Worker is gone: the frame will never be keyed, so undo the bump.
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            return Err(PhyError::AudioIo("phy worker has stopped".into()));
+        }
         let token = TxToken(self.next_token);
         self.next_token += 1;
         Ok(token)
@@ -125,6 +145,10 @@ impl PhyTransport for SondePhy {
 
     fn poll_rx(&mut self) -> Option<RxFrame> {
         self.rx_frames.try_recv().ok()
+    }
+
+    fn tx_in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
     }
 
     fn channel_quality(&self) -> ChannelQualityReport {
@@ -149,6 +173,7 @@ struct Worker<W: Waveform, R: Radio> {
     frame_tx: Sender<RxFrame>,
     quality: Arc<Mutex<QualitySnapshot>>,
     shutdown: Arc<Mutex<bool>>,
+    in_flight: Arc<AtomicUsize>,
     modes: ModeTable,
 }
 
@@ -188,6 +213,10 @@ impl<W: Waveform, R: Radio> Worker<W, R> {
                 }
             }
         }
+        // The over is off the air (PTT released, or the job never made it there
+        // on an encode error) — drop it from the in-flight count last, so a link
+        // polling `tx_in_flight()` sees the frame keyed for the whole TX window.
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 
     fn do_rx(&mut self) {
@@ -198,15 +227,29 @@ impl<W: Waveform, R: Radio> Worker<W, R> {
                 return;
             }
         };
-        if let Some(frame) = self.waveform.decode_scan(&samples) {
-            let mode = self.modes.resolve(ModeHint::Floor, None);
-            if let Ok(mut q) = self.quality.lock() {
-                q.frames_total += 1;
-                q.last_frame_snr_db = frame.frame_snr_db;
+        match self.waveform.decode_scan(&samples) {
+            DecodeScan::Frame(frame) => {
+                let mode = self.modes.resolve(ModeHint::Floor, None);
+                if let Ok(mut q) = self.quality.lock() {
+                    q.frames_total += 1;
+                    q.last_frame_snr_db = frame.frame_snr_db;
+                }
+                let snr = frame.frame_snr_db.unwrap_or(f32::NAN);
+                let rx = RxFrame::new(frame.payload, mode, None, snr, true);
+                let _ = self.frame_tx.send(rx);
             }
-            let snr = frame.frame_snr_db.unwrap_or(f32::NAN);
-            let rx = RxFrame::new(frame.payload, mode, None, snr, true);
-            let _ = self.frame_tx.send(rx);
+            // A frame was acquired but failed to decode: a real RX frame error.
+            // Count it (total + failed) so `channel_quality().frame_error_rate()`
+            // reflects it — this is the signal subsystem #5 adapts on. No
+            // `RxFrame` is delivered (there is no payload).
+            DecodeScan::Detected => {
+                if let Ok(mut q) = self.quality.lock() {
+                    q.frames_total += 1;
+                    q.frames_failed += 1;
+                }
+            }
+            // Only noise in this window — not a frame error; count nothing.
+            DecodeScan::NoSignal => {}
         }
     }
 }
@@ -277,6 +320,146 @@ mod tests {
         assert!(
             after.frame_error_rate().is_finite(),
             "FER is a finite number after a frame"
+        );
+        phy.shutdown();
+    }
+
+    // ─── tx_in_flight (sonde-jt6, seam 1) ──────────────────────────────
+
+    /// A radio that parks inside `transmit` (PTT held) until the test releases
+    /// it, so the in-flight count can be observed mid-key deterministically.
+    struct BlockingRadio {
+        entered: Sender<()>,
+        release: Receiver<()>,
+    }
+    impl Radio for BlockingRadio {
+        fn transmit(&mut self, _samples: &[f32]) -> Result<(), PhyError> {
+            let _ = self.entered.send(()); // tell the test we are keying
+            let _ = self.release.recv(); // park until released
+            Ok(())
+        }
+        fn receive(&mut self, max: usize) -> Result<Vec<f32>, PhyError> {
+            std::thread::sleep(Duration::from_millis(1));
+            Ok(vec![0.0; max])
+        }
+    }
+
+    #[test]
+    fn tx_in_flight_tracks_a_keyed_over() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut phy = SondePhy::new(
+            FloorWaveform::new(),
+            BlockingRadio {
+                entered: entered_tx,
+                release: release_rx,
+            },
+        );
+        assert_eq!(phy.tx_in_flight(), 0, "idle before any send");
+
+        phy.send_frame(b"keyed", ModeHint::Floor).unwrap();
+        assert!(
+            phy.tx_in_flight() >= 1,
+            "send_frame bumps in-flight synchronously — the link must never see a queued over as idle"
+        );
+
+        // The worker is now parked inside Radio::transmit (PTT asserted).
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker entered transmit");
+        assert_eq!(
+            phy.tx_in_flight(),
+            1,
+            "exactly one over is keyed while transmit blocks"
+        );
+
+        // Release the over; the count must drain back to 0 once PTT releases.
+        release_tx.send(()).unwrap();
+        let start = Instant::now();
+        while phy.tx_in_flight() != 0 {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "in-flight never drained to 0 after the over completed"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        phy.shutdown();
+    }
+
+    // ─── detected-but-failed RX (sonde-jt6, seam 2) ────────────────────
+
+    /// A radio that hands back one pre-built capture on the first `receive`,
+    /// then silence — to inject a specific RX window into the worker.
+    struct ReplayRadio {
+        capture: Vec<f32>,
+        delivered: bool,
+    }
+    impl Radio for ReplayRadio {
+        fn transmit(&mut self, _samples: &[f32]) -> Result<(), PhyError> {
+            Ok(())
+        }
+        fn receive(&mut self, max: usize) -> Result<Vec<f32>, PhyError> {
+            if !self.delivered {
+                self.delivered = true;
+                Ok(self.capture.clone())
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+                Ok(vec![0.0; max])
+            }
+        }
+    }
+
+    #[test]
+    fn detected_but_failed_frame_counts_as_an_rx_error() {
+        use sonde_fec::codec::FloorRate14Codec;
+        use sonde_phy::robustness_floor::wideband_lowdensity::{
+            WidebandLowDensityFloor, PREAMBLE_LEN_SAMPLES,
+        };
+
+        // Build a capture that holds a real preamble + a real first block, but
+        // is cut short before the later blocks the header declares. The demod
+        // acquires sync (so this is NOT silence) then fails to decode the
+        // missing blocks — exactly the case the old `Option<DecodedFrame>` hid
+        // as "no frame", leaving FER structurally blind to RX failures.
+        let floor = WidebandLowDensityFloor::with_fec(Box::new(FloorRate14Codec::new()));
+        let payload: Vec<u8> = (0..600).map(|i| (i % 251) as u8).collect();
+        let full = floor.transmit_multi_with_preamble(&payload).unwrap();
+        let keep = PREAMBLE_LEN_SAMPLES + (full.len() - PREAMBLE_LEN_SAMPLES) / 2;
+        let capture = full[..keep].to_vec();
+
+        let mut phy = SondePhy::new(
+            FloorWaveform::new(),
+            ReplayRadio {
+                capture,
+                delivered: false,
+            },
+        );
+
+        // Wait until the worker has processed the replayed window and recorded
+        // the failure. A clean miss (silence) would never move the FER.
+        let start = Instant::now();
+        loop {
+            if phy.channel_quality().frame_error_rate() > 0.0 {
+                break;
+            }
+            assert!(
+                phy.poll_rx().is_none(),
+                "a failed decode must not deliver a payload"
+            );
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "the detected-but-failed frame was never counted"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            phy.channel_quality().frame_error_rate(),
+            1.0,
+            "the only frame seen was a failure, so FER is 1.0"
+        );
+        assert!(
+            phy.poll_rx().is_none(),
+            "no payload is delivered for a failed decode"
         );
         phy.shutdown();
     }

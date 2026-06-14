@@ -7,7 +7,7 @@
 
 use sonde_phy::modes::{ModeFamily, ModeHint};
 use sonde_phy::phy_api::PhyTransport;
-use sonde_phy_runtime::{DecodedFrame, Radio, SondePhy, Waveform};
+use sonde_phy_runtime::{DecodeScan, DecodedFrame, Radio, SondePhy, Waveform};
 use std::time::{Duration, Instant};
 
 /// A toy waveform: payload bytes are widened to f32 samples 1:1 and read back
@@ -19,7 +19,7 @@ impl Waveform for ByteEchoWaveform {
     fn encode(&self, payload: &[u8]) -> Result<Vec<f32>, sonde_phy::error::PhyError> {
         Ok(payload.iter().map(|&b| b as f32).collect())
     }
-    fn decode_scan(&self, samples: &[f32]) -> Option<DecodedFrame> {
+    fn decode_scan(&self, samples: &[f32]) -> DecodeScan {
         // Loopback wraps with leading/trailing zero silence; strip zeros.
         let bytes: Vec<u8> = samples
             .iter()
@@ -27,9 +27,9 @@ impl Waveform for ByteEchoWaveform {
             .map(|&s| s as u8)
             .collect();
         if bytes.is_empty() {
-            None
+            DecodeScan::NoSignal
         } else {
-            Some(DecodedFrame {
+            DecodeScan::Frame(DecodedFrame {
                 payload: bytes,
                 family: ModeFamily::OfdmMain,
                 frame_snr_db: Some(42.0),

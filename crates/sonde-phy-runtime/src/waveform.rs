@@ -11,7 +11,9 @@
 use sonde_fec::codec::FloorRate14Codec;
 use sonde_phy::error::PhyError;
 use sonde_phy::modes::ModeFamily;
-use sonde_phy::robustness_floor::wideband_lowdensity::WidebandLowDensityFloor;
+use sonde_phy::robustness_floor::wideband_lowdensity::{
+    SyncDecodeOutcome, WidebandLowDensityFloor,
+};
 
 /// One successfully demodulated frame.
 #[derive(Debug, Clone, PartialEq)]
@@ -27,6 +29,25 @@ pub struct DecodedFrame {
     pub frame_snr_db: Option<f32>,
 }
 
+/// Outcome of [`Waveform::decode_scan`] on one RX window.
+///
+/// The three variants exist so [`crate::SondePhy`]'s RX pump can keep an honest
+/// frame-error rate: a frame that was *detected but failed to decode* is a real
+/// error and must count, whereas a window of silence is not. Collapsing both
+/// into "no frame" (the old `Option<DecodedFrame>`) made the FER structurally
+/// blind to RX failures, which starved subsystem #5's link adaptation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DecodeScan {
+    /// No frame present — the window caught only noise/silence.
+    NoSignal,
+    /// A frame was detected (sync/preamble acquired) but it failed to decode
+    /// (FEC reject or truncated body). No payload is produced, but the runtime
+    /// counts it as a frame error.
+    Detected,
+    /// A frame decoded cleanly.
+    Frame(DecodedFrame),
+}
+
 /// A modulation/demodulation format. Implementors are `Send` so the runtime
 /// worker thread can own one.
 pub trait Waveform: Send {
@@ -34,10 +55,12 @@ pub trait Waveform: Send {
     /// body) ready to hand to a [`crate::Radio`].
     fn encode(&self, payload: &[u8]) -> Result<Vec<f32>, PhyError>;
 
-    /// Scan `samples` for a frame and demodulate it. Returns `None` when no
-    /// frame is present (the common case for an RX window that caught only
-    /// noise). Returns `Some` on a clean decode.
-    fn decode_scan(&self, samples: &[f32]) -> Option<DecodedFrame>;
+    /// Scan `samples` for a frame and demodulate it. Returns
+    /// [`DecodeScan::NoSignal`] when no frame is present (the common case for an
+    /// RX window that caught only noise), [`DecodeScan::Detected`] when a frame
+    /// was acquired but failed to decode (a real frame error), and
+    /// [`DecodeScan::Frame`] on a clean decode.
+    fn decode_scan(&self, samples: &[f32]) -> DecodeScan;
 
     /// The mode family this waveform serves. Used by [`crate::SondePhy`] to
     /// route a `ModeHint` to the right waveform once more than one is
@@ -76,14 +99,15 @@ impl Waveform for FloorWaveform {
         self.inner.transmit_multi_with_preamble(payload)
     }
 
-    fn decode_scan(&self, samples: &[f32]) -> Option<DecodedFrame> {
-        match self.inner.receive_multi_with_sync(samples) {
-            Ok((_offset, payload)) => Some(DecodedFrame {
+    fn decode_scan(&self, samples: &[f32]) -> DecodeScan {
+        match self.inner.receive_multi_with_sync_scan(samples) {
+            SyncDecodeOutcome::Frame { payload, .. } => DecodeScan::Frame(DecodedFrame {
                 payload,
                 family: ModeFamily::RobustnessFloor,
                 frame_snr_db: None,
             }),
-            Err(_) => None,
+            SyncDecodeOutcome::DetectedDecodeFailed { .. } => DecodeScan::Detected,
+            SyncDecodeOutcome::NoSignal => DecodeScan::NoSignal,
         }
     }
 
@@ -107,15 +131,19 @@ mod tests {
         let mut captured = vec![0.0f32; 500];
         captured.extend_from_slice(&samples);
 
-        let frame = wf.decode_scan(&captured).expect("a frame is decoded");
-        assert_eq!(frame.payload, payload);
-        assert_eq!(frame.family, ModeFamily::RobustnessFloor);
+        match wf.decode_scan(&captured) {
+            DecodeScan::Frame(frame) => {
+                assert_eq!(frame.payload, payload);
+                assert_eq!(frame.family, ModeFamily::RobustnessFloor);
+            }
+            other => panic!("expected a decoded frame, got {other:?}"),
+        }
     }
 
     #[test]
-    fn floor_waveform_returns_none_on_pure_noise() {
+    fn floor_waveform_reports_no_signal_on_pure_noise() {
         let wf = FloorWaveform::new();
         let silence = vec![0.0f32; 4096];
-        assert!(wf.decode_scan(&silence).is_none());
+        assert_eq!(wf.decode_scan(&silence), DecodeScan::NoSignal);
     }
 }
