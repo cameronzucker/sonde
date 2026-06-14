@@ -241,6 +241,10 @@ export function createWaterfall(mountEl) {
       window.removeEventListener("resize", onResize);
     }
 
+    if (surfaceMesh) {
+      scene.remove(surfaceMesh);
+      surfaceMesh = null;
+    }
     if (currentGeo) {
       currentGeo.dispose();
       currentGeo = null;

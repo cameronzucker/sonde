@@ -65,7 +65,7 @@ export function createPlayback({ onFrame, onDone }) {
     durationS = Math.max(0, Number(r?.time_to_deliver_s) || 0);
     symbolStarts = Array.isArray(r?.symbols) ? r.symbols.map((s) => Number(s.t_start_s) || 0) : [];
     elapsedS = 0;
-    emit();
+    if (r) emit(); // load(null) just resets state (e.g. on engine error) — no frame
   }
 
   function play() {

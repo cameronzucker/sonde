@@ -12,6 +12,11 @@ export async function initEngine(base = "./assets") {
     fetch(`${base}/payload.bin`),
     fetch(`${base}/payload.offsets.json`),
   ]);
+  if (!binResp.ok || !offResp.ok) {
+    throw new Error(
+      `payload assets missing (payload.bin ${binResp.status}, offsets ${offResp.status}) — run demo/build-assets.sh`,
+    );
+  }
   _payload = new Uint8Array(await binResp.arrayBuffer());
   _offsetsJson = await offResp.text();
   _offsets = JSON.parse(_offsetsJson);

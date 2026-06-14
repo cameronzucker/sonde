@@ -207,7 +207,7 @@ body {
 .reg::before { width: 16px; height: 1.5px; } .reg::after { width: 1.5px; height: 16px; }
 .reg--tl { top: 10px; left: 10px; } .reg--tr { top: 10px; right: 10px; }
 .reg--bl { bottom: 10px; left: 10px; } .reg--br { bottom: 10px; right: 10px; }
-.reg--tr::before, .reg--br::before { right: 0; } .reg--tr::after, .reg--tr::before { right: 0; }
+.reg--tr::before, .reg--tr::after, .reg--br::before { right: 0; }
 .reg--bl::before, .reg--bl::after { bottom: 0; } .reg--br::before, .reg--br::after { bottom: 0; right: 0; }
 
 /* ── Control panel ─────────────────────────────────────────────────────── */
@@ -428,6 +428,14 @@ body {
 }
 .credit { max-width: 70ch; }
 .license { color: var(--muted); }
+
+/* ── Focus visibility (keyboard) ───────────────────────────────────────── */
+.seg:focus-visible, .toggle__opt:focus-visible, .transport__play:focus-visible,
+.picker:focus-visible, .slider:focus-visible, .scrub:focus-visible,
+.transport__speed select:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 2px;
+}
 
 /* ── Motion ────────────────────────────────────────────────────────────── */
 @keyframes rise { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }

@@ -69,6 +69,8 @@ function runAndLoad() {
     statDeliver.textContent = "—";
     setAdaptation(`Engine error: ${err.message}`);
     imageReveal.showFailed();
+    playback.load(null); // stop any animation from the previous result
+    setPlayGlyph(false);
     return;
   }
 
@@ -88,7 +90,9 @@ function runAndLoad() {
   const pick = state.auto ? `Auto selected ${r.mode_id}` : `Manual: ${r.mode_id}`;
   const outcome = r.recovered_ok
     ? "link closes — payload recovered."
-    : "link fails to sync — multipath beyond the floor's reach.";
+    : (state.condition === "none"
+        ? "SNR too low — the floor waveform can't close the link."
+        : "link fails to sync — multipath beyond the floor's reach.");
   setAdaptation(`${pick} for ${state.snrDb} dB / ${state.condition}. ${outcome}`);
 
   // Views.

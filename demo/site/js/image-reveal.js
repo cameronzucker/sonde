@@ -19,6 +19,13 @@ export function createImageReveal(canvasEl) {
 
   // ── race guard: monotonically increasing generation token ──
   let _generation = 0;
+  // Latest fraction passed to render(), so an async decode that resolves a few
+  // frames late draws at the CURRENT playback position, not a stale one.
+  let _lastFraction = 0;
+
+  // ── reusable offscreen canvas for the corrupt-JPEG byte-grid composite ──
+  let _offscreen = null;
+  let _offctx = null;
 
   // ── dark background color ──
   const BG = "#0b0f14";
@@ -69,11 +76,13 @@ export function createImageReveal(canvasEl) {
       ctx.drawImage(bitmap, dx, dy, dw, dh);
     } else if (_cachedPixelData) {
       // Byte-grid: putImageData ignores the clip region, so we composite via
-      // a temporary offscreen canvas instead.
-      const offscreen = new OffscreenCanvas(W, H);
-      const octx = offscreen.getContext("2d");
-      octx.putImageData(_cachedPixelData, 0, 0);
-      ctx.drawImage(offscreen, 0, 0);
+      // a reused offscreen canvas (avoids allocating one per frame).
+      if (!_offscreen || _offscreen.width !== W || _offscreen.height !== H) {
+        _offscreen = new OffscreenCanvas(W, H);
+        _offctx = _offscreen.getContext("2d");
+      }
+      _offctx.putImageData(_cachedPixelData, 0, 0);
+      ctx.drawImage(_offscreen, 0, 0);
     }
 
     ctx.restore();
@@ -138,6 +147,7 @@ export function createImageReveal(canvasEl) {
    * @param {number} fraction  0..1 reveal progress
    */
   function render(recoveredBytes, imageRange, fraction) {
+    _lastFraction = fraction;
     // Guard: empty payload or empty image slice → showFailed.
     if (!recoveredBytes || recoveredBytes.length === 0) {
       showFailed();
@@ -181,14 +191,14 @@ export function createImageReveal(canvasEl) {
       if (_generation !== myGen) return; // stale — a newer render() superseded this
 
       _cachedBitmap = bitmap;
-      drawWithClip(bitmap, fraction);
+      drawWithClip(bitmap, _lastFraction); // draw at the current position, not the stale one
     }).catch(() => {
       if (_generation !== myGen) return;
 
       // Corrupt JPEG: render byte-grid.
       _cachedBitmap = "corrupt";
       buildByteGrid(bytes);
-      drawWithClip(null, fraction);
+      drawWithClip(null, _lastFraction);
     });
   }
 
