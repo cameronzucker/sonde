@@ -17,6 +17,7 @@ use sonde_phy::phy_api::PhyTransport;
 
 use crate::conn::{ConnState, Connection, HostEvent};
 use crate::frame::LinkFrame;
+use crate::host::HostCommand;
 
 /// Drives a [`Connection`] over a `PhyTransport`.
 pub struct Link<P: PhyTransport> {
@@ -44,6 +45,16 @@ impl<P: PhyTransport> Link<P> {
     /// Begin a clean teardown.
     pub fn disconnect(&mut self, now: Duration) {
         self.conn.disconnect(now);
+    }
+
+    /// Apply a host/TNC command (#8). The complementary half of the contract is
+    /// the [`HostEvent`] stream returned by [`Link::poll`].
+    pub fn command(&mut self, cmd: HostCommand, now: Duration) {
+        match cmd {
+            HostCommand::Connect => self.conn.connect(now),
+            HostCommand::Send(data) => self.conn.send(data),
+            HostCommand::Disconnect => self.conn.disconnect(now),
+        }
     }
 
     /// Current connection state.
