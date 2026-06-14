@@ -96,4 +96,23 @@ mod tests {
         assert_eq!(recommend_mode(30.0), "floor-wblo");
         assert_eq!(recommend_mode(-5.0), "floor-wblo");
     }
+
+    #[test]
+    fn run_link_json_includes_recovered_and_rx_bytes() {
+        let payload: Vec<u8> = (0..60).map(|i| i as u8).collect();
+        let offsets = serde_json::json!({
+            "total_len": payload.len(),
+            "fields": [{"label":"image","start":0,"end":payload.len()}],
+            "image_byte_len": payload.len()
+        })
+        .to_string();
+        let json = run_link(&payload, &offsets, "floor-wblo", 80.0, "none", 1);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v["recovered_bytes"].is_array());
+        assert_eq!(
+            v["recovered_bytes"].as_array().unwrap().len(),
+            payload.len()
+        );
+        assert!(v["symbols"][0]["rx_bytes"].is_array());
+    }
 }
