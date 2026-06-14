@@ -87,18 +87,26 @@ function runAndLoad() {
   statDeliver.textContent = `${r.time_to_deliver_s.toFixed(1)} s`;
 
   // Adaptation narrative.
+  // Three outcome states: clean recovery; synced-but-corrupted (frame decoded
+  // with bit errors — recovered_bytes present but != payload); failed sync
+  // (no recovered_bytes). The engine reports recovered_ok=false for BOTH of the
+  // latter two, so the image/narrative key off recovered_bytes PRESENCE, not
+  // recovered_ok — otherwise the corrupting-image showcase reads "DECODE FAILED".
+  const synced = Array.isArray(r.recovered_bytes) && r.recovered_bytes.length > 0;
   const pick = state.auto ? `Auto selected ${r.mode_id}` : `Manual: ${r.mode_id}`;
   const outcome = r.recovered_ok
     ? "link closes — payload recovered."
-    : (state.condition === "none"
-        ? "SNR too low — the floor waveform can't close the link."
-        : "link fails to sync — multipath beyond the floor's reach.");
+    : synced
+      ? `link syncs but bit errors corrupt the payload (BER ${(r.ber * 100).toFixed(1)}%) — watch the recon image degrade.`
+      : (state.condition === "none"
+          ? "SNR too low — the floor waveform can't close the link."
+          : "link fails to sync — multipath beyond the floor's reach.");
   setAdaptation(`${pick} for ${state.snrDb} dB / ${state.condition}. ${outcome}`);
 
   // Views.
   waterfall.setData(r.spectrogram);
   packetConsole.reset();
-  if (r.recovered_ok) imageReveal.render(r.recovered_bytes, imageRange, 0);
+  if (synced) imageReveal.render(r.recovered_bytes, imageRange, 0);
   else imageReveal.showFailed();
 
   playback.load(r);
@@ -110,7 +118,9 @@ function runAndLoad() {
 function onFrame(fraction, symbolIndex) {
   waterfall.setNow(fraction);
 
-  if (result?.recovered_ok) {
+  // Render whenever bytes were recovered (clean OR corrupted) — not only on
+  // recovered_ok, so the corrupting reveal works in the marginal regime.
+  if (result && Array.isArray(result.recovered_bytes) && result.recovered_bytes.length > 0) {
     imageReveal.render(result.recovered_bytes, imageRange, fraction);
   }
 
@@ -130,7 +140,10 @@ function onFrame(fraction, symbolIndex) {
 
 function onDone() {
   setPlayGlyph(false);
-  if (result && !result.recovered_ok) imageReveal.showFailed();
+  // Only show the failed placeholder for a true sync failure (no bytes at all);
+  // a synced-but-corrupted decode keeps its (corrupted) recovered image.
+  const synced = result && Array.isArray(result.recovered_bytes) && result.recovered_bytes.length > 0;
+  if (result && !synced) imageReveal.showFailed();
 }
 
 // ── Transport controls ───────────────────────────────────────────────────────
