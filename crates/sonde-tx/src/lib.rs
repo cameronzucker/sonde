@@ -203,7 +203,8 @@ pub fn encode_payload(
     payload: &[u8],
     frame_mode: FrameMode,
 ) -> Result<AudioBuffer, TxError> {
-    let floor = WidebandLowDensityFloor::new();
+    let floor =
+        WidebandLowDensityFloor::with_fec(Box::new(sonde_fec::codec::FloorRate14Codec::new()));
     let samples = match (mode, frame_mode) {
         (Mode::WideFloor, FrameMode::Raw) => floor.transmit(payload).map_err(TxError::Phy)?,
         (Mode::WideFloor, FrameMode::Sync) => floor
@@ -674,10 +675,17 @@ mod tests {
 
     #[test]
     fn encode_payload_oversized_returns_phy_error() {
-        // The wide-floor mode's single-symbol capacity is ~9 bytes
-        // (per wideband_lowdensity.rs docstring). 64 bytes is well
-        // over.
-        let err = encode_payload(Mode::WideFloor, &[0u8; 64], FrameMode::Raw).unwrap_err();
+        // Under the rate-1/4 coded floor path, the wide-floor mode no
+        // longer caps at a single OFDM symbol — multi-block framing
+        // carries payloads up to u16::MAX bytes. The PayloadTooLarge
+        // ceiling is now that u16::MAX limit, so the oversize case must
+        // exceed 65_535 bytes.
+        let err = encode_payload(
+            Mode::WideFloor,
+            &[0u8; (u16::MAX as usize) + 1],
+            FrameMode::Raw,
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             TxError::Phy(PhyError::PayloadTooLarge { .. })
@@ -964,9 +972,12 @@ mod tests {
         buffer.write_wav(&path).unwrap();
         let read_back = AudioBuffer::read_wav(&path).unwrap();
         let _ = std::fs::remove_file(&path);
-        let decoded = WidebandLowDensityFloor::new()
-            .receive(read_back.samples())
-            .unwrap();
+        // encode_payload now emits FloorRate14-coded samples, so the
+        // decode side must use a floor wired with the same codec.
+        let decoded =
+            WidebandLowDensityFloor::with_fec(Box::new(sonde_fec::codec::FloorRate14Codec::new()))
+                .receive(read_back.samples())
+                .unwrap();
         assert_eq!(decoded, payload);
     }
 
@@ -1323,9 +1334,13 @@ mod tests {
         use sonde_phy::robustness_floor::wideband_lowdensity::WidebandLowDensityFloor;
         let payload = b"HELLO_MULTI_SYNC";
         let got = encode_payload(Mode::WideFloor, payload, FrameMode::MultiSync).unwrap();
-        let want = WidebandLowDensityFloor::new()
-            .transmit_multi_with_preamble(payload)
-            .unwrap();
+        // The reference floor must carry the same FEC codec that
+        // encode_payload now wires in, else the coded sample streams
+        // differ.
+        let want =
+            WidebandLowDensityFloor::with_fec(Box::new(sonde_fec::codec::FloorRate14Codec::new()))
+                .transmit_multi_with_preamble(payload)
+                .unwrap();
         assert_eq!(got.samples().len(), want.len());
         for (i, (&a, &b)) in got.samples().iter().zip(want.iter()).enumerate() {
             assert!((a - b).abs() < 1e-6, "sample {i} differs: {a} vs {b}");
@@ -1411,5 +1426,17 @@ mod tests {
     fn args_parse_watchdog_bin_without_value_errors() {
         let err = Args::parse(&s(&["--watchdog-bin"])).unwrap_err();
         assert!(err.contains("--watchdog-bin"));
+    }
+
+    // ─── FEC wiring (sonde-64w.1) ───────────────────────────────────
+
+    #[test]
+    fn encode_payload_uses_floor_fec_round_trip() {
+        use sonde_fec::codec::FloorRate14Codec;
+        use sonde_phy::robustness_floor::wideband_lowdensity::WidebandLowDensityFloor;
+        let buf = encode_payload(Mode::WideFloor, b"FECWIRED", FrameMode::MultiSync).unwrap();
+        let floor = WidebandLowDensityFloor::with_fec(Box::new(FloorRate14Codec::new()));
+        let (_s, decoded) = floor.receive_multi_with_sync(buf.samples()).unwrap();
+        assert_eq!(decoded, b"FECWIRED");
     }
 }
