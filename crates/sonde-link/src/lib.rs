@@ -25,14 +25,18 @@
 #![warn(missing_docs)]
 
 pub mod arq;
+pub mod clock;
 pub mod conn;
+pub mod driver;
 pub mod frame;
 pub mod host;
 pub mod link;
 pub mod mac;
 pub mod profile;
 
+pub use clock::{Clock, SystemClock};
 pub use conn::{ConnState, Connection, HostEvent};
+pub use driver::Driver;
 pub use frame::{Callsign, FrameError, FrameType, LinkFrame, LINK_MTU, LINK_OVERHEAD};
 pub use host::HostCommand;
 pub use link::Link;
