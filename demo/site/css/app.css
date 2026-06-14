@@ -397,6 +397,14 @@ body {
   border: 1px solid var(--line-strong); cursor: pointer; -webkit-appearance: none; appearance: none;
 }
 .transport__speed option { background: var(--panel-1); }
+.transport__mute {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 40px; height: 40px; border-radius: 8px; cursor: pointer;
+  background: rgba(0,0,0,0.3); border: 1px solid var(--line-strong);
+  font-size: 16px; line-height: 1; color: var(--ink);
+}
+.transport__mute:hover { border-color: var(--teal); }
+.transport__mute[aria-pressed="true"] { opacity: 0.55; }
 
 /* ── Explainer ─────────────────────────────────────────────────────────── */
 .explainer {

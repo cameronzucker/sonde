@@ -1,12 +1,13 @@
 // main.js — bootstrap + wiring for the Sonde adaptive-link demo (ES module).
 // engine.js is the only wasm-aware module; every view consumes parsed LinkResult objects.
 
-import { initEngine, listModes, recommendMode, runLink, offsets } from "./engine.js";
+import { initEngine, listModes, recommendMode, runLink, linkAudio, offsets, SAMPLE_RATE_HZ } from "./engine.js";
 import { createWaterfall } from "./waterfall.js";
 import { createConsole } from "./console.js";
 import { createImageReveal } from "./image-reveal.js";
 import { createPlayback } from "./playback.js";
 import { createControls } from "./controls.js";
+import { createAudioPlayer } from "./audio.js";
 
 // ── DOM handles ─────────────────────────────────────────────────────────────
 const el = (id) => document.getElementById(id);
@@ -20,9 +21,11 @@ const adaptation = el("adaptation-readout");
 const playBtn = el("play-btn");
 const scrub = el("scrub");
 const speedSel = el("speed");
+const muteBtn = el("mute-btn");
+const muteGlyph = el("mute-glyph");
 
 // ── Module instances + run state ─────────────────────────────────────────────
-let waterfall, packetConsole, imageReveal, playback, controls;
+let waterfall, packetConsole, imageReveal, playback, controls, audioPlayer;
 let modes = [];
 let result = null;          // current LinkResult
 let imageRange = [0, 0];    // [start,end] of the image field within the payload
@@ -56,9 +59,10 @@ function runAndLoad() {
   const state = controls.getState();
   const mode = state.auto ? recommendMode(state.snrDb) : (state.mode || recommendMode(state.snrDb));
 
+  const runSeed = seed++; // capture so the audio uses the SAME channel realization
   let r;
   try {
-    r = runLink(mode, state.snrDb, state.condition, seed++);
+    r = runLink(mode, state.snrDb, state.condition, runSeed);
   } catch (err) {
     // Engine refused this mode/condition — surface it without crashing the page.
     statMode.textContent = mode;
@@ -69,6 +73,7 @@ function runAndLoad() {
     statDeliver.textContent = "—";
     setAdaptation(`Engine error: ${err.message}`);
     imageReveal.showFailed();
+    audioPlayer.load(null); // no audio for an unavailable mode
     playback.load(null); // stop any animation from the previous result
     setPlayGlyph(false);
     return;
@@ -106,11 +111,18 @@ function runAndLoad() {
   // Views.
   waterfall.setData(r.spectrogram);
   packetConsole.reset();
-  if (synced) imageReveal.render(r.recovered_bytes, imageRange, 0);
-  else imageReveal.showFailed();
+  if (!synced) imageReveal.showFailed();
+
+  // Audio: the channel-impaired waveform for this exact run (same seed) — lets
+  // the operator hear the modulated signal. Plays on the transport Play button.
+  audioPlayer.load(linkAudio(mode, state.snrDb, state.condition, runSeed), SAMPLE_RATE_HZ);
 
   playback.load(r);
-  scrub.value = "0";
+  // Land on the fully-delivered frame so the recon image + packet console are
+  // populated at rest. Previously the page sat at fraction 0 — a 0%-revealed,
+  // i.e. blank, recon image — until the operator pressed Play. Play/scrub now
+  // replays the progressive fill-in from the start on demand.
+  playback.scrub(1);
   setPlayGlyph(false);
 }
 
@@ -158,9 +170,14 @@ function wireTransport() {
   playBtn.addEventListener("click", () => {
     if (playback.isPlaying()) {
       playback.pause();
+      audioPlayer.stop();
       setPlayGlyph(false);
     } else {
+      // playback.play() replays from the start when parked at the end; mirror
+      // that for the audio so sound and visuals start together.
+      const offset = Number(scrub.value) >= 1000 ? 0 : Number(scrub.value) / 1000;
       playback.play();
+      audioPlayer.play(offset);
       setPlayGlyph(playback.isPlaying());
     }
   });
@@ -168,11 +185,19 @@ function wireTransport() {
   scrub.addEventListener("input", () => {
     scrubbing = true;
     playback.scrub(Number(scrub.value) / 1000);
+    audioPlayer.stop(); // audio resumes from the new position on next Play
     setPlayGlyph(false);
   });
   scrub.addEventListener("change", () => { scrubbing = false; });
 
   speedSel.addEventListener("change", () => playback.setSpeed(Number(speedSel.value)));
+
+  muteBtn.addEventListener("click", () => {
+    const next = !audioPlayer.isMuted();
+    audioPlayer.setMuted(next);
+    muteBtn.setAttribute("aria-pressed", String(next));
+    if (muteGlyph) muteGlyph.textContent = next ? "🔇" : "🔊";
+  });
 }
 
 // ── Credit line ────────────────────────────────────────────────────────────--
@@ -197,6 +222,7 @@ async function boot() {
   packetConsole = createConsole(el("tx-console"), el("rx-console"), el("flip-count"));
   imageReveal = createImageReveal(el("recon-image"));
   playback = createPlayback({ onFrame, onDone });
+  audioPlayer = createAudioPlayer();
   controls = createControls(modes, runAndLoad);
 
   wireTransport();

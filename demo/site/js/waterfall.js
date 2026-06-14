@@ -13,10 +13,13 @@ const HALF_X = 4.0; // cols mapped to [-HALF_X, +HALF_X]
 const HALF_Z = 2.5; // rows  mapped to [-HALF_Z, +HALF_Z]
 const Y_SCALE = 1.5; // vertical exaggeration
 
-// Camera orbit parameters.
+// Camera parameters. The camera no longer auto-orbits — a moving surface reads
+// as a spinning toy and can't be studied. It holds a fixed 3/4 view; the
+// operator drags to orbit/tilt so the occupied band can actually be inspected.
 const CAM_RADIUS = 7.5;
-const CAM_Y = 4.5;
-const ORBIT_SPEED = 0.0004; // radians per ms
+const CAM_Y_MIN = 1.2;
+const CAM_Y_MAX = 7.5;
+const Y_GAMMA = 0.75; // <1 lifts low/mid magnitudes so structure is visible
 
 export function createWaterfall(mountEl) {
   // ── Renderer ──────────────────────────────────────────────────────────────
@@ -42,19 +45,50 @@ export function createWaterfall(mountEl) {
     0.1,
     100,
   );
-  // Start at angle 0; orbit loop updates each frame.
+  // Fixed 3/4 starting view; operator drags to orbit (azimuth) and tilt (height).
   let orbitAngle = Math.PI / 6;
+  let camY = 4.5;
   const orbitCenter = new THREE.Vector3(0, 0, 0);
   updateCamera();
 
   function updateCamera() {
     camera.position.set(
       CAM_RADIUS * Math.cos(orbitAngle),
-      CAM_Y,
+      camY,
       CAM_RADIUS * Math.sin(orbitAngle),
     );
     camera.lookAt(orbitCenter);
   }
+
+  // ── Manual orbit: pointer drag (mouse + touch via pointer events) ───────────
+  let dragging = false;
+  let lastPX = 0;
+  let lastPY = 0;
+  renderer.domElement.style.touchAction = "none";
+  renderer.domElement.style.cursor = "grab";
+  renderer.domElement.addEventListener("pointerdown", (e) => {
+    dragging = true;
+    lastPX = e.clientX;
+    lastPY = e.clientY;
+    renderer.domElement.style.cursor = "grabbing";
+    renderer.domElement.setPointerCapture?.(e.pointerId);
+  });
+  renderer.domElement.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    orbitAngle -= (e.clientX - lastPX) * 0.01; // horizontal drag → orbit
+    camY = Math.max(CAM_Y_MIN, Math.min(CAM_Y_MAX, camY + (e.clientY - lastPY) * 0.03));
+    lastPX = e.clientX;
+    lastPY = e.clientY;
+    updateCamera();
+  });
+  const endDrag = (e) => {
+    dragging = false;
+    renderer.domElement.style.cursor = "grab";
+    if (e?.pointerId !== undefined) renderer.domElement.releasePointerCapture?.(e.pointerId);
+  };
+  renderer.domElement.addEventListener("pointerup", endDrag);
+  renderer.domElement.addEventListener("pointercancel", endDrag);
+  renderer.domElement.addEventListener("pointerleave", endDrag);
 
   // ── Surface mesh (placeholder, rebuilt in setData) ────────────────────────
   // material is shared and reused; only geometry is replaced on setData.
@@ -104,16 +138,11 @@ export function createWaterfall(mountEl) {
 
   // ── Animation loop ────────────────────────────────────────────────────────
   let rafId = null;
-  let lastTime = null;
 
-  function animate(now) {
+  function animate() {
     rafId = requestAnimationFrame(animate);
-    const dt = lastTime === null ? 0 : now - lastTime;
-    lastTime = now;
-
-    orbitAngle += ORBIT_SPEED * dt;
-    updateCamera();
-
+    // No auto-orbit: the camera moves only on operator drag (updateCamera()).
+    // The loop still runs so the sweep plane animates during playback.
     renderer.render(scene, camera);
   }
 
@@ -129,16 +158,20 @@ export function createWaterfall(mountEl) {
       for (let c = 0; c < cols; c++) {
         const idx = r * cols + c;
         const t = (mag_q[idx] ?? 0) / 255;
+        // Gamma-lift height + color so the occupied band stands out against the
+        // noise floor instead of reading as a flat slab (legibility, not data
+        // change — t is still the real quantized magnitude).
+        const ts = Math.pow(t, Y_GAMMA);
         const x = cols <= 1 ? 0 : (c / (cols - 1)) * (HALF_X * 2) - HALF_X;
         const z = rows <= 1 ? 0 : (r / (rows - 1)) * (HALF_Z * 2) - HALF_Z;
-        const y = t * Y_SCALE;
+        const y = ts * Y_SCALE;
 
         const vi = idx * 3;
         positions[vi] = x;
         positions[vi + 1] = y;
         positions[vi + 2] = z;
 
-        const [cr, cg, cb] = viridis(t);
+        const [cr, cg, cb] = viridis(ts);
         colors[vi] = cr / 255;
         colors[vi + 1] = cg / 255;
         colors[vi + 2] = cb / 255;
