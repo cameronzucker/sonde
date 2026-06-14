@@ -1,0 +1,2 @@
+# payload.bin is a committed demo artifact; override the root *.bin ignore.
+!payload.bin
