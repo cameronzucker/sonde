@@ -29,8 +29,16 @@ foundation both demo modes share.
   brainstorm/spec. The engine seam (`run_link(payload, mode, snr, condition, seed)`) already
   supports it — that mode is purely a second input source producing the same (snr, condition).
 - **Full-speed QAM modes** — shown as "pending" until the parallel PHY work lands.
-- **Per-symbol live decode** and **corrupted-image rendering** — need engine API additions
-  (noted as future).
+- **2D waveform scope / 2D waterfall lane** — considered during brainstorming and
+  **dropped**; the 3D waterfall is the sole signal display (more impressive, fewer panels).
+  Revisit only if a standard-SDR stacked view is later wanted.
+- **Continuous "live-link" streaming animation** — deferred (this spec uses
+  recompute-on-change + playback).
+
+> **Now IN scope (added in brainstorming):** a **TX | RX packet console** showing actual
+> sent vs received bytes with flipped-byte highlighting, and **real corrupted-image
+> rendering** — both enabled by small engine additions (recovered payload bytes +
+> per-symbol decoded bytes; see §3).
 
 ## 3. Engine contract consumed (already built)
 
@@ -46,6 +54,18 @@ From `crates/sonde-wasm` (built to `demo/site/pkg/` via `wasm-bindgen --target w
 payload_len, preamble_samples, symbol_size_samples, total_samples, time_to_deliver_s,
 throughput_bps, symbols[] {idx, sample_start/end, t_start_s/t_end_s, bytes[], byte_start,
 byte_end, field}, spectrogram {rows, cols, freqs_hz[], times_s[], mag_q[] (row-major u8)}`.
+
+**Engine additions required (small; land on the `sonde-wasm` engine — its own engine task,
+done before this frontend consumes them):**
+1. `LinkResult.recovered_bytes` — the full decoded payload (already computed inside
+   `run_link_core`, currently discarded). Empty when sync fails. Powers the RX side of the
+   console + the corrupted-image reveal.
+2. Per-symbol **decoded** bytes — add `SymbolRec.rx_bytes` alongside the existing `bytes`
+   (which become the TX/sent ground truth). Requires a small `sonde-phy`
+   `decode_symbols(&samples) -> Vec<Vec<u8>>` accessor (coordinate with the parallel
+   framing refactor, spec §7 of the parent). Lets the console show per-symbol flips synced
+   to playback.
+   No waveform/time-domain export is needed (the 2D scope was dropped).
 
 Static assets produced by `sonde-demo-builder`: `payload.bin` + `payload.offsets.json`
 (field offsets: header / body / image ranges). Requires an operator-provided source image
@@ -65,10 +85,12 @@ as *why adaptation matters* (see §8).
   `poor`, `flutter`); **Auto ⇄ Manual** toggle (Manual reveals a mode picker built from
   `list_modes()`, with non-`implemented` modes shown disabled/"pending").
 - **Adaptation readout:** in Auto, "measured SNR N dB → Sonde chose <mode> / <constellation>."
-- **Packet inspector:** the current symbol's bytes (hex) color-coded by `field`
-  (header / body / image), with byte range and a message-assembly progress bar.
-- **Recovered-image tile:** the recon photo, progressively revealed as playback advances
-  (see §6).
+- **TX | RX packet console:** side-by-side hex of the current symbol's **sent** bytes
+  (ground truth) vs **received** bytes (`rx_bytes`), with flipped bytes highlighted; field
+  color-coding (header / body / image), byte range, a running flip count, and a
+  message-assembly progress bar. Updates per-symbol in sync with the waterfall "now" marker.
+- **Recovered-image tile:** the recon photo, progressively revealed as playback advances;
+  shows **real corruption** from `recovered_bytes` when bits flip (see §6).
 - **Stats bar:** mode, constellation, BER, throughput (bps), time-to-deliver (s),
   measured SNR.
 - **Explainer + honesty banner** (see §8).
@@ -89,15 +111,16 @@ as *why adaptation matters* (see §8).
 
 ## 6. Recovered-image handling (Phase 1)
 
-`run_link` does not return recovered bytes; it returns `recovered_ok` + `ber`. Therefore:
-- **On `recovered_ok` (BER 0):** recovered bytes equal the original, so the tile renders the
-  **known image** decoded from `payload.bin`'s image byte-range (from `payload.offsets.json`),
-  revealed progressively in step with the playback marker (the "image arriving over radio"
-  effect).
-- **On failure (multipath / low SNR):** show a "decode failed — no clean image recovered"
-  state (e.g., static/noise placeholder) rather than a fake image.
-- Rendering *partially corrupted* bytes would require an engine API that returns the
-  recovered buffer — explicitly **future**, not Phase 1.
+With `recovered_bytes` now on `LinkResult` (§3), the tile renders the **actual received
+image** from the image byte-range (per `payload.offsets.json`):
+- **High SNR / Ideal channel (BER 0):** received == original → a clean photo, revealed
+  progressively in step with the playback marker (the "image arriving over radio" effect).
+- **Marginal AWGN SNR (sync holds, bits flip):** received bytes differ → the rendered JPEG
+  shows **real corruption** (blocky/garbled regions) that worsens as SNR drops — the money
+  shot. Decode the partial/garbled buffer defensively (a corrupt JPEG may fail to decode;
+  fall back to showing the raw byte-grid / a "corrupted" state).
+- **Sync failure (multipath / very low SNR):** `recovered_bytes` is empty → show a
+  "decode failed — no image recovered" state rather than a fake image.
 
 ## 7. Visual approach
 
@@ -108,7 +131,11 @@ as *why adaptation matters* (see §8).
   monospace for data readouts. Exact tokens are the frontend-design skill's to choose within
   this direction (no exact Tuxlink token match required).
 - The 3D waterfall is **Three.js, vendored locally** (works offline + on GitHub Pages
-  identically).
+  identically), and is the **sole signal display** (no 2D waveform/waterfall).
+- **Proportion discipline (explicit constraint):** no full-bleed, edge-to-edge skinny
+  elements — that's an AI-slop tell. Use a contained max-width, a deliberate grid with
+  generous gutters, cards with sensible aspect ratios, and real whitespace. Panels should
+  read as a composed instrument, not stretched bars.
 
 ## 8. Honesty guardrails (in-UI)
 
@@ -130,9 +157,9 @@ demo/
       main.js               # bootstrap: load wasm + payload assets, wire controls
       engine.js             # thin wrapper over sonde_wasm JS API (parse JSON, types)
       waterfall.js          # Three.js waterfall (build/update surface from spectrogram)
-      inspector.js          # packet inspector rendering from symbols[]
+      console.js            # TX|RX packet console: sent vs rx_bytes per symbol + flip highlight
       playback.js           # timeline/playback state machine + "now" marker
-      image-reveal.js       # progressive image render from payload image-range
+      image-reveal.js       # progressive image render from recovered_bytes (real corruption)
       controls.js           # levers, Auto/Manual, debounce
     vendor/three.min.js     # vendored Three.js
     pkg/                    # wasm-bindgen output (sonde_wasm.js + .wasm)
@@ -178,5 +205,6 @@ API shape. Files stay focused (a large `main.js` is a smell to split).
 
 ## 13. Future (explicitly deferred)
 
-Map-linked propagation-game mode (sonde-669.2), full-speed QAM modes, per-symbol live
-decode coloring, corrupted-image rendering, continuous "live link" streaming animation.
+Map-linked propagation-game mode (sonde-669.2), full-speed QAM modes, continuous "live
+link" streaming animation, and the 2D waveform-scope / 2D-waterfall stacked view (dropped
+in favor of the standalone 3D waterfall).
