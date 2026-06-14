@@ -25,6 +25,7 @@ clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 proptest = "1"
+hound = "3"           # WAV I/O for the wav_channel example (sonde-imh ARDOP spike)
 
 [[bin]]
 name = "hf-channel-sim-cli"
