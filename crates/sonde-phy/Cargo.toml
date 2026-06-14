@@ -17,9 +17,9 @@ hound.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 rand = "0.8"
-# Activated as #1 and #4 publish; until then sibling subagents' plans
-# may stub these with path-deps in coordination.
-# hf-channel-sim.workspace = true
+# Channel simulator — drives the robustness-floor fading gate
+# (tests/robustness_floor_fading.rs). Dev-only; not a runtime dep.
+hf-channel-sim.workspace = true
 # sonde-fec.workspace = true
 
 [features]
