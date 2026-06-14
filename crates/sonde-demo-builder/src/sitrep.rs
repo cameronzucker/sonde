@@ -4,7 +4,6 @@ use serde::Serialize;
 
 /// One labeled byte range within the payload.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct Field {
     pub label: String,
     pub start: usize,
@@ -13,7 +12,6 @@ pub struct Field {
 
 /// Field-offset map serialized to `payload.offsets.json`.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct FieldOffsets {
     pub total_len: usize,
     pub fields: Vec<Field>,
@@ -23,7 +21,6 @@ pub struct FieldOffsets {
 /// Build the payload bytes and offsets from envelope text parts and the
 /// compressed image bytes. Layout: header + blank line + body + attachment
 /// marker line + raw image bytes.
-#[allow(dead_code)]
 pub fn build_payload(
     callsign: &str,
     position_line: &str,

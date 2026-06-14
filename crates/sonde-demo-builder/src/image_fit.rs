@@ -7,7 +7,6 @@ use image::{codecs::jpeg::JpegEncoder, DynamicImage};
 /// Resize `img` so its longest side is at most `max_dim`, then JPEG-encode,
 /// lowering quality until the encoded size is <= `target_bytes`. Returns the
 /// encoded JPEG bytes. Errors only if even quality 10 overflows the budget.
-#[allow(dead_code)] // called in Task 4; removed then
 pub fn fit_jpeg(img: &DynamicImage, max_dim: u32, target_bytes: usize) -> Result<Vec<u8>> {
     let resized = img.resize(max_dim, max_dim, image::imageops::FilterType::Triangle);
     let rgb = resized.to_rgb8();
