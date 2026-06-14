@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use crate::arq::{Reassembler, RecvBuffer, SendWindow, FIRST_SEQ};
 use crate::frame::{Callsign, FrameType, LinkFrame};
+use crate::mac::ArqStrategy;
 use crate::profile::ModeProfile;
 
 /// CONN retransmissions before a connect attempt fails.
@@ -97,6 +98,9 @@ pub struct Connection {
     deadline: Option<Duration>,
     awaiting_reply: bool,
     owe_ack: bool,
+    /// Whether to emit the SACK bitmap. Selective repeat sets it; the floor
+    /// `WholeMessage` strategy clears it (cumulative-only, the "no NACK" model).
+    sack_enabled: bool,
     silent_overs: u32,
     conn_retries: u32,
     disc_retries: u32,
@@ -144,10 +148,27 @@ impl Connection {
             deadline: None,
             awaiting_reply: false,
             owe_ack: false,
+            sack_enabled: true,
             silent_overs: 0,
             conn_retries: 0,
             disc_retries: 0,
         }
+    }
+
+    /// Select the ARQ strategy (builder; apply before `connect`). The floor
+    /// `WholeMessage` strategy is the degenerate stop-and-wait: window 1 and no
+    /// SACK (the canonical floor "no NACK" model, design §5). Selective repeat
+    /// keeps the constructed window and SACK.
+    pub fn with_strategy(mut self, strategy: ArqStrategy) -> Self {
+        match strategy {
+            ArqStrategy::SelectiveRepeat => self.sack_enabled = true,
+            ArqStrategy::WholeMessage => {
+                self.sack_enabled = false;
+                self.send = SendWindow::new(1);
+                self.recv = RecvBuffer::new(1);
+            }
+        }
+        self
     }
 
     /// Current lifecycle state.
@@ -290,7 +311,7 @@ impl Connection {
                 self.floor = Floor::Listening;
                 self.awaiting_reply = self.send.has_unacked();
                 let wait = if self.awaiting_reply {
-                    self.profile.turn_recovery_timeout()
+                    self.profile.turn_recovery_timeout() + self.backoff_jitter()
                 } else {
                     self.death_watch()
                 };
@@ -318,6 +339,26 @@ impl Connection {
         self.profile.keepalive_interval() * DEAD_OVERS_TOLERATED
     }
 
+    /// Deterministic, bounded jitter added to the turn-recovery deadline so two
+    /// stations that lost the floor at the same instant do not phase-lock into
+    /// repeated re-take collisions (design §3.5). The callsign tie-break decides
+    /// the eventual winner; the jitter (derived from our callsign + the silent-
+    /// over count, so it is reproducible and varies per retry) just spreads them
+    /// in time. Bounded to half a turn-recovery so it never starves death
+    /// detection.
+    fn backoff_jitter(&self) -> Duration {
+        let mut h = 0xcbf2_9ce4_8422_2325u64; // FNV-1a
+        for b in self.local.as_str().bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        h = h
+            .wrapping_add(self.silent_overs as u64)
+            .wrapping_mul(0x100_0000_01b3);
+        let span_ms = (self.profile.turn_recovery_timeout().as_millis() / 2).max(1) as u64;
+        Duration::from_millis(h % span_ms)
+    }
+
     fn session_ok(&self, frame: &LinkFrame) -> bool {
         self.state == ConnState::Connected && frame.conn_id == self.conn_id
     }
@@ -341,7 +382,7 @@ impl Connection {
             payload,
         );
         f.ack_through = self.recv.ack_through();
-        f.sack = self.recv.sack();
+        f.sack = self.sack_to_send();
         if self.msg_end_seqs.contains(&seq) {
             f = f.end_of_msg();
         }
@@ -354,8 +395,18 @@ impl Connection {
             self.remote.clone(),
             self.conn_id,
             self.recv.ack_through(),
-            self.recv.sack(),
+            self.sack_to_send(),
         )
+    }
+
+    /// The SACK bitmap to advertise: the live receive-buffer bitmap under
+    /// selective repeat, or `0` under the floor `WholeMessage` strategy.
+    fn sack_to_send(&self) -> u32 {
+        if self.sack_enabled {
+            self.recv.sack()
+        } else {
+            0
+        }
     }
 
     /// Build this over's frames into the outbox: up to `W` unacked DATA frames
@@ -863,5 +914,77 @@ mod tests {
             p.b_messages().is_empty(),
             "never delivered ⇒ no silent corruption"
         );
+    }
+
+    #[test]
+    fn backoff_jitter_is_deterministic_bounded_and_station_specific() {
+        let a = init();
+        let b = acc();
+        // Deterministic: same inputs ⇒ same jitter.
+        assert_eq!(a.backoff_jitter(), a.backoff_jitter());
+        // Station-specific: the two callsigns spread, avoiding phase-lock.
+        assert_ne!(a.backoff_jitter(), b.backoff_jitter());
+        // Bounded to < half a turn-recovery so death detection is never starved.
+        assert!(a.backoff_jitter() < a.profile.turn_recovery_timeout());
+    }
+
+    #[test]
+    fn sack_disabled_suppresses_the_bitmap_even_with_a_buffered_gap() {
+        // Selective-repeat receiver with a real out-of-order gap buffered.
+        let mut b = acc();
+        b.handle_frame(
+            LinkFrame::control(
+                FrameType::Conn,
+                call("K1ABC"),
+                call("W2XYZ"),
+                0x1234,
+                FIRST_SEQ,
+            ),
+            Duration::ZERO,
+        );
+        // seq 2 arrives before seq 1 ⇒ a gap is buffered ⇒ recv.sack() != 0.
+        b.handle_frame(
+            LinkFrame::data(call("K1ABC"), call("W2XYZ"), 0x1234, 2, b"x".to_vec()),
+            Duration::ZERO,
+        );
+        assert_ne!(b.recv.sack(), 0, "precondition: a gap is buffered");
+        assert_ne!(b.make_ack().sack, 0, "selective repeat advertises the gap");
+
+        // The floor WholeMessage strategy must suppress the bitmap (no NACK).
+        b.sack_enabled = false;
+        assert_eq!(b.make_ack().sack, 0, "floor advertises no SACK");
+        assert_eq!(b.make_data(9, b"y".to_vec()).sack, 0);
+    }
+
+    #[test]
+    fn floor_whole_message_delivers_multi_fragment_in_order_with_no_sack() {
+        // Stop-and-wait (window 1, no SACK) over a perfect pipe still delivers a
+        // multi-fragment message byte-exact and in order.
+        let mut a = Connection::initiator(call("K1ABC"), call("W2XYZ"), 0x1234, profile(), 8)
+            .with_strategy(ArqStrategy::WholeMessage);
+        let mut b = Connection::acceptor(call("W2XYZ"), call("K1ABC"), profile(), 8)
+            .with_strategy(ArqStrategy::WholeMessage);
+        a.connect(Duration::ZERO);
+        a.send(b"floor-msg!".to_vec()); // 10 bytes, mtu 4 ⇒ 3 fragments
+        let mut now = Duration::ZERO;
+        let mut got = Vec::new();
+        for _ in 0..80 {
+            while let Some(f) = a.poll_transmit(now) {
+                b.handle_frame(f, now);
+            }
+            while let Some(f) = b.poll_transmit(now) {
+                assert_eq!(f.sack, 0, "floor peer never advertises a SACK");
+                a.handle_frame(f, now);
+            }
+            now += TICK;
+            a.handle_timeout(now);
+            b.handle_timeout(now);
+            while let Some(e) = b.poll_event() {
+                if let HostEvent::DataReceived(d) = e {
+                    got.push(d);
+                }
+            }
+        }
+        assert_eq!(got, vec![b"floor-msg!".to_vec()]);
     }
 }

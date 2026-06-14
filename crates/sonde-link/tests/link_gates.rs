@@ -24,7 +24,9 @@ use sonde_phy::error::PhyError;
 use sonde_phy::modes::{ModeHint, ModeTable};
 use sonde_phy::phy_api::{ChannelQualityReport, PhyTransport, RxFrame, TxToken};
 
-use sonde_link::{Callsign, ConnState, Connection, HostEvent, Link, ModeProfile};
+use sonde_link::{
+    ArqStrategy, Callsign, ConnState, Connection, HostCommand, HostEvent, Link, ModeProfile,
+};
 
 // ---------------------------------------------------------------------------
 // Deterministic PRNG (xorshift64*) — reproducible from a seed, no rand dep.
@@ -474,6 +476,10 @@ struct LinkPair {
 
 impl LinkPair {
     fn new(params: ChannelParams) -> Self {
+        Self::with_strategy(params, ArqStrategy::SelectiveRepeat)
+    }
+
+    fn with_strategy(params: ChannelParams, strategy: ArqStrategy) -> Self {
         let (chan, ea, eb) = Channel::new(params);
         let a = Link::new(
             ea,
@@ -483,12 +489,14 @@ impl LinkPair {
                 0x1234,
                 gate_profile(),
                 8,
-            ),
+            )
+            .with_strategy(strategy),
             ModeHint::MainAuto,
         );
         let b = Link::new(
             eb,
-            Connection::acceptor(callsign("W2XYZ"), callsign("K1ABC"), gate_profile(), 8),
+            Connection::acceptor(callsign("W2XYZ"), callsign("K1ABC"), gate_profile(), 8)
+                .with_strategy(strategy),
             ModeHint::MainAuto,
         );
         Self {
@@ -640,4 +648,62 @@ fn g4_honest_failure_on_sustained_loss() {
         p.b_messages().is_empty(),
         "nothing delivered ⇒ no partial/silent delivery"
     );
+}
+
+#[test]
+fn g6_floor_whole_message_delivers_under_burst_loss() {
+    // The degenerate floor strategy (stop-and-wait, no SACK) must still deliver
+    // byte-exact in order over a bursty channel — the FT8-class "no NACK" model.
+    let params = ChannelParams {
+        seed: 0xF100,
+        p_g2b: 0.15,
+        p_b2g: 0.45,
+        loss_good: 0.03,
+        loss_bad: 0.55,
+        corruption_prob: 0.03,
+        rtt: TICK,
+    };
+    let mut p = LinkPair::with_strategy(params, ArqStrategy::WholeMessage);
+    p.a.connect(Duration::ZERO);
+    assert!(
+        p.run_until(600, |p| p.both_connected()),
+        "floor handshake completes"
+    );
+
+    let msg: Vec<u8> = (0u8..24).collect(); // multi-fragment, stop-and-wait
+    p.a.send(msg.clone());
+    assert!(
+        p.run_until(8000, |p| !p.b_messages().is_empty()),
+        "floor whole-message recovers loss by resend-until-acked"
+    );
+    assert_eq!(p.b_messages(), vec![msg]);
+    assert_eq!(p.a.state(), ConnState::Connected);
+}
+
+#[test]
+fn host_command_surface_drives_the_full_lifecycle() {
+    // The #8 TNC contract: connect / send / disconnect as commands, with
+    // delivery + lifecycle observed through the HostEvent stream.
+    let params = ChannelParams {
+        seed: 0x4057,
+        p_g2b: 0.1,
+        p_b2g: 0.5,
+        loss_good: 0.05,
+        loss_bad: 0.4,
+        corruption_prob: 0.0,
+        rtt: TICK,
+    };
+    let mut p = LinkPair::new(params);
+    p.a.command(HostCommand::Connect, p.now);
+    assert!(p.run_until(600, |p| p.both_connected()));
+
+    let msg = b"via-host-command".to_vec();
+    p.a.command(HostCommand::Send(msg.clone()), p.now);
+    assert!(p.run_until(4000, |p| !p.b_messages().is_empty()));
+    assert_eq!(p.b_messages(), vec![msg]);
+
+    p.a.command(HostCommand::Disconnect, p.now);
+    assert!(p.run_until(600, |p| p.a.state() == ConnState::Closed
+        && p.b.state() == ConnState::Closed));
+    assert!(p.b_events.contains(&HostEvent::Disconnected));
 }

@@ -27,10 +27,14 @@
 pub mod arq;
 pub mod conn;
 pub mod frame;
+pub mod host;
 pub mod link;
+pub mod mac;
 pub mod profile;
 
 pub use conn::{ConnState, Connection, HostEvent};
 pub use frame::{Callsign, FrameError, FrameType, LinkFrame, LINK_MTU, LINK_OVERHEAD};
+pub use host::HostCommand;
 pub use link::Link;
+pub use mac::{route, ArqStrategy, Route, WindowParams};
 pub use profile::ModeProfile;
