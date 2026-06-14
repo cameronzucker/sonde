@@ -52,6 +52,22 @@ pub fn run_link(
     }
 }
 
+/// Channel-impaired audio samples (f32, at 48 kHz) for the link — the real
+/// modulated waveform after the simulated channel, for in-browser playback so
+/// the operator can *hear* it. Marshals to a `Float32Array`. Same `mode_id`/
+/// `snr_db`/`condition`/`seed` as [`run_link`] yields the audio for that run.
+/// Returns an empty array for an unimplemented mode.
+#[wasm_bindgen]
+pub fn link_audio(
+    payload: &[u8],
+    mode_id: &str,
+    snr_db: f64,
+    condition: &str,
+    seed: u32,
+) -> Vec<f32> {
+    link::link_audio_core(payload, mode_id, snr_db, condition, seed as u64).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +130,19 @@ mod tests {
             payload.len()
         );
         assert!(v["symbols"][0]["rx_bytes"].is_array());
+    }
+
+    #[test]
+    fn link_audio_returns_samples_for_floor_and_empty_for_unimplemented() {
+        let payload: Vec<u8> = (0..60).map(|i| i as u8).collect();
+        let audio = link_audio(&payload, "floor-wblo", 80.0, "none", 1);
+        assert!(
+            audio.len() > 1000,
+            "floor audio should be many samples, got {}",
+            audio.len()
+        );
+        assert!(audio.iter().all(|s| s.is_finite()));
+        // Unimplemented mode → empty (no panic).
+        assert!(link_audio(&payload, "ofdm-mid", 80.0, "none", 1).is_empty());
     }
 }

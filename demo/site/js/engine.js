@@ -1,5 +1,8 @@
 // engine.js — the only module aware of the sonde-wasm JSON API.
-import init, { list_modes, recommend_mode, run_link } from "../pkg/sonde_wasm.js";
+import init, { list_modes, recommend_mode, run_link, link_audio } from "../pkg/sonde_wasm.js";
+
+/** Sample rate of the engine's audio output, in Hz (matches sonde-phy). */
+export const SAMPLE_RATE_HZ = 48000;
 
 let _payload = null;          // Uint8Array
 let _offsetsJson = null;      // string (passed verbatim to run_link)
@@ -41,4 +44,14 @@ export function runLink(modeId, snrDb, condition, seed) {
   const r = JSON.parse(json);
   if (r.error) throw new Error(r.error);
   return r;
+}
+
+/**
+ * Channel-impaired audio samples (Float32Array @ SAMPLE_RATE_HZ) for the link —
+ * the real modulated waveform after the simulated channel, for playback. Pass
+ * the SAME modeId/snrDb/condition/seed as the matching runLink() call so the
+ * audio corresponds to that run. Empty for an unimplemented mode.
+ */
+export function linkAudio(modeId, snrDb, condition, seed) {
+  return link_audio(_payload, modeId, snrDb, condition, seed >>> 0);
 }

@@ -202,6 +202,30 @@ pub fn run_link_core(
     })
 }
 
+/// Channel-impaired audio samples for the link — the real modulated waveform
+/// after the simulated channel (what the waterfall visualizes and the operator
+/// can listen to). Encode + channel only; no decode/STFT, so it's cheaper than
+/// [`run_link_core`]. Uses the same `WidebandLowDensityFloor::new()` + seed as
+/// `run_link_core`, so for identical args the audio matches that run's waveform.
+/// Returns `ModeUnavailable` for unimplemented modes.
+pub fn link_audio_core(
+    payload: &[u8],
+    mode_id: &str,
+    snr_db: f64,
+    condition: &str,
+    seed: u64,
+) -> Result<Vec<f32>, PhyError> {
+    if !is_implemented(mode_id) {
+        return Err(PhyError::ModeUnavailable(format!(
+            "{mode_id} not implemented yet (pending QAM work)"
+        )));
+    }
+    let floor = WidebandLowDensityFloor::new();
+    let tx = floor.transmit_multi_with_preamble(payload)?;
+    let (observed_real, _clean, _observed) = apply_channel(&tx, snr_db, condition, seed);
+    Ok(observed_real)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
