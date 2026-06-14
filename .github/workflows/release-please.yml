@@ -7,6 +7,14 @@ name: release-please
 #
 # On each push to main, release-please opens/updates a release PR. Merging that
 # PR cuts the release (tag + CHANGELOG + version.txt bump).
+#
+# Uses a fine-grained PAT (secret RELEASE_PLEASE_TOKEN) rather than the built-in
+# GITHUB_TOKEN, for two reasons: (1) this repo intentionally does NOT grant
+# Actions the "create pull requests" capability; (2) more importantly, a release
+# PR opened by GITHUB_TOKEN would NOT trigger the CI workflow (GitHub blocks that
+# recursion), so it could never satisfy main's required `check` status and would
+# be unmergeable. A PAT-created PR triggers CI normally. PAT scope: fine-grained,
+# repo cameronzucker/sonde, Contents + Pull requests = read/write.
 
 on:
   push:
@@ -22,5 +30,6 @@ jobs:
     steps:
       - uses: googleapis/release-please-action@v5
         with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           config-file: .github/release-please-config.json
           manifest-file: .github/.release-please-manifest.json
