@@ -84,6 +84,10 @@ pub struct WidebandLowDensityFloor {
     // adapters (e.g. sonde-phy-runtime's `FloorWaveform`); a bare
     // `dyn` trait object would strip the auto-trait. All codecs are Send.
     fec: Box<dyn FecCodec + Send>,
+    /// When `Some`, the demod uses this FIXED noise variance instead of the
+    /// per-symbol empty-bin estimate. Production leaves it `None`; only the
+    /// sonde-gtg differential gate's control arm sets it (to `0.1`).
+    n0_override: Option<f32>,
 }
 
 impl WidebandLowDensityFloor {
@@ -95,6 +99,7 @@ impl WidebandLowDensityFloor {
         Self {
             params,
             fec: Box::new(IdentityFec::new(block)),
+            n0_override: None,
         }
     }
 
@@ -103,7 +108,16 @@ impl WidebandLowDensityFloor {
         Self {
             params: OfdmParams::for_mode(OfdmModeName::Wide),
             fec,
+            n0_override: None,
         }
+    }
+
+    /// Force a FIXED demod noise variance instead of the per-symbol empty-bin
+    /// estimate. Diagnostic / differential-gate use only — the production demod
+    /// estimates `n0` per symbol (see [`crate::ofdm_main::receiver`]).
+    pub fn with_fixed_n0(mut self, n0: f32) -> Self {
+        self.n0_override = Some(n0);
+        self
     }
 
     /// Borrowed access to the underlying OFDM parameter set.
@@ -152,7 +166,7 @@ impl WidebandLowDensityFloor {
     /// the soft values flow straight to `FecCodec::decode_soft`.
     fn demodulate_coded_symbol(&self, samples: &[f32]) -> Vec<f32> {
         let bits_per_sc = self.bits_per_subcarrier();
-        let rx = OfdmReceiver::new(&self.params);
+        let rx = OfdmReceiver::with_n0_override(&self.params, self.n0_override);
         rx.demodulate_one_symbol(samples, &bits_per_sc)
     }
 
