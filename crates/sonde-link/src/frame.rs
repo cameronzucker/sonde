@@ -14,9 +14,10 @@
 //! 27  SEQ           4    DATA frame seq, or control context seq
 //! 31  ACK_THROUGH   4    cumulative in-order high-water acknowledged
 //! 35  SACK          4    bitmap: bit i ⇒ (ACK_THROUGH+1+i) received out-of-order
-//! 39  LEN           2    payload length
-//! 41  PAYLOAD       N
-//! 41+N CRC32        4    IEEE, over [0 .. 41+N)
+//! 39  MODE          1    link mode/rung id this frame was sent under (link adaptation)
+//! 40  LEN           2    payload length
+//! 42  PAYLOAD       N
+//! 42+N CRC32        4    IEEE, over [0 .. 42+N)
 //! ```
 //!
 //! Parsing is **exact-length and CRC-first**: a frame is rejected unless its
@@ -35,7 +36,7 @@ pub const MAGIC: [u8; 2] = [0x53, 0x4C];
 /// Link protocol version this build speaks.
 pub const VERSION: u8 = 1;
 /// Fixed bytes before the payload (MAGIC..=LEN).
-pub const HEADER_LEN: usize = 41;
+pub const HEADER_LEN: usize = 42;
 /// CRC trailer length.
 pub const CRC_LEN: usize = 4;
 /// Total fixed per-frame overhead (header + CRC).
@@ -151,6 +152,11 @@ pub struct LinkFrame {
     pub ack_through: u32,
     /// Selective-ack bitmap relative to `ack_through`.
     pub sack: u32,
+    /// Link mode / ladder-rung id this frame was transmitted under (link
+    /// adaptation). `0` = the default/fastest rung; the receiver reads it to
+    /// follow a downshift and to detect mode divergence. See the mode-adaptation
+    /// design doc.
+    pub mode: u8,
     /// Payload bytes (empty for pure control frames).
     pub payload: Vec<u8>,
 }
@@ -167,6 +173,7 @@ impl LinkFrame {
             seq,
             ack_through: 0,
             sack: 0,
+            mode: 0,
             payload,
         }
     }
@@ -182,6 +189,7 @@ impl LinkFrame {
             seq: 0,
             ack_through,
             sack,
+            mode: 0,
             payload: Vec::new(),
         }
     }
@@ -203,6 +211,7 @@ impl LinkFrame {
             seq,
             ack_through: 0,
             sack: 0,
+            mode: 0,
             payload: Vec::new(),
         }
     }
@@ -229,6 +238,12 @@ impl LinkFrame {
         self.flags & FLAG_END_OF_MSG != 0
     }
 
+    /// Stamp the link mode / ladder-rung id this frame is sent under.
+    pub fn with_mode(mut self, mode: u8) -> Self {
+        self.mode = mode;
+        self
+    }
+
     /// Serialize to wire bytes (header + payload + CRC32).
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
         if self.payload.len() > LINK_MTU {
@@ -248,6 +263,7 @@ impl LinkFrame {
         b.extend_from_slice(&self.seq.to_be_bytes());
         b.extend_from_slice(&self.ack_through.to_be_bytes());
         b.extend_from_slice(&self.sack.to_be_bytes());
+        b.push(self.mode);
         b.extend_from_slice(&(self.payload.len() as u16).to_be_bytes());
         b.extend_from_slice(&self.payload);
         let crc = CRC32.checksum(&b);
@@ -269,7 +285,7 @@ impl LinkFrame {
         }
         let frame_type = FrameType::from_u8(buf[3])?;
         let flags = buf[4];
-        let len = u16::from_be_bytes([buf[39], buf[40]]) as usize;
+        let len = u16::from_be_bytes([buf[40], buf[41]]) as usize;
         let expected = LINK_OVERHEAD + len;
         if buf.len() != expected {
             return Err(FrameError::LengthMismatch {
@@ -289,6 +305,7 @@ impl LinkFrame {
         let seq = u32::from_be_bytes([buf[27], buf[28], buf[29], buf[30]]);
         let ack_through = u32::from_be_bytes([buf[31], buf[32], buf[33], buf[34]]);
         let sack = u32::from_be_bytes([buf[35], buf[36], buf[37], buf[38]]);
+        let mode = buf[39];
         let payload = buf[HEADER_LEN..HEADER_LEN + len].to_vec();
         Ok(Self {
             frame_type,
@@ -299,6 +316,7 @@ impl LinkFrame {
             seq,
             ack_through,
             sack,
+            mode,
             payload,
         })
     }
@@ -410,7 +428,19 @@ mod tests {
         assert_eq!(g.ack_through, 100);
         assert_eq!(g.sack, 0b1011);
         assert!(g.payload.is_empty());
-        assert_eq!(u16::from_be_bytes([bytes[39], bytes[40]]), 0);
+        assert_eq!(u16::from_be_bytes([bytes[40], bytes[41]]), 0); // LEN at offset 40
+    }
+
+    #[test]
+    fn mode_id_round_trips() {
+        let f = LinkFrame::data(call("K1ABC"), call("W2XYZ"), 1, 5, b"x".to_vec()).with_mode(3);
+        let bytes = f.encode().unwrap();
+        assert_eq!(bytes[39], 3, "MODE at offset 39");
+        let g = LinkFrame::decode(&bytes).unwrap();
+        assert_eq!(g.mode, 3);
+        // Default mode is 0 when not stamped.
+        let h = LinkFrame::control(FrameType::Conn, call("K1ABC"), call("W2XYZ"), 1, 1);
+        assert_eq!(LinkFrame::decode(&h.encode().unwrap()).unwrap().mode, 0);
     }
 
     #[test]
@@ -459,8 +489,8 @@ mod tests {
         let f = LinkFrame::data(call("K1ABC"), call("W2XYZ"), 1, 1, b"abc".to_vec());
         let mut bytes = f.encode().unwrap();
         let fake = (1000u16).to_be_bytes();
-        bytes[39] = fake[0];
-        bytes[40] = fake[1];
+        bytes[40] = fake[0];
+        bytes[41] = fake[1];
         assert!(matches!(
             LinkFrame::decode(&bytes),
             Err(FrameError::LengthMismatch { .. })

@@ -114,9 +114,40 @@ fn ladder() -> [Rung; 5] {
     ]
 }
 
+/// Number of rungs on the adaptation ladder (id 0 = fastest, NUM_RUNGS-1 = base).
+pub const NUM_RUNGS: u8 = 5;
+/// The most-robust bottom rung (deep-floor nFSK) — the universal failure-
+/// convergence target for the link's BASE-fallback (design P1).
+pub const BASE_RUNG: u8 = NUM_RUNGS - 1;
 /// Index of the ladder rung used when no channel measurement exists yet
 /// (missing SNR ⇒ the mid OFDM rung, per design §6 / the PHY's `MainAuto`).
-const DEFAULT_RUNG: usize = 1;
+pub const DEFAULT_RUNG: u8 = 1;
+
+/// Build a [`Route`] from a ladder rung, optionally capping the window to the
+/// frames a payload actually needs.
+fn build_route(r: &Rung, window_cap: Option<u32>) -> Route {
+    let window = match window_cap {
+        Some(cap) => r.window.min(cap),
+        None => r.window,
+    };
+    Route {
+        mode: r.mode,
+        strategy: r.strategy,
+        window: WindowParams { window },
+        profile: ModeProfile::new(
+            std::time::Duration::from_millis(r.over_airtime_ms),
+            r.per_over_mtu,
+        ),
+    }
+}
+
+/// The full [`Route`] for an explicit ladder rung id (clamped to the ladder).
+/// Used by mid-session mode adaptation to address a specific mode.
+pub fn rung(id: u8) -> Route {
+    let rungs = ladder();
+    let idx = (id as usize).min(rungs.len() - 1);
+    build_route(&rungs[idx], None)
+}
 
 /// Effective SNR = raw aggregate SNR penalized by frame-error rate. `None` when
 /// no frames have been observed yet (SNR is NaN).
@@ -133,27 +164,24 @@ fn effective_snr_db(q: &ChannelQualityReport) -> Option<f32> {
 /// needs (no point opening eight slots for a one-frame message).
 pub fn route(payload_len: usize, quality: &ChannelQualityReport) -> Route {
     let rungs = ladder();
+    let idx = recommended_rung(quality) as usize;
+    let r = &rungs[idx];
+    let frames_needed = payload_len.div_ceil(r.per_over_mtu.max(1)).max(1) as u32;
+    build_route(r, Some(frames_needed))
+}
+
+/// The ladder rung id recommended for a channel of the given quality (no payload
+/// cap). Higher FER / lower SNR ⇒ a higher (more robust) rung id.
+pub fn recommended_rung(quality: &ChannelQualityReport) -> u8 {
+    let rungs = ladder();
     let idx = match effective_snr_db(quality) {
-        None => DEFAULT_RUNG,
+        None => DEFAULT_RUNG as usize,
         Some(eff) => rungs
             .iter()
             .position(|r| eff >= r.snr_floor_db)
             .unwrap_or(rungs.len() - 1),
     };
-    let r = &rungs[idx];
-    let profile = ModeProfile::new(
-        std::time::Duration::from_millis(r.over_airtime_ms),
-        r.per_over_mtu,
-    );
-    let frames_needed = payload_len.div_ceil(r.per_over_mtu.max(1)).max(1) as u32;
-    Route {
-        mode: r.mode,
-        strategy: r.strategy,
-        window: WindowParams {
-            window: r.window.min(frames_needed),
-        },
-        profile,
-    }
+    idx as u8
 }
 
 #[cfg(test)]
@@ -233,5 +261,28 @@ mod tests {
         // A tiny payload on a clean channel: window capped to a single frame.
         let r = route(10, &quality(25.0, 100, 0));
         assert_eq!(r.window.window, 1);
+    }
+
+    #[test]
+    fn rung_addresses_specific_ladder_modes() {
+        let top = rung(0);
+        assert_eq!(top.mode, ModeHint::MainAuto);
+        assert_eq!(top.strategy, ArqStrategy::SelectiveRepeat);
+        assert!(top.window.window > 1, "fast rung is not payload-capped");
+
+        let base = rung(BASE_RUNG);
+        assert_eq!(base.mode, ModeHint::FloorCrowdedBand);
+        assert_eq!(base.strategy, ArqStrategy::WholeMessage);
+        assert_eq!(base.window.window, 1, "deep-floor base is whole-message");
+        // Out-of-range clamps to the base rung.
+        assert_eq!(rung(99), rung(BASE_RUNG));
+    }
+
+    #[test]
+    fn recommended_rung_increases_as_the_channel_worsens() {
+        assert!(
+            recommended_rung(&quality(25.0, 100, 0)) < recommended_rung(&quality(-25.0, 100, 0))
+        );
+        assert_eq!(recommended_rung(&quality(-25.0, 100, 0)), BASE_RUNG);
     }
 }

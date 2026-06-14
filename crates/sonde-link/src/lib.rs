@@ -40,5 +40,7 @@ pub use driver::Driver;
 pub use frame::{Callsign, FrameError, FrameType, LinkFrame, LINK_MTU, LINK_OVERHEAD};
 pub use host::HostCommand;
 pub use link::Link;
-pub use mac::{route, ArqStrategy, Route, WindowParams};
+pub use mac::{
+    recommended_rung, route, rung, ArqStrategy, Route, WindowParams, BASE_RUNG, NUM_RUNGS,
+};
 pub use profile::ModeProfile;

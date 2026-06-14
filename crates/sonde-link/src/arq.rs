@@ -64,6 +64,15 @@ impl SendWindow {
         self.frames.clear();
     }
 
+    /// Change the window **in place**, preserving `base`/`next_seq` and all
+    /// buffered-but-unacked frames. Used by mid-session mode adaptation: a mode
+    /// change resizes the window without dropping the seq stream or outstanding
+    /// data. `window == 1` is the floor whole-message strategy.
+    pub fn reconfigure(&mut self, window: u32) {
+        assert!(window >= 1, "window must be >= 1");
+        self.window = window;
+    }
+
     /// Whether any enqueued frame is still unacked.
     pub fn has_unacked(&self) -> bool {
         !self.frames.is_empty()
@@ -166,6 +175,13 @@ impl RecvBuffer {
     pub fn reset(&mut self) {
         self.next_expected = FIRST_SEQ;
         self.buffered.clear();
+    }
+
+    /// Change the window **in place**, preserving `next_expected` and all
+    /// buffered out-of-order frames (mid-session mode adaptation).
+    pub fn reconfigure(&mut self, window: u32) {
+        assert!(window >= 1, "window must be >= 1");
+        self.window = window;
     }
 
     /// Cumulative in-order high-water received (`0` ⇒ nothing yet).
@@ -411,5 +427,33 @@ mod tests {
             Some(b"msg2".to_vec()),
             "second message must not include the first"
         );
+    }
+
+    // ---- in-place reconfigure (mid-session mode change) ----
+
+    #[test]
+    fn send_window_reconfigure_preserves_in_flight_and_resizes() {
+        let mut w = SendWindow::new(8);
+        for b in [b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()] {
+            w.enqueue(b);
+        }
+        assert_eq!(w.over_frames().len(), 4, "window 8 sends all 4");
+        w.reconfigure(1); // drop to floor whole-message
+        assert_eq!(w.outstanding(), 4, "no frames dropped by the resize");
+        let over = w.over_frames();
+        assert_eq!(over.len(), 1, "window 1 now caps the over");
+        assert_eq!(over[0].0, 1, "still starts at the preserved base seq");
+    }
+
+    #[test]
+    fn recv_buffer_reconfigure_preserves_high_water_and_buffered() {
+        let mut r = RecvBuffer::new(8);
+        r.accept(1, b"a".to_vec(), false);
+        r.accept(3, b"c".to_vec(), false); // out-of-order, buffered
+        assert_eq!(r.ack_through(), 1);
+        assert_ne!(r.sack(), 0);
+        r.reconfigure(1);
+        assert_eq!(r.ack_through(), 1, "high-water preserved across resize");
+        assert_ne!(r.sack(), 0, "buffered out-of-order frame preserved");
     }
 }
