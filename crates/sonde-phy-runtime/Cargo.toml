@@ -12,6 +12,9 @@ description = "Production PhyTransport runtime for sonde: a half-duplex pump tha
 # Core (hardware-free) path: only the PHY waveform + error/mode types. No cpal,
 # no ALSA — FloorWaveform wraps WidebandLowDensityFloor, which is core PHY.
 sonde-phy.workspace = true
+# Real floor FEC (rate-1/4 LDPC) injected into FloorWaveform so the operational
+# runtime decodes through fading, not just AWGN/clean. Pure Rust, hardware-free.
+sonde-fec.workspace = true
 
 # Hardware path only (feature = "hardware"): real soundcard + serial-RTS PTT.
 # Optional so `cargo test` / default CI build the hardware-free core without

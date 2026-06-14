@@ -28,6 +28,21 @@ use crate::sync::preamble::{PreambleDetector, PreambleGenerator};
 /// pin in [`crate::sync::preamble`].
 pub const PREAMBLE_LEN_SAMPLES: usize = 192;
 
+/// Early-alignment guard: the symbol FFT window starts this many samples
+/// EARLIER than the detected preamble end. The real-valued correlator can lock
+/// onto the *delayed* path of a multipath channel (measured: Watterson Moderate
+/// detects ~48 samples late), so without the guard the window would start late
+/// and spill into the next symbol. Backing off by a fixed margin lands the
+/// window inside the cyclic prefix, where the offset is just a per-sub-carrier
+/// phase ramp the channel estimator absorbs. 128 covers ITU-R F.520
+/// Good/Moderate/Poor path delays (24/48/96 samples @ 48 kHz) with margin, well
+/// inside the 512-sample CP.
+///
+/// NOTE: timing is NOT the dominant fading failure mode — frequency-selective
+/// nulls are (see [`crate::ofdm_main::receiver`] and the fading gate). This
+/// guard is a robustness margin for delayed-path lock, not the fading fix.
+const SYNC_WINDOW_GUARD_SAMPLES: usize = 128;
+
 /// Default robustness floor: wide-band OFDM, BPSK on every occupied
 /// sub-carrier, with a composed FEC codec. Strategic posture is "go
 /// wider, not denser" — see overview §5.A.1.
@@ -265,7 +280,8 @@ impl WidebandLowDensityFloor {
                     .to_string(),
             )
         })?;
-        let body_start = detection.start_sample + PREAMBLE_LEN_SAMPLES;
+        let body_start = (detection.start_sample + PREAMBLE_LEN_SAMPLES)
+            .saturating_sub(SYNC_WINDOW_GUARD_SAMPLES);
         if body_start >= samples.len() {
             return Err(PhyError::FrameDetect(format!(
                 "preamble detected at sample {} but no body samples follow",

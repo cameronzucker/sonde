@@ -8,6 +8,7 @@
 //! [`Waveform::decode_scan`] with FM-appropriate pre-emphasis handling,
 //! deviation/PAPR control, and channel model.
 
+use sonde_fec::codec::FloorRate14Codec;
 use sonde_phy::error::PhyError;
 use sonde_phy::modes::ModeFamily;
 use sonde_phy::robustness_floor::wideband_lowdensity::WidebandLowDensityFloor;
@@ -15,8 +16,8 @@ use sonde_phy::robustness_floor::wideband_lowdensity::WidebandLowDensityFloor;
 /// One successfully demodulated frame.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedFrame {
-    /// FEC-corrected payload bytes (uncoded until the FEC-wiring plan lands;
-    /// the byte contract is unchanged either way).
+    /// FEC-corrected payload bytes (rate-1/4 LDPC via [`FloorWaveform`]'s
+    /// injected `FloorRate14Codec`).
     pub payload: Vec<u8>,
     /// Mode family the frame was demodulated under.
     pub family: ModeFamily,
@@ -52,10 +53,14 @@ pub struct FloorWaveform {
 }
 
 impl FloorWaveform {
-    /// Construct the floor waveform with its pinned Wide-mode params.
+    /// Construct the floor waveform with its pinned Wide-mode params and the
+    /// real rate-1/4 LDPC codec ([`FloorRate14Codec`]). The coded path is what
+    /// lets the floor decode through Watterson fading (a frequency-selective
+    /// null erases uncoded bits irrecoverably); the channel-aware demod turns a
+    /// nulled sub-carrier into a low-confidence near-erasure the code bridges.
     pub fn new() -> Self {
         Self {
-            inner: WidebandLowDensityFloor::new(),
+            inner: WidebandLowDensityFloor::with_fec(Box::new(FloorRate14Codec::new())),
         }
     }
 }
