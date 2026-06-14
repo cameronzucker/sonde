@@ -142,6 +142,21 @@ pub trait PhyTransport {
     fn poll_rx(&mut self) -> Option<RxFrame>;
     /// Snapshot of channel-quality observables for subsystem #7.
     fn channel_quality(&self) -> ChannelQualityReport;
+    /// Frames currently queued for transmission or actively being keyed.
+    /// `0` means the transmit path is idle (PTT released); a non-zero count
+    /// means the worker is still keying or has work queued.
+    ///
+    /// Subsystem #5 uses this to freeze its turn-recovery clock on real
+    /// keying instead of estimating airtime — the link's "my over has
+    /// stopped" instant is when this returns to `0`, not when `send_frame`
+    /// accepted the payload.
+    ///
+    /// Defaults to `0` for transports that cannot observe their TX pipeline.
+    /// The [`NullPhy`] loopback is one: a send completes synchronously before
+    /// `send_frame` returns, so nothing is ever in flight to observe.
+    fn tx_in_flight(&self) -> usize {
+        0
+    }
 }
 
 /// In-process loopback PHY for contract tests. Frames sent are echoed
