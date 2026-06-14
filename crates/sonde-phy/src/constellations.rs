@@ -161,6 +161,57 @@ impl Mapper {
         out
     }
 
+    /// Channel-aware per-bit LLRs (max-log) given the received symbol `y`,
+    /// the per-symbol complex channel estimate `h`, and noise variance `n0`.
+    ///
+    /// Metric over the unit-power constellation: `metric(c) = -|y - h·c|² / n0`.
+    /// Unlike [`Self::compute_llr`] (which assumes the symbol has already been
+    /// equalized to the constellation scale), this folds the channel into the
+    /// likelihood, so the LLR magnitude scales with the per-subcarrier
+    /// reliability `|h|²`. On a deep frequency-selective null (`|h|→0`) the LLRs
+    /// collapse toward zero — a low-confidence near-erasure the FEC can bridge —
+    /// rather than a zero-forced, fixed-magnitude WRONG-sign value that poisons
+    /// the soft decoder. For BPSK this reduces to `4·Re(conj(h)·y)/n0`.
+    ///
+    /// `syms` and `chans` must have equal length (one channel tap per symbol).
+    /// Returns `bits_per_symbol()` LLRs per symbol in transmission order; LLR
+    /// positive ⇒ bit=0 favoured.
+    pub fn compute_llr_channel(
+        &self,
+        syms: &[Complex<f32>],
+        chans: &[Complex<f32>],
+        n0: f32,
+    ) -> Vec<f32> {
+        assert_eq!(
+            syms.len(),
+            chans.len(),
+            "compute_llr_channel: syms/chans length mismatch"
+        );
+        let inv = 1.0 / n0.max(1e-9);
+        let bps = self.constellation.bits_per_symbol();
+        let mut out = Vec::with_capacity(syms.len() * bps);
+        let alphabet = self.alphabet();
+        for (y, h) in syms.iter().zip(chans.iter()) {
+            for bit_idx in 0..bps {
+                let mut max0 = f32::NEG_INFINITY;
+                let mut max1 = f32::NEG_INFINITY;
+                for (bit_pattern, c) in &alphabet {
+                    let dist = (y - h * c).norm_sqr();
+                    let metric = -dist * inv;
+                    if (bit_pattern >> (bps - 1 - bit_idx)) & 1 == 0 {
+                        if metric > max0 {
+                            max0 = metric;
+                        }
+                    } else if metric > max1 {
+                        max1 = metric;
+                    }
+                }
+                out.push(max0 - max1);
+            }
+        }
+        out
+    }
+
     fn alphabet(&self) -> Vec<(usize, Complex<f32>)> {
         let bps = self.constellation.bits_per_symbol();
         let n = 1usize << bps;
@@ -174,5 +225,90 @@ impl Mapper {
             out.push((code, sym[0]));
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// For BPSK the channel-aware max-log LLR must equal the closed form
+    /// `4·Re(conj(h)·y)/n0`. This is the load-bearing property: the LLR
+    /// magnitude tracks |h|², so a faded (small-|h|) subcarrier yields a
+    /// low-confidence value instead of a fixed-magnitude (possibly wrong-sign)
+    /// zero-forced one.
+    #[test]
+    fn bpsk_channel_llr_matches_closed_form() {
+        let mapper = Mapper::new(Constellation::Bpsk);
+        let n0 = 0.37_f32;
+        let cases = [
+            (Complex::new(0.8, 0.1), Complex::new(1.0, 0.0)),
+            (Complex::new(-0.6, 0.3), Complex::new(0.2, -0.9)),
+            // Deep-null channel: tiny |h| ⇒ tiny LLR (near-erasure).
+            (Complex::new(0.5, -0.4), Complex::new(0.03, 0.02)),
+        ];
+        for (y, h) in cases {
+            let got = mapper.compute_llr_channel(&[y], &[h], n0);
+            let want = 4.0 * (h.conj() * y).re / n0;
+            assert_eq!(got.len(), 1);
+            assert!(
+                (got[0] - want).abs() < 1e-3,
+                "BPSK channel LLR {} != closed form {} for y={y} h={h}",
+                got[0],
+                want
+            );
+        }
+    }
+
+    /// With a unit channel (`h = 1+0j`), the channel-aware LLR must reproduce
+    /// the plain equalized-sample LLR exactly, for every constellation — the
+    /// new path is a strict generalization, not a behavior change on the clean
+    /// channel the existing OFDM tests rely on.
+    #[test]
+    fn unit_channel_matches_plain_llr_all_constellations() {
+        let h = Complex::new(1.0_f32, 0.0);
+        let n0 = 0.2_f32;
+        let syms = [
+            Complex::new(0.9, -0.2),
+            Complex::new(-0.3, 0.7),
+            Complex::new(0.1, 0.1),
+            Complex::new(-0.8, -0.6),
+        ];
+        let chans = [h; 4];
+        for c in [
+            Constellation::Bpsk,
+            Constellation::Qpsk,
+            Constellation::Qam16,
+            Constellation::Qam64,
+        ] {
+            let mapper = Mapper::new(c);
+            let plain = mapper.compute_llr(&syms, n0);
+            let channel = mapper.compute_llr_channel(&syms, &chans, n0);
+            assert_eq!(plain.len(), channel.len(), "{c:?}: LLR count differs");
+            for (a, b) in plain.iter().zip(channel.iter()) {
+                assert!(
+                    (a - b).abs() < 1e-4,
+                    "{c:?}: unit-channel LLR {b} != plain LLR {a}"
+                );
+            }
+        }
+    }
+
+    /// A near-null channel must yield a far smaller LLR magnitude than a
+    /// strong channel for the same normalized received symbol — the reliability
+    /// weighting the soft decoder needs.
+    #[test]
+    fn bpsk_null_subcarrier_is_low_confidence() {
+        let mapper = Mapper::new(Constellation::Bpsk);
+        let n0 = 0.1_f32;
+        let strong =
+            mapper.compute_llr_channel(&[Complex::new(1.0, 0.0)], &[Complex::new(1.0, 0.0)], n0)[0];
+        let nulled =
+            mapper.compute_llr_channel(&[Complex::new(0.05, 0.0)], &[Complex::new(0.05, 0.0)], n0)
+                [0];
+        assert!(
+            nulled.abs() < strong.abs() * 0.1,
+            "null LLR {nulled} should be << strong LLR {strong}"
+        );
     }
 }

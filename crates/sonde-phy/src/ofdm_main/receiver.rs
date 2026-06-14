@@ -8,6 +8,15 @@ use crate::ofdm_main::ofdm_params::OfdmParams;
 use num_complex::Complex;
 use rustfft::FftPlanner;
 
+/// Symmetric clip applied to each soft LLR before it leaves the demodulator.
+/// Bounds the damage an over-confident WRONG-sign LLR (from channel-estimate
+/// interpolation error near a spectral notch) can do to the soft FEC decoder.
+/// At `n0 = 0.1` a BPSK sub-carrier saturates here once `|h| ≳ 0.71`, so the
+/// strongest constructive fades are intentionally capped — fine, since past
+/// that point the bit is already maximally reliable and the extra magnitude
+/// buys the decoder nothing.
+const LLR_CLAMP: f32 = 20.0;
+
 /// Single-symbol OFDM receiver bound to one resolved [`OfdmParams`]
 /// mode.
 pub struct OfdmReceiver<'a> {
@@ -48,9 +57,13 @@ impl<'a> OfdmReceiver<'a> {
             *c *= scale;
         }
 
-        // Equalize.
+        // Estimate the per-bin complex channel from the pilots (with edge
+        // extrapolation). We do NOT zero-force: ZF normalizes every bin to the
+        // constellation scale and so discards the per-subcarrier reliability
+        // |h|² that the soft decoder needs to ride out a frequency-selective
+        // null. Instead we feed (y, h) straight to the channel-aware LLR.
         let eq = OfdmEqualizer::new(p.pilot_indices().to_vec(), p.fft_size());
-        let equalized = eq.equalize(&freq);
+        let chan_est = eq.estimate_channel(&freq);
 
         // LLR per data sub-carrier in transmission order.
         let pilot_set: std::collections::HashSet<usize> =
@@ -72,12 +85,16 @@ impl<'a> OfdmReceiver<'a> {
                 _ => panic!("unsupported bit-loading: {bpc}"),
             };
             let mapper = Mapper::new(constellation);
-            // Noise-variance proxy. Phase 11 refines via the residual
-            // after hard decision; for clean-channel round-trip the
-            // value only sets LLR magnitude, not sign.
+            // Channel-aware LLR: magnitude scales with |h|², so a nulled
+            // sub-carrier yields a low-confidence near-erasure rather than a
+            // fixed-magnitude (possibly wrong-sign) zero-forced value. N0 is a
+            // fixed proxy; Phase 11 refines via a residual-noise estimator.
             let n0 = 0.1_f32;
-            let llrs = mapper.compute_llr(&[equalized[sc]], n0);
-            all_llr.extend_from_slice(&llrs);
+            let llrs = mapper.compute_llr_channel(&[freq[sc]], &[chan_est[sc]], n0);
+            // Clip so a wrong-phase but non-small |h| estimate (e.g. interp
+            // error near a notch) cannot inject an unbounded WRONG-sign LLR
+            // that poisons the soft decoder.
+            all_llr.extend(llrs.into_iter().map(|l| l.clamp(-LLR_CLAMP, LLR_CLAMP)));
         }
         all_llr
     }

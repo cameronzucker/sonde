@@ -20,7 +20,10 @@ rand = "0.8"
 # Channel simulator — drives the robustness-floor fading gate
 # (tests/robustness_floor_fading.rs). Dev-only; not a runtime dep.
 hf-channel-sim.workspace = true
-# sonde-fec.workspace = true
+# Real floor codec for the fading gate. DEV-ONLY back-edge: the normal edge is
+# `sonde-fec -> sonde-phy` (FecCodec trait); Cargo permits the dev-only reverse
+# edge (`cargo tree -e normal,dev` resolves it). Not a runtime dependency.
+sonde-fec.workspace = true
 
 [features]
 default = []

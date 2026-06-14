@@ -3,23 +3,31 @@
 //! to pass unless `FloorRate14Codec` is genuinely in the signal path adding
 //! end-to-end coding gain.
 //!
-//! ## Why AWGN-only (not Watterson fading)
+//! ## Why the differential gate uses AWGN
 //!
-//! This gate proves *wiring + coding gain*, not worst-case channel robustness
-//! (that is a later slice). The impairment here is AWGN from `hf_channel_sim`'s
-//! `AwgnGenerator`. The Watterson fading path (`WattersonChannel`) is
-//! deliberately *not* applied: the floor receiver has no per-subcarrier channel
-//! estimation / equalizer yet, so even the mildest two-tap Rayleigh fade — at
-//! zero Doppler and zero delay spread — applies an arbitrary complex rotation
-//! that the preamble-sync phase reference cannot undo, collapsing *both* the
-//! identity and the FEC decode to failure (empirically verified across all
-//! `ChannelCondition`s and custom low-Doppler params). A capture where neither
-//! codec decodes proves nothing about coding gain. AWGN-dominated points, by
-//! contrast, give a wide, clean, deterministic separation: the rate-1/4 LDPC
-//! recovers the payload where the identity baseline cannot.
+//! `floor_fec_decodes_where_identity_fails` uses AWGN from `hf_channel_sim`'s
+//! `AwgnGenerator` because the *differential* separation (identity fails / FEC
+//! succeeds) is cleanest and most deterministic at an AWGN-dominated operating
+//! point. It is not a fading test — its job is to prove the codec is wired and
+//! carrying coding gain.
+//!
+//! ## Watterson fading (added sonde-64w.2)
+//!
+//! With the channel-aware-LLR equalizer fix in place (sonde-phy's
+//! `ofdm_main::receiver` now does pilot-aided channel estimation + reliability-
+//! weighted soft LLRs), the floor decodes through Watterson fading too.
+//! `operational_pipeline_survives_watterson_good` below proves the *operational*
+//! entry points (`encode_payload` / `decode_one_symbol`) recover the payload
+//! through a frequency-selective fade on the converged seed. It is
+//! converged-seed-only (not seed-swept) because the production sync correlator
+//! is not yet phase-robust across all realizations — tracked under bd
+//! `sonde-64w.3` (complex matched-filter sync). The correctly-aligned equalizer
+//! robustness is gated seed-robustly in
+//! `sonde-phy/tests/robustness_floor_fading.rs`.
 
-use hf_channel_sim::AwgnGenerator;
+use hf_channel_sim::{AwgnGenerator, ChannelCondition, WattersonChannel};
 use num_complex::Complex;
+use rustfft::FftPlanner;
 use sonde_fec::codec::FloorRate14Codec;
 use sonde_phy::robustness_floor::wideband_lowdensity::WidebandLowDensityFloor;
 
@@ -32,12 +40,54 @@ fn impair(clean: &[f32], snr_db: f64, seed: u64) -> Vec<f32> {
     cx.iter().map(|c| c.re).collect()
 }
 
+/// Analytic signal (Hilbert) of a real signal: zero negative freqs, double
+/// positives. `Re{analytic} == original` for a unit channel.
+fn analytic(real_sig: &[f32]) -> Vec<Complex<f32>> {
+    let n = real_sig.len();
+    let mut planner = FftPlanner::<f32>::new();
+    let fwd = planner.plan_fft_forward(n);
+    let inv = planner.plan_fft_inverse(n);
+    let mut buf: Vec<Complex<f32>> = real_sig.iter().map(|&x| Complex::new(x, 0.0)).collect();
+    fwd.process(&mut buf);
+    let half = n / 2;
+    for (k, b) in buf.iter_mut().enumerate() {
+        if k == 0 || (n % 2 == 0 && k == half) {
+        } else if k < half {
+            *b *= 2.0;
+        } else {
+            *b = Complex::new(0.0, 0.0);
+        }
+    }
+    inv.process(&mut buf);
+    let scale = 1.0 / n as f32;
+    for b in buf.iter_mut() {
+        *b *= scale;
+    }
+    buf
+}
+
+/// Real audio → analytic → complex Watterson → AWGN → real audio. The faithful
+/// application of a complex-baseband fading model to real passband audio.
+fn through_watterson(
+    clean: &[f32],
+    condition: ChannelCondition,
+    snr_db: f64,
+    seed: u64,
+) -> Vec<f32> {
+    let mut ch = WattersonChannel::from_condition(seed, condition, 48_000.0);
+    let mut a = analytic(clean);
+    a.extend(std::iter::repeat(Complex::new(0.0, 0.0)).take(1024));
+    let mut faded = ch.process_block(&a);
+    AwgnGenerator::new(seed ^ 0xA5A5).add_noise(&mut faded, snr_db);
+    faded.iter().map(|c| c.re).collect()
+}
+
 #[test]
 fn floor_fec_decodes_where_identity_fails() {
     let payload = b"DIFFERENTIAL GATE PAYLOAD";
     // AWGN-dominated operating point with margin (FEC decodes from roughly
-    // -6 dB up; identity never does). See the module doc for why fading is
-    // excluded.
+    // -6 dB up; identity never does). See the module doc for why the
+    // differential gate uses AWGN (fading is covered by the Watterson test).
     let snr_db = 4.0;
     let seed = 0xC0DE_F100;
 
@@ -110,5 +160,35 @@ fn operational_pipeline_survives_awgn_end_to_end() {
     assert_eq!(
         decoded, payload,
         "operational TX→channel→RX pipeline must recover the payload end-to-end"
+    );
+}
+
+#[test]
+fn operational_pipeline_survives_watterson_good() {
+    // The operational entry points recover the payload through a frequency-
+    // selective Watterson Good fade — the un-fakeable proof that the
+    // channel-aware-LLR equalizer fix (sonde-64w.2) is load-bearing in the real
+    // encode→channel→decode path, not just a sonde-phy unit test. Converged-seed
+    // only: production sync phase-robustness is bd sonde-64w.3.
+    let payload = b"DIFFERENTIAL GATE PAYLOAD";
+    let seed = 0xC0DE_6402;
+
+    let buf = sonde_tx::encode_payload(
+        sonde_tx::Mode::WideFloor,
+        payload,
+        sonde_tx::FrameMode::MultiSync,
+    )
+    .expect("operational encode");
+    let faded = through_watterson(buf.samples(), ChannelCondition::Good, 30.0, seed);
+
+    let decoded = sonde_rx::decode_one_symbol(
+        sonde_rx::Mode::WideFloor,
+        &faded,
+        sonde_rx::FrameMode::MultiSync,
+    )
+    .expect("operational decode through Watterson Good fading");
+    assert_eq!(
+        decoded, payload,
+        "operational pipeline must recover the payload through Watterson Good fading"
     );
 }

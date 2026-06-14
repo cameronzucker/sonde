@@ -20,6 +20,8 @@ libc = "0.2"
 [dev-dependencies]
 hf-channel-sim.workspace = true
 num-complex.workspace = true
+# Analytic-signal (Hilbert) helper for the operational Watterson fading gate.
+rustfft.workspace = true
 # Receive side, for the end-to-end operational differential gate only.
 sonde-rx = { path = "../sonde-rx" }
 
