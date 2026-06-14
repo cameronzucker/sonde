@@ -91,5 +91,22 @@ fn characterize_current_floor_waveform() {
         oob_frac
     );
     println!("largest spur/image above 3000 Hz = {oob_peak_dbc:.1} dBc");
+    println!("PAPR = {papr_db:.2} dB (PAPR reduction is a separate Step-1 item)");
     println!("=====================================================\n");
+
+    // ─── PSD-mask GATE (Step 1 acceptance, spectral half) ───
+    // Raised-cosine inter-symbol windowing brings the emitted spectrum within an
+    // SSB-class mask. PAPR is measured but not yet gated (reduction pending).
+    assert!(
+        occupied_bw <= 2700.0,
+        "occupied -26 dBc bandwidth {occupied_bw:.0} Hz exceeds the 2.7 kHz mask"
+    );
+    assert!(
+        oob_peak_dbc <= -26.0,
+        "out-of-band spur/image {oob_peak_dbc:.1} dBc exceeds the -26 dBc mask"
+    );
+    assert!(
+        oob_frac < 0.01,
+        "out-of-band energy fraction {oob_frac:.4} exceeds 1%"
+    );
 }

@@ -43,6 +43,11 @@ pub const PREAMBLE_LEN_SAMPLES: usize = 192;
 /// guard is a robustness margin for delayed-path lock, not the fading fix.
 const SYNC_WINDOW_GUARD_SAMPLES: usize = 128;
 
+/// Raised-cosine inter-symbol windowing roll-off, in samples. Confined to the
+/// 512-sample cyclic-prefix guard so the FFT body stays intact (decode is
+/// bit-identical); only the out-of-band spectrum is shaped. 128 ≈ 2.7 ms taper.
+const WINDOW_ROLLOFF_SAMPLES: usize = 128;
+
 /// Default robustness floor: wide-band OFDM, BPSK on every occupied
 /// sub-carrier, with a composed FEC codec. Strategic posture is "go
 /// wider, not denser" — see overview §5.A.1.
@@ -152,14 +157,64 @@ impl WidebandLowDensityFloor {
         let block_info = self.fec.block_info_bits();
         let info = frame_info_bits(payload, block_info);
         let dps = self.data_bits_per_symbol();
-        let mut out = Vec::new();
+        let mut symbols: Vec<Vec<f32>> = Vec::new();
         for block in info.chunks(block_info) {
             let coded = self.fec.encode(block);
             for chunk in coded.chunks(dps) {
-                out.extend_from_slice(&self.modulate_coded_symbol(chunk));
+                symbols.push(self.modulate_coded_symbol(chunk));
             }
         }
-        Ok(out)
+        Ok(self.window_and_concat(&symbols))
+    }
+
+    /// Concatenate OFDM symbols with raised-cosine inter-symbol windowing
+    /// (overlap-add) to suppress the spectral sidelobes that a hard,
+    /// rectangular symbol boundary produces.
+    ///
+    /// The roll-off is confined to the dropped cyclic prefix: each symbol gets a
+    /// cyclic suffix (a copy of the FFT body's head, the natural continuation of
+    /// the periodic body), both edges are tapered by a raised-cosine ramp of
+    /// [`WINDOW_ROLLOFF_SAMPLES`], and consecutive symbols overlap by that
+    /// roll-off. The 2048-sample FFT body is left untouched and the receiver's
+    /// `CP + body` stride is unchanged, so demodulation is bit-identical — only
+    /// the out-of-band spectrum changes. Output length is
+    /// `n_symbols·stride + roll-off`.
+    fn window_and_concat(&self, symbols: &[Vec<f32>]) -> Vec<f32> {
+        let rho = WINDOW_ROLLOFF_SAMPLES;
+        let sym = self.symbol_size_samples();
+        let cp = self.params.cp_len();
+        if symbols.is_empty() {
+            return Vec::new();
+        }
+        // Rising raised-cosine ramp r[i] over the roll-off; the falling edge is
+        // its mirror. (Cross-fade smoothness, not power-complementarity, is what
+        // suppresses sidelobes; the region is dropped by the receiver anyway.)
+        let ramp: Vec<f32> = (0..rho)
+            .map(|i| {
+                let x = (i as f32 + 0.5) / rho as f32;
+                0.5 - 0.5 * (std::f32::consts::PI * x).cos()
+            })
+            .collect();
+        let total = symbols.len() * sym + rho;
+        let mut out = vec![0.0_f32; total];
+        for (k, s) in symbols.iter().enumerate() {
+            debug_assert_eq!(s.len(), sym);
+            // Extended frame: symbol + cyclic suffix (= first `rho` of the FFT
+            // body, the periodic continuation past the symbol's end).
+            let mut frame = Vec::with_capacity(sym + rho);
+            frame.extend_from_slice(s);
+            frame.extend_from_slice(&s[cp..cp + rho]);
+            for i in 0..rho {
+                frame[i] *= ramp[i]; // ramp up (inside the CP guard)
+                let tail = sym + rho - 1 - i;
+                frame[tail] *= ramp[i]; // ramp down (the suffix)
+            }
+            let base = k * sym;
+            for (i, &v) in frame.iter().enumerate() {
+                out[base + i] += v;
+            }
+        }
+        out
     }
 
     /// Demodulate a coded frame produced by [`Self::transmit_multi`].
