@@ -6,7 +6,45 @@
 - **Issue:** `sonde-imh.2` (real ARDOP connected mode) — implementation done; in_progress pending operator verification + PR merge
 - **Builds on:** raven-tamarack-pika handoff (`2026-06-14-raven-tamarack-pika-ardop-connected-mode.md`)
 
-## What this session did
+## UPDATE — LIVE REWORK (same session, after operator laptop review)
+Operator review found the first cut had the **wrong shape**: it was run-then-replay
+(Run session → wait → press "Play audio" to see the waterfall), audio didn't play on
+its own, and the multi-panel page needed constant scrolling. Reshaped to **live + one
+screen** (commits `f7ed0ee`, `1bb892d`):
+
+- **Live on-air audio over SSE.** The backend now tails the growing on-air tap file
+  and streams base64 PCM `audio` events interleaved with the protocol events
+  (`server.py::_stream_tap_audio`). The frontend (`live-audio.js`) schedules them
+  continuously on the AudioContext clock; the AnalyserNode drives the waterfall. So
+  **audio + waterfall are LIVE** as the modems transmit — no replay step. The proven
+  `arecord|channel_filter|aplay` OS pipe is untouched (tailing a file can't perturb
+  the half-duplex timing).
+- **One action.** `Connect` starts a live session; the click also unlocks audio. The
+  log, telemetry, and recon image stream live too. Removed the play/scrub/replay
+  transport.
+- **Single-viewport cockpit.** `index.html` + cockpit CSS: a topbar of levers (SNR /
+  condition / bandwidth ceiling) + Connect + mute, a hero live waterfall (left), and a
+  telemetry / ARQ-log / recon rail (right, log scrolls internally). Honesty banner +
+  explainer moved below the fold. No scrolling to reach the interactive parts.
+- **Clean shutdown (SIGTERM/SIGINT).** Killing the server mid-session now aborts the
+  session so ardopcf/arecord/aplay are torn down — fixes an orphan-leak that held the
+  loopback devices and poisoned later sessions (it caused a long debugging detour;
+  if you ever see a stuck demo, `pkill ardopcf channel_filter; pkill -f 'arecord -t raw';
+  pkill -f 'aplay -t raw'`). Removed the dead replay-WAV plumbing (live-only now).
+
+Verified headless: a live session streams ~470 `audio` events from the handshake
+onward; mid-stream chunks decode to valid 1440-sample 12 kHz PCM; pass 2895/2895;
+SIGTERM mid-session leaves **zero** orphaned procs; node --check + served-cockpit DOM
+checks all green. **Operator visual/audio verification on a laptop is still the merge
+gate** — the Pi can't render or play audio.
+
+New/changed files this rework: `demo/ardop/server.py`; `demo/site/js/live-audio.js`
+(new), `session-engine.js`, `main.js`, `controls.js`; `demo/site/index.html`,
+`demo/site/css/app.css`; deleted `demo/site/js/audio.js`.
+
+---
+
+## What this session did (first cut — superseded shape, kept for history)
 Turned the *proven* connected-mode testbench into a **live, streamed demo** —
 backend service + reshaped frontend — and retired the superseded one-way PHY path.
 
