@@ -394,8 +394,8 @@ impl WidebandLowDensityFloor {
         }
         let mut symbols: Vec<Vec<u8>> = Vec::with_capacity(symbols_needed);
         let mut stream: Vec<u8> = Vec::with_capacity(symbols_needed * cap);
-        symbols.push(first.clone());
         stream.extend_from_slice(&first);
+        symbols.push(first);
         for s in 1..symbols_needed {
             let start = s * symbol_size;
             let chunk = self.decode_symbol_bytes(&body[start..start + symbol_size]);
