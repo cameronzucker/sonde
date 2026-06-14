@@ -15,6 +15,30 @@ updates:
     labels:
       - dependencies
       - rust
+    # Deferred breaking bumps — these need a deliberate, coordinated migration,
+    # not an in-isolation auto-bump (tracked in bd sonde-9eg). Patch updates
+    # still flow normally; only the breaking (0.x minor/major) bumps are held.
+    ignore:
+      # The rand 0.10 ecosystem does not cleanly co-resolve on a single
+      # rand_core (the tree carries both rand_core 0.9 and 0.10, so a
+      # rand_chacha ChaCha8Rng won't satisfy rand 0.10's Rng trait), AND the
+      # bump needs an API migration (gen -> random) across sonde-fec +
+      # hf-channel-sim. Revisit when the rand 0.10 line's sub-crates align.
+      - dependency-name: "rand"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "rand_distr"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "rand_chacha"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "rand_xoshiro"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      # cpal 0.16+ reworks the device / SampleRate / stream-build API in
+      # crates/sonde-phy/src/audio_device.rs, which feeds the transmit path and
+      # needs on-the-bench validation (RADIO-1) — a merely-compiling port could
+      # ship a subtle audio bug only the operator would catch. Migrate
+      # deliberately with hardware in the loop.
+      - dependency-name: "cpal"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
 
   # GitHub Actions used by the workflows.
   - package-ecosystem: github-actions
