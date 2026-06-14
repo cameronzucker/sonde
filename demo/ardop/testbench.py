@@ -29,7 +29,27 @@ import time
 ARDOPCF = os.environ.get("ARDOPCF", os.path.expanduser("~/Code/ardopcf-spike/build/linux/ardopcf"))
 HERE = os.path.dirname(os.path.abspath(__file__))
 FILTER = os.path.join(HERE, "channel_filter.py")
+PAYLOAD = os.path.join(HERE, "../site/assets/payload.bin")
 RATE = "12000"
+
+# ardopcf data frame types (the modes it adapts among during a transfer), vs the
+# robust connect frames (ConReq/ConAck) which we don't count as data adaptation.
+import re as _re
+_DATA_FRAME = _re.compile(r"Sending Frame Type ((?:4FSK|4PSK|8PSK|16QAM)\.\S+)")
+
+
+def data_modes_from_log(path):
+    """Distinct data frame types ardopcf used, in order — shows rate adaptation."""
+    seen, out = set(), []
+    try:
+        with open(path, encoding="iso-8859-1") as f:
+            for line in f:
+                m = _DATA_FRAME.search(line)
+                if m and m.group(1) not in seen:
+                    seen.add(m.group(1)); out.append(m.group(1))
+    except OSError:
+        pass
+    return out
 
 
 def log(msg):
@@ -97,6 +117,60 @@ class Host:
             pass
 
 
+class DataConn:
+    """ardopcf data socket (host_port+1). Outbound frames are <2B BE len><data>;
+    inbound are <2B BE len><3B tag 'ARQ'/'FEC'/'ERR'><data>."""
+
+    def __init__(self, name, port):
+        self.name = name
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+        self.sock.settimeout(0.3)
+        self.recv_bytes = bytearray()
+        self.tags = []
+        self.lock = threading.Lock()
+        self.alive = True
+        self._buf = b""
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        while self.alive:
+            try:
+                d = self.sock.recv(8192)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not d:
+                break
+            self._buf += d
+            while len(self._buf) >= 2:
+                ln = (self._buf[0] << 8) | self._buf[1]
+                if len(self._buf) < 2 + ln:
+                    break
+                msg = self._buf[2:2 + ln]
+                self._buf = self._buf[2 + ln:]
+                tag, data = msg[:3].decode("ascii", "replace"), bytes(msg[3:])
+                with self.lock:
+                    self.tags.append(tag)
+                    if tag == "ARQ":
+                        self.recv_bytes += data
+
+    def send_data(self, data):
+        frame = len(data).to_bytes(2, "big") + data
+        self.sock.sendall(frame)
+
+    def received(self):
+        with self.lock:
+            return bytes(self.recv_bytes)
+
+    def close(self):
+        self.alive = False
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
 def launch_ardopcf(card, port, logpath):
     dev = f"plughw:CARD={card},DEV=0"
     f = open(logpath, "w")
@@ -119,9 +193,11 @@ def launch_bridge(src_card, dst_card, snr, condition, seed):
     snr = float(snr)
     seed = int(seed)
     dn = subprocess.DEVNULL
-    # Tight ALSA buffers (~40 ms) so the bridge adds minimal latency — the ARQ
-    # turnaround can't tolerate the default multi-hundred-ms buffering.
-    lowlat = ["--buffer-time=40000", "--period-time=8000"]
+    # Balance latency vs xruns: ~100 ms buffer / 20 ms period. Tighter (40 ms)
+    # under-runs on the Pi ("sync_ptr1: Broken pipe") and breaks the handshake;
+    # the default (seconds) blows the ARQ turnaround budget. 100 ms is stable and
+    # still within ARDOP's half-duplex timing.
+    lowlat = ["--buffer-time=100000", "--period-time=20000"]
     rec = subprocess.Popen(
         ["arecord", "-t", "raw", "-f", "S16_LE", "-r", RATE, "-c1", *lowlat,
          "-D", f"plughw:CARD={src_card},DEV=1"], stdout=subprocess.PIPE, stderr=dn)
@@ -156,6 +232,8 @@ def main():
     ap.add_argument("--call-a", default="N0AAA")
     ap.add_argument("--call-b", default="N0BBB")
     ap.add_argument("--timeout", type=float, default=60)
+    ap.add_argument("--payload", default=PAYLOAD, help="file to transfer over the link")
+    ap.add_argument("--data-timeout", type=float, default=90)
     args = ap.parse_args()
 
     # Turn SIGTERM (e.g. `timeout`, or the backend killing us) into SystemExit so
@@ -165,6 +243,7 @@ def main():
 
     procs, files = [], []
     hosts = []
+    dataconns = []
     try:
         log(f"launching ardopcf A (aldA:8515) and B (aldB:8525), SNR={args.snr} dB")
         pa, fa = launch_ardopcf("aldA", 8515, "/tmp/tb_ardopA.log"); procs.append(pa); files.append(fa)
@@ -200,18 +279,39 @@ def main():
         cb = B.wait_for("CONNECTED", 5)
         if ca:
             log(f"*** CONNECTED (handshake + bandwidth negotiated) ***  A: {ca!r}  B: {cb!r}")
-            time.sleep(1.0)
-            log("holding the link 3 s ...")
-            time.sleep(3.0)
+            # ── Data transfer over the live ARQ link ──────────────────────────
+            with open(args.payload, "rb") as f:
+                payload = f.read()
+            dA = DataConn("A", 8516); dB = DataConn("B", 8526)
+            dataconns += [dA, dB]
+            log(f"DATA: A loads {len(payload)} bytes ({os.path.basename(args.payload)}) into the ARQ buffer")
+            dA.send_data(payload)
+            end = time.time() + args.data_timeout
+            while time.time() < end:
+                if len(dB.received()) >= len(payload):
+                    break
+                time.sleep(0.3)
+            got = dB.received()
+            delivered = got[:len(payload)] == payload
+            log(f"DATA: B received {len(got)}/{len(payload)} bytes  delivered_intact={delivered}")
+
             A.send("DISCONNECT")
-            A.wait_for(["DISCONNECTED", "NEWSTATE DISC"], 10)
-            log("RESULT: PASS — real ARDOP CONNECT through the channel sim")
-            rc = 0
+            A.wait_for(["DISCONNECTED", "NEWSTATE DISC"], 15)
+            modes = data_modes_from_log("/tmp/tb_ardopA.log")
+            log(f"DATA: rate adaptation — A used data modes: {modes or '(none logged)'}")
+            if delivered:
+                log("RESULT: PASS — real ARDOP connect + ARQ data transfer through the channel sim")
+                rc = 0
+            else:
+                log("RESULT: PARTIAL — connected but payload not fully delivered in time")
+                rc = 3
         else:
             log("RESULT: FAIL — no CONNECT within timeout (see /tmp/tb_*.log)")
             rc = 2
         return rc
     finally:
+        for D in dataconns:
+            D.close()
         for H in hosts:
             H.close()
         for p in procs:
