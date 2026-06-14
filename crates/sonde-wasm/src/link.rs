@@ -46,6 +46,12 @@ fn build_symbols(
         let stream_byte = i * cap;
         let payload_byte = stream_byte.saturating_sub(2);
         let field = if stream_byte < 2 { "header(framing)".to_string() } else { field_for_byte(offsets, payload_byte) };
+        // Symbol 0 spends 2 of its `cap` bytes on the length header, so it
+        // carries `cap - 2` real payload bytes. Later symbols carry `cap`.
+        // Subtract the header bytes so payload ranges stay contiguous and
+        // non-overlapping (the frontend paints byte_start..byte_end).
+        let header_bytes_here = if stream_byte < 2 { 2 } else { 0 };
+        let byte_end = payload_byte + (cap - header_bytes_here);
         out.push(SymbolRec {
             idx: i,
             sample_start,
@@ -54,7 +60,7 @@ fn build_symbols(
             t_end_s: sample_end as f32 / sr,
             bytes: chunk.to_vec(),
             byte_start: payload_byte,
-            byte_end: payload_byte + cap,
+            byte_end,
             field,
         });
     }
@@ -66,7 +72,7 @@ fn bit_error_rate(a: &[u8], b: &[u8]) -> f32 {
     if n == 0 {
         return 1.0;
     }
-    let diff_bits: u64 = a.iter().zip(b).take(n).map(|(x, y)| (x ^ y).count_ones() as u64).sum();
+    let diff_bits: u64 = a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones() as u64).sum();
     // Count missing bytes (length mismatch) as fully errored.
     let extra = (a.len().max(b.len()) - n) as u64 * 8;
     (diff_bits + extra) as f32 / ((a.len().max(b.len())) as f32 * 8.0)
@@ -126,7 +132,6 @@ pub fn run_link_core(
     let measured_snr_db = mean_band_snr(&clean_c, &observed_c);
 
     let symbols = build_symbols(payload, cap, symbol_size, offsets);
-    let n_symbols = symbols.len();
     let sr = SAMPLE_RATE_HZ as f32;
     let time_to_deliver_s = total_samples as f32 / sr;
     let throughput_bps = (payload.len() as f32 * 8.0) / time_to_deliver_s;
@@ -144,7 +149,7 @@ pub fn run_link_core(
         total_samples,
         time_to_deliver_s,
         throughput_bps,
-        symbols: symbols.into_iter().take(n_symbols).collect(),
+        symbols,
         spectrogram,
     })
 }
@@ -197,5 +202,20 @@ mod tests {
         assert_eq!(r.spectrogram.mag_q.len(), r.spectrogram.rows * r.spectrogram.cols);
         // Lowest freq row >= ~250 Hz band edge.
         assert!(*r.spectrogram.freqs_hz.first().unwrap() >= 200.0);
+    }
+
+    #[test]
+    fn symbol_payload_ranges_are_contiguous_and_nonoverlapping() {
+        // 20-byte payload -> stream = 2 header + 20 = 22 bytes -> ceil(22/9)=3 symbols.
+        let payload: Vec<u8> = (0..20).map(|i| i as u8).collect();
+        let off = offsets_for(payload.len());
+        let r = run_link_core(&payload, &off, "floor-wblo", 80.0, "none", 1).unwrap();
+        // Symbol 0 carries cap-2 = 7 payload bytes; later symbols carry 9.
+        assert_eq!(r.symbols[0].byte_start, 0);
+        assert_eq!(r.symbols[0].byte_end, 7);
+        // Contiguous, non-overlapping across all symbols.
+        for w in r.symbols.windows(2) {
+            assert_eq!(w[0].byte_end, w[1].byte_start, "ranges must be contiguous");
+        }
     }
 }
