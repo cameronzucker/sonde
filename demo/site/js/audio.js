@@ -6,6 +6,7 @@
 export function createAudioPlayer({ gain = 0.3 } = {}) {
   let ctx = null;
   let gainNode = null;
+  let analyser = null; // tapped by the waterfall for a live spectrogram
   let buffer = null; // AudioBuffer, built lazily once a ctx exists
   let pendingSamples = null; // Float32Array awaiting a ctx
   let sampleRate = 48000;
@@ -20,11 +21,24 @@ export function createAudioPlayer({ gain = 0.3 } = {}) {
       ctx = new AC();
       gainNode = ctx.createGain();
       gainNode.gain.value = muted ? 0 : gain;
+      // AnalyserNode taps the signal for the live waterfall. fftSize 1024 → 512
+      // bins; minDecibels..maxDecibels is a FIXED dB window so the displayed level
+      // is consistent run-to-run (a noisy low-SNR transmission really does read as
+      // noisier — no per-run normalization). It's a pass-through; audio is unchanged.
+      analyser = ctx.createAnalyser();
+      analyser.fftSize = 1024;
+      analyser.smoothingTimeConstant = 0.55;
+      analyser.minDecibels = -95;
+      analyser.maxDecibels = -20;
+      analyser.connect(gainNode);
       gainNode.connect(ctx.destination);
     }
     if (ctx.state === "suspended") ctx.resume();
     return ctx;
   }
+
+  /** The AnalyserNode for the live spectrogram (null until the first play()). */
+  function getAnalyser() { return analyser; }
 
   function buildBuffer() {
     if (buffer || !pendingSamples || !ctx) return;

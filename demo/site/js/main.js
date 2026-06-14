@@ -1,9 +1,13 @@
-// main.js — bootstrap + wiring for the Sonde adaptive-link demo (ES module).
-// engine.js is the only wasm-aware module; every view consumes parsed LinkResult objects.
+// main.js — bootstrap + wiring for the ARDOP-anchored HF link demo (ES module).
+//
+// Re-anchored on a real reference modem: ardop-engine.js is the only backend-aware
+// module; it hits demo/ardop/server.py, which runs real ardopcf frames through
+// hf-channel-sim. Every view consumes the parsed result objects unchanged. ardopcf
+// is external/reference (clean-sheet, ADR 0014); the page transmits nothing.
 
-import { initEngine, listModes, recommendMode, runLink, linkAudio, offsets, SAMPLE_RATE_HZ } from "./engine.js";
+import { initEngine, listModes, recommendMode, runLink, fetchAudio, offsets } from "./ardop-engine.js";
 import { createWaterfall } from "./waterfall.js";
-import { createConsole } from "./console.js";
+import { createFrameLog } from "./frame-log.js";
 import { createImageReveal } from "./image-reveal.js";
 import { createPlayback } from "./playback.js";
 import { createControls } from "./controls.js";
@@ -25,13 +29,14 @@ const muteBtn = el("mute-btn");
 const muteGlyph = el("mute-glyph");
 
 // ── Module instances + run state ─────────────────────────────────────────────
-let waterfall, packetConsole, imageReveal, playback, controls, audioPlayer;
+let waterfall, frameLog, imageReveal, playback, controls, audioPlayer;
 let modes = [];
-let result = null;          // current LinkResult
+let result = null;          // current run result
 let imageRange = [0, 0];    // [start,end] of the image field within the payload
-let renderedSymbols = 0;    // how many symbols the console has shown this run
+let renderedFrames = 0;     // how many frame-log rows shown this run
 let scrubbing = false;      // suppress scrub feedback while the user drags
 let seed = 1;               // fresh channel realization per run
+let runToken = 0;           // guards against stale async runs/audio applying late
 
 /** Find the [start,end] byte range of the "image" field in the offsets map. */
 function imageFieldRange(off) {
@@ -54,97 +59,104 @@ function setAdaptation(text) {
   if (t) t.textContent = text;
 }
 
-// ── Run the link for the current control state and load it for playback ──────
-function runAndLoad() {
-  const state = controls.getState();
-  const mode = state.auto ? recommendMode(state.snrDb) : (state.mode || recommendMode(state.snrDb));
+function clearStats(mode, msg) {
+  statMode.textContent = mode;
+  statConstellation.textContent = constellationFor(mode);
+  statSnr.textContent = "—";
+  statBer.textContent = "—";
+  statThroughput.textContent = "—";
+  statDeliver.textContent = "—";
+  setAdaptation(msg);
+}
 
+// ── Run the link for the current control state and load it for playback ──────
+async function runAndLoad() {
+  const state = controls.getState();
+  const requested = state.auto ? "auto" : (state.mode || "auto");
+  const myToken = ++runToken;
   const runSeed = seed++; // capture so the audio uses the SAME channel realization
+
+  setAdaptation("Running real ARDOP through the channel sim…");
+
   let r;
   try {
-    r = runLink(mode, state.snrDb, state.condition, runSeed);
+    r = await runLink(requested, state.snrDb, state.condition, runSeed);
   } catch (err) {
-    // Engine refused this mode/condition — surface it without crashing the page.
-    statMode.textContent = mode;
-    statConstellation.textContent = constellationFor(mode);
-    statSnr.textContent = "—";
-    statBer.textContent = "—";
-    statThroughput.textContent = "—";
-    statDeliver.textContent = "—";
-    setAdaptation(`Engine error: ${err.message}`);
+    if (myToken !== runToken) return; // a newer run superseded this one
+    clearStats(state.auto ? "auto" : (state.mode || "—"), `Backend error: ${err.message}`);
     imageReveal.showFailed();
-    audioPlayer.load(null); // no audio for an unavailable mode
-    playback.load(null); // stop any animation from the previous result
+    frameLog.reset();
+    audioPlayer.load(null);
+    playback.load(null);
     setPlayGlyph(false);
     return;
   }
+  if (myToken !== runToken) return; // stale — discard
 
   result = r;
   imageRange = imageFieldRange(offsets());
-  renderedSymbols = 0;
+  renderedFrames = 0;
 
-  // Telemetry.
+  // Telemetry. ARDOP reports link quality, not an SNR estimate — show the channel
+  // SNR we drove the sim with (honest labeling).
   statMode.textContent = r.mode_id;
-  statConstellation.textContent = constellationFor(r.mode_id);
-  statSnr.textContent = `${r.measured_snr_db.toFixed(1)} dB`;
-  statBer.textContent = `${(r.ber * 100).toFixed(2)}%`;
+  statConstellation.textContent = r.constellation || constellationFor(r.mode_id);
+  statSnr.textContent = `${r.set_snr_db.toFixed(0)} dB set`;
+  statBer.textContent = isFinite(r.ber) ? `${(r.ber * 100).toFixed(2)}%` : "—";
   statThroughput.textContent = fmtThroughput(r.throughput_bps);
   statDeliver.textContent = `${r.time_to_deliver_s.toFixed(1)} s`;
 
-  // Adaptation narrative.
-  // Three outcome states: clean recovery; synced-but-corrupted (frame decoded
-  // with bit errors — recovered_bytes present but != payload); failed sync
-  // (no recovered_bytes). The engine reports recovered_ok=false for BOTH of the
-  // latter two, so the image/narrative key off recovered_bytes PRESENCE, not
-  // recovered_ok — otherwise the corrupting-image showcase reads "DECODE FAILED".
-  const synced = Array.isArray(r.recovered_bytes) && r.recovered_bytes.length > 0;
-  const pick = state.auto ? `Auto selected ${r.mode_id}` : `Manual: ${r.mode_id}`;
-  const outcome = r.recovered_ok
-    ? "link closes — payload recovered."
-    : synced
-      ? `link syncs but bit errors corrupt the payload (BER ${(r.ber * 100).toFixed(1)}%) — watch the recon image degrade.`
-      : (state.condition === "none"
-          ? "SNR too low — the floor waveform can't close the link."
-          : "link fails to sync — multipath beyond the floor's reach.");
+  // Adaptation narrative — three outcomes keyed on frame loss.
+  const s = r.summary;
+  const pick = r.auto ? `Auto selected ${r.mode_id}` : `Manual: ${r.mode_id}`;
+  let outcome;
+  if (s.frames_decoded === s.frames_total) {
+    outcome = `all ${s.frames_total} frames decoded — image recovered intact.`;
+  } else if (s.frames_decoded === 0) {
+    outcome = `0 / ${s.frames_total} frames decoded — link can't close, nothing recovered.`;
+  } else {
+    outcome = `${s.frames_decoded} / ${s.frames_total} frames decoded — ${s.frames_total - s.frames_decoded} lost to the channel (no ARQ), leaving holes in the image.`;
+  }
   setAdaptation(`${pick} for ${state.snrDb} dB / ${state.condition}. ${outcome}`);
 
-  // Views.
-  waterfall.setData(r.spectrogram);
-  packetConsole.reset();
-  if (!synced) imageReveal.showFailed();
+  // Views. The waterfall is a LIVE spectrogram driven by the playing audio's
+  // analyser (see boot()); just clear its history so this transmission scrolls in
+  // fresh. (The backend's static spectrogram field is intentionally unused.)
+  waterfall.reset();
+  frameLog.reset();
+  if (s.frames_decoded === 0) imageReveal.showFailed();
 
-  // Audio: the channel-impaired waveform for this exact run (same seed) — lets
-  // the operator hear the modulated signal. Plays on the transport Play button.
-  audioPlayer.load(linkAudio(mode, state.snrDb, state.condition, runSeed), SAMPLE_RATE_HZ);
+  // Audio: the concatenated channel-impaired transmission for this exact run. Fetch
+  // is async; guard against a stale run applying its audio over a newer one.
+  fetchAudio(r.audio_url).then(({ samples, sampleRate }) => {
+    if (myToken !== runToken) return;
+    audioPlayer.load(samples, sampleRate);
+  }).catch(() => { if (myToken === runToken) audioPlayer.load(null); });
 
   playback.load(r);
-  // Land on the fully-delivered frame so the recon image + packet console are
-  // populated at rest. Previously the page sat at fraction 0 — a 0%-revealed,
-  // i.e. blank, recon image — until the operator pressed Play. Play/scrub now
-  // replays the progressive fill-in from the start on demand.
+  // Land on the fully-delivered frame so the recon image + frame log are populated
+  // at rest; Play/scrub replays the progressive fill-in on demand.
   playback.scrub(1);
   setPlayGlyph(false);
 }
 
 // ── Playback frame handler ───────────────────────────────────────────────────
-function onFrame(fraction, symbolIndex) {
-  waterfall.setNow(fraction);
-
-  // Render whenever bytes were recovered (clean OR corrupted) — not only on
-  // recovered_ok, so the corrupting reveal works in the marginal regime.
-  if (result && Array.isArray(result.recovered_bytes) && result.recovered_bytes.length > 0) {
+function onFrame(fraction, frameIndex) {
+  // Reveal the recovered image (clipped to fraction). Holes from lost frames show
+  // as corruption in the byte-grid fallback when the JPEG won't decode.
+  if (result && result.recovered_bytes && result.recovered_bytes.length > 0) {
     imageReveal.render(result.recovered_bytes, imageRange, fraction);
   }
 
-  // Show every symbol up to symbolIndex; on a backward scrub, replay from scratch.
-  const target = symbolIndex + 1;
-  if (target < renderedSymbols) {
-    packetConsole.reset();
-    renderedSymbols = 0;
+  // Append frame-log rows up to frameIndex; on a backward scrub, replay from scratch.
+  const target = frameIndex + 1;
+  if (target < renderedFrames) {
+    frameLog.reset();
+    renderedFrames = 0;
   }
-  while (renderedSymbols < target && renderedSymbols < (result?.symbols.length || 0)) {
-    packetConsole.showSymbol(result.symbols[renderedSymbols]);
-    renderedSymbols++;
+  while (renderedFrames < target && renderedFrames < (result?.frames.length || 0)) {
+    frameLog.showFrame(result.frames[renderedFrames]);
+    renderedFrames++;
   }
 
   if (!scrubbing) scrub.value = String(Math.round(fraction * 1000));
@@ -152,10 +164,7 @@ function onFrame(fraction, symbolIndex) {
 
 function onDone() {
   setPlayGlyph(false);
-  // Only show the failed placeholder for a true sync failure (no bytes at all);
-  // a synced-but-corrupted decode keeps its (corrupted) recovered image.
-  const synced = result && Array.isArray(result.recovered_bytes) && result.recovered_bytes.length > 0;
-  if (result && !synced) imageReveal.showFailed();
+  if (result && result.summary.frames_decoded === 0) imageReveal.showFailed();
 }
 
 // ── Transport controls ───────────────────────────────────────────────────────
@@ -173,8 +182,6 @@ function wireTransport() {
       audioPlayer.stop();
       setPlayGlyph(false);
     } else {
-      // playback.play() replays from the start when parked at the end; mirror
-      // that for the audio so sound and visuals start together.
       const offset = Number(scrub.value) >= 1000 ? 0 : Number(scrub.value) / 1000;
       playback.play();
       audioPlayer.play(offset);
@@ -218,11 +225,17 @@ async function boot() {
   await initEngine();
   modes = listModes();
 
-  waterfall = createWaterfall(el("waterfall-mount"));
-  packetConsole = createConsole(el("tx-console"), el("rx-console"), el("flip-count"));
+  audioPlayer = createAudioPlayer();
+  // The waterfall is a live spectrogram: it taps the audio player's AnalyserNode
+  // each frame while audio is playing, so it animates in real time and honestly
+  // reflects the channel's noise at the current SNR.
+  waterfall = createWaterfall(el("waterfall-mount"), {
+    getAnalyser: () => audioPlayer.getAnalyser(),
+    isPlaying: () => audioPlayer.isPlaying(),
+  });
+  frameLog = createFrameLog(el("frame-log-stream"), el("frame-log-stat"));
   imageReveal = createImageReveal(el("recon-image"));
   playback = createPlayback({ onFrame, onDone });
-  audioPlayer = createAudioPlayer();
   controls = createControls(modes, runAndLoad);
 
   wireTransport();
@@ -233,6 +246,5 @@ async function boot() {
 
 boot().catch((err) => {
   setAdaptation(`Failed to initialise: ${err.message}`);
-  // Surface to console for debugging the wasm/asset load path.
-  console.error("[sonde-demo] boot failed:", err);
+  console.error("[ardop-demo] boot failed:", err);
 });

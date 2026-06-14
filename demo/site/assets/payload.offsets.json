@@ -1,21 +1,11 @@
 {
-  "total_len": 3025,
+  "total_len": 2895,
   "fields": [
     {
-      "label": "header",
-      "start": 0,
-      "end": 132
-    },
-    {
-      "label": "body",
-      "start": 132,
-      "end": 356
-    },
-    {
       "label": "image",
-      "start": 356,
-      "end": 3025
+      "start": 0,
+      "end": 2895
     }
   ],
-  "image_byte_len": 2669
+  "image_byte_len": 2895
 }

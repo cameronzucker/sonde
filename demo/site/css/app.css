@@ -354,6 +354,31 @@ body {
 .console__stream::-webkit-scrollbar { width: 8px; }
 .console__stream::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 8px; }
 
+/* ── Frame decode log (ARDOP per-frame results) ─────────────────────────── */
+.flip #frame-log-stat { color: var(--teal); font-weight: 600; }
+.flog { background: var(--panel-1); display: flex; flex-direction: column; flex: 1; min-width: 0; }
+.flog__bar {
+  font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.05em;
+  color: var(--muted); padding: 11px 16px; border-bottom: 1px solid var(--line);
+}
+.flog__stream {
+  font-family: var(--font-mono); font-size: 12.5px; line-height: 1.6;
+  padding: 8px 16px; height: 230px; overflow-y: auto;
+}
+.flog__row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 4px 0; border-bottom: 1px dashed var(--line);
+}
+.flog__row--fail { opacity: 0.85; }
+.flog__idx { color: var(--faint); min-width: 34px; }
+.flog__pill { font-weight: 600; font-size: 11px; padding: 2px 8px; border-radius: 4px; letter-spacing: 0.08em; }
+.flog__pill--pass { color: var(--green-ok); background: rgba(68,209,141,0.13); }
+.flog__pill--fail { color: var(--red); background: rgba(255,93,93,0.16); }
+.flog__meta { color: var(--muted); }
+.flog__meta--lost { color: var(--red); font-style: italic; }
+.flog__stream::-webkit-scrollbar { width: 8px; }
+.flog__stream::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 8px; }
+
 /* ── Transport (contained bar, real height — not a skinny strip) ───────── */
 .panel--transport {
   flex-direction: row; align-items: center; gap: 20px;

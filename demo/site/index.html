@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>SONDE · HF Data Modem — Adaptive Link Demo</title>
-  <meta name="description" content="Interactive demo of the Sonde HF data modem: drive a simulated shortwave channel and watch real DSP adapt while an EmComm SITREP is delivered over the link." />
+  <title>HF Data Modem — Live ARDOP Link Demo</title>
+  <meta name="description" content="Interactive HF data-modem demo: drive a simulated shortwave channel and watch a real reference modem (ARDOP) deliver an EmComm SITREP image over it, frame by frame — the known-good baseline Sonde is built against." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Chivo:ital,wght@0,300;0,400;0,500;0,700;0,900;1,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -34,7 +34,7 @@
         </span>
       </div>
       <div class="masthead__meta">
-        <span class="chip chip--live"><span class="chip__dot"></span>SIMULATED LINK</span>
+        <span class="chip chip--live"><span class="chip__dot"></span>ARDOP · SIMULATED CHANNEL</span>
         <span class="chip chip--muted">EMCOMM · SITREP DELIVERY</span>
       </div>
     </header>
@@ -43,11 +43,12 @@
     <div class="honesty" role="note">
       <span class="honesty__mark" aria-hidden="true">▲</span>
       <p>
-        <strong>Simulated channel · software DSP · not on-air.</strong>
-        Real Sonde modulation and demodulation run in your browser via WebAssembly over a
-        synthetic HF channel. No radio is keyed. Only the robustness-floor waveform decodes
-        cleanly today, and only on the ideal (AWGN) condition — multipath degradation is shown
-        deliberately, to illustrate <em>why adaptation matters</em>.
+        <strong>Real reference modem · simulated channel · not on-air.</strong>
+        Each run drives a real <strong>ARDOP</strong> modem (ardopcf) end-to-end through a
+        synthetic HF channel on the backend, then plays back what actually decoded. No radio
+        is keyed. ARDOP is a known-good external baseline — the bar Sonde is being built to
+        meet — and is never reimplemented here. There is no link layer, so a frame the channel
+        corrupts is simply lost: watch the image gain <em>holes</em> as conditions worsen.
       </p>
     </div>
 
@@ -58,14 +59,14 @@
       <section class="panel panel--hero" aria-labelledby="hero-label">
         <div class="panel__head">
           <h2 class="panel__title" id="hero-label"><span class="idx">01</span> Spectral Waterfall</h2>
-          <span class="panel__hint">3D STFT · viridis magnitude · live sweep</span>
+          <span class="panel__hint">live 3D FFT of the transmission · press Play · drag to orbit</span>
         </div>
         <div class="stage" id="waterfall-mount" role="img" aria-label="3D spectrogram waterfall of the transmitted signal">
           <span class="reg reg--tl" aria-hidden="true"></span>
           <span class="reg reg--tr" aria-hidden="true"></span>
           <span class="reg reg--bl" aria-hidden="true"></span>
           <span class="reg reg--br" aria-hidden="true"></span>
-          <div class="stage__boot" id="stage-boot">initialising DSP core…</div>
+          <div class="stage__boot" id="stage-boot">press ▶ Play to stream the live spectrogram…</div>
         </div>
       </section>
 
@@ -148,32 +149,26 @@
       <section class="panel panel--recon" aria-labelledby="recon-label">
         <div class="panel__head">
           <h2 class="panel__title" id="recon-label"><span class="idx">04</span> Recon Attachment</h2>
-          <span class="panel__hint">recovered bytes → JPEG</span>
+          <span class="panel__hint">recovered frames → JPEG</span>
         </div>
         <div class="recon">
           <canvas id="recon-image" width="320" height="240" aria-label="Progressively decoded reconnaissance photo"></canvas>
-          <p class="recon__cap">The SITREP carries a ~3&nbsp;KB aerial photo. It renders from the
-            <em>recovered</em> bytes as the link plays out — clean at high SNR, visibly corrupted at the margin.</p>
+          <p class="recon__cap">The SITREP carries a ~3&nbsp;KB recon photo. It renders from the
+            frames that <em>decoded</em> as the link plays out — intact at high SNR, holes where frames are lost at the margin.</p>
         </div>
       </section>
 
-      <!-- TX | RX CONSOLE -->
+      <!-- FRAME DECODE LOG -->
       <section class="panel panel--console" aria-labelledby="console-label">
         <div class="panel__head">
-          <h2 class="panel__title" id="console-label"><span class="idx">05</span> Packet Console</h2>
+          <h2 class="panel__title" id="console-label"><span class="idx">05</span> Frame Decode Log</h2>
           <span class="panel__hint">
-            per-symbol bytes · <span class="flip">flips <span id="flip-count">0</span></span>
+            per-frame result · <span class="flip">decoded <span id="frame-log-stat">0/0</span></span>
           </span>
         </div>
-        <div class="console">
-          <div class="console__col">
-            <div class="console__bar"><span class="console__lbl console__lbl--tx">TX</span> transmitted ground truth</div>
-            <div class="console__stream" id="tx-console"><span class="console__idle">— awaiting playback —</span></div>
-          </div>
-          <div class="console__col">
-            <div class="console__bar"><span class="console__lbl console__lbl--rx">RX</span> demodulated &amp; decoded</div>
-            <div class="console__stream" id="rx-console"><span class="console__idle">— awaiting playback —</span></div>
-          </div>
+        <div class="flog">
+          <div class="flog__bar">each ARDOP frame: decode PASS/FAIL · RS bytes corrected · residual BER</div>
+          <div class="flog__stream" id="frame-log-stream"><span class="console__idle">— awaiting playback —</span></div>
         </div>
       </section>
 
@@ -204,9 +199,9 @@
     <section class="explainer" aria-label="What you're seeing">
       <h3>What you're seeing</h3>
       <ol>
-        <li><strong>Set the channel.</strong> Drag SNR and pick a condition. <em>Auto</em> lets Sonde choose the waveform; <em>Manual</em> lets you force one.</li>
-        <li><strong>Sonde runs the real DSP.</strong> Your payload is modulated, pushed through a synthetic HF channel, then demodulated and decoded — entirely in WebAssembly.</li>
-        <li><strong>Press play.</strong> The waterfall sweeps, the packet console shows TX vs. decoded RX byte-by-byte, and the recon photo rebuilds from what actually survived.</li>
+        <li><strong>Set the channel.</strong> Drag SNR and pick a condition. <em>Auto</em> picks the fastest frame type expected to close the link; <em>Manual</em> lets you force one (robust modes need many more frames).</li>
+        <li><strong>ARDOP runs the real modem.</strong> The backend chunks a ~3&nbsp;KB image across real ARDOP frames, pushes each through a synthetic HF channel, and decodes it — real modulation, real Reed–Solomon FEC, no shortcuts.</li>
+        <li><strong>Press play.</strong> The waterfall sweeps the real transmission, the frame log shows each frame's decode and FEC effort, and the recon photo rebuilds from the frames that survived — with holes where frames were lost.</li>
       </ol>
     </section>
 

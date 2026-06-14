@@ -205,9 +205,14 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8770)
+    # Bind to all interfaces by default: the Pi serves the backend and a laptop on
+    # the LAN renders the page (the Pi can't run a browser itself). /api/run shells
+    # out to ardopcf, so every query param is validated/coerced (frame + condition
+    # allowlists, numeric SNR/seed) — keep it to a trusted LAN, not the open internet.
+    ap.add_argument("--host", default="0.0.0.0")
     args = ap.parse_args()
-    srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    print(f"ARDOP demo on http://127.0.0.1:{args.port}/  (site + /api/run, /api/modes, /api/audio)")
+    srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    print(f"ARDOP demo on http://{args.host}:{args.port}/  (site + /api/run, /api/modes, /api/audio)")
     srv.serve_forever()
 
 

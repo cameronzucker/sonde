@@ -62,9 +62,12 @@ FRAME_CAPACITY = {
 # into unbounded ardopcf invocations (also keeps the demo's latency sane).
 MAX_FRAMES = 64
 
-# Audio band shown in the spectrogram (Hz). ARDOP SSB audio sits ~300–2700 Hz;
-# cap the STFT a little above that so the occupied band fills the surface.
-SPEC_FREQ_CAP_HZ = 3600.0
+# Audio band shown in the spectrogram (Hz). Cropped to the SSB passband (design
+# spec §4: 250–2700 Hz) so the occupied band fills the surface rather than floating
+# in a wide noise field — wider modes (16QAM.2000) fill it, narrow modes (4PSK.500)
+# show a thin ridge, making the per-mode bandwidth difference visible.
+SPEC_FREQ_LO_HZ = 200.0
+SPEC_FREQ_HI_HZ = 2800.0
 
 _PAYLOAD_PATH = os.path.join(os.path.dirname(__file__), "../site/assets/payload.bin")
 
@@ -214,8 +217,9 @@ def compute_spectrogram(samples, sr, rows=100, nfft=256):
         frames.append(np.abs(np.fft.rfft(seg * win)))
     mag = np.array(frames)  # rows × (nfft/2 + 1)
     bin_hz = sr / nfft
-    maxbin = min(mag.shape[1], int(SPEC_FREQ_CAP_HZ / bin_hz) + 1)
-    mag = mag[:, :maxbin]
+    lobin = max(0, int(SPEC_FREQ_LO_HZ / bin_hz))
+    hibin = min(mag.shape[1], int(SPEC_FREQ_HI_HZ / bin_hz) + 1)
+    mag = mag[:, lobin:hibin]
     mag_db = 20.0 * np.log10(mag + 1e-6)
     lo, hi = np.percentile(mag_db, 5.0), np.percentile(mag_db, 99.5)
     norm = np.clip((mag_db - lo) / max(1e-6, hi - lo), 0.0, 1.0)
@@ -225,7 +229,7 @@ def compute_spectrogram(samples, sr, rows=100, nfft=256):
         "rows": int(n_rows),
         "cols": int(n_cols),
         "mag_q": mag_q,
-        "freqs_hz": [round(c * bin_hz, 1) for c in range(n_cols)],
+        "freqs_hz": [round((lobin + c) * bin_hz, 1) for c in range(n_cols)],
         "times_s": [round(r * hop / sr, 3) for r in range(n_rows)],
     }
 
