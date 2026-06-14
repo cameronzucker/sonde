@@ -48,6 +48,28 @@ const SYNC_WINDOW_GUARD_SAMPLES: usize = 128;
 /// bit-identical); only the out-of-band spectrum is shaped. 128 ≈ 2.7 ms taper.
 const WINDOW_ROLLOFF_SAMPLES: usize = 128;
 
+/// Target peak-to-average power ratio (dB) for the soft-clipped OFDM body.
+/// Uncompensated OFDM peaks at ~22 dB (≈10·log10 of the occupied sub-carrier
+/// count) — far too high for an SSB PA. A soft clip to 12 dB cuts ~10 dB of PAPR
+/// while keeping out-of-band regrowth within the −26 dBc mask (measured in
+/// waveform_psd_papr.rs) and leaving decode intact at the high-SNR clean point.
+/// Clipping below ~12 dB pushes the spectral regrowth past the mask.
+const PAPR_TARGET_DB: f32 = 12.0;
+
+/// Soft-clip `signal` so its peak-to-average power ratio does not exceed
+/// `target_papr_db`. The threshold is derived from the signal's own mean power;
+/// samples beyond ±A are limited to ±A. Clipping corrupts the FFT body (trading
+/// EVM for PAPR) — acceptable for the strong-FEC floor — unlike the lossless
+/// inter-symbol windowing.
+fn soft_clip_to_papr(signal: &[f32], target_papr_db: f32) -> Vec<f32> {
+    if signal.is_empty() {
+        return Vec::new();
+    }
+    let mean_pow = signal.iter().map(|s| s * s).sum::<f32>() / signal.len() as f32;
+    let amp = (mean_pow * 10.0_f32.powf(target_papr_db / 10.0)).sqrt();
+    signal.iter().map(|&s| s.clamp(-amp, amp)).collect()
+}
+
 /// Default robustness floor: wide-band OFDM, BPSK on every occupied
 /// sub-carrier, with a composed FEC codec. Strategic posture is "go
 /// wider, not denser" — see overview §5.A.1.
@@ -164,7 +186,8 @@ impl WidebandLowDensityFloor {
                 symbols.push(self.modulate_coded_symbol(chunk));
             }
         }
-        Ok(self.window_and_concat(&symbols))
+        let windowed = self.window_and_concat(&symbols);
+        Ok(soft_clip_to_papr(&windowed, PAPR_TARGET_DB))
     }
 
     /// Concatenate OFDM symbols with raised-cosine inter-symbol windowing

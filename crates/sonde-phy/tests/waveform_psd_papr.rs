@@ -91,12 +91,12 @@ fn characterize_current_floor_waveform() {
         oob_frac
     );
     println!("largest spur/image above 3000 Hz = {oob_peak_dbc:.1} dBc");
-    println!("PAPR = {papr_db:.2} dB (PAPR reduction is a separate Step-1 item)");
     println!("=====================================================\n");
 
-    // ─── PSD-mask GATE (Step 1 acceptance, spectral half) ───
+    // ─── PSD-mask + PAPR GATE (Step 1 acceptance) ───
     // Raised-cosine inter-symbol windowing brings the emitted spectrum within an
-    // SSB-class mask. PAPR is measured but not yet gated (reduction pending).
+    // SSB-class mask; a 12 dB soft-clip bounds PAPR while keeping OOB regrowth
+    // within the mask.
     assert!(
         occupied_bw <= 2700.0,
         "occupied -26 dBc bandwidth {occupied_bw:.0} Hz exceeds the 2.7 kHz mask"
@@ -108,5 +108,9 @@ fn characterize_current_floor_waveform() {
     assert!(
         oob_frac < 0.01,
         "out-of-band energy fraction {oob_frac:.4} exceeds 1%"
+    );
+    assert!(
+        papr_db <= 13.0,
+        "PAPR {papr_db:.2} dB exceeds the 13 dB bound (soft-clip target is 12 dB)"
     );
 }
