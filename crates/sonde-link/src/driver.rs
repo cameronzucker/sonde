@@ -29,7 +29,6 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use sonde_phy::error::PhyError;
-use sonde_phy::modes::ModeHint;
 use sonde_phy::phy_api::PhyTransport;
 
 use crate::clock::Clock;
@@ -46,7 +45,6 @@ pub struct Driver<P: PhyTransport, C: Clock> {
     conn: Connection,
     phy: P,
     clock: C,
-    hint: ModeHint,
     /// `true` while an over we flushed is still being keyed by the worker.
     tx_active: bool,
     /// Real-time instant at which the current keyed over began.
@@ -58,13 +56,14 @@ pub struct Driver<P: PhyTransport, C: Clock> {
 }
 
 impl<P: PhyTransport, C: Clock> Driver<P, C> {
-    /// Wrap a connection + transport + clock with the mode hint to transmit under.
-    pub fn new(phy: P, conn: Connection, clock: C, hint: ModeHint) -> Self {
+    /// Wrap a connection + transport + clock. Frames are transmitted at the
+    /// connection's *current* mode ([`Connection::current_hint`]), so a
+    /// mid-session mode change takes effect on the wire automatically.
+    pub fn new(phy: P, conn: Connection, clock: C) -> Self {
         Self {
             conn,
             phy,
             clock,
-            hint,
             tx_active: false,
             tx_start: Duration::ZERO,
             tx_airtime: Duration::ZERO,
@@ -154,9 +153,10 @@ impl<P: PhyTransport, C: Clock> Driver<P, C> {
         // Flush the next over only when the worker is free (half-duplex).
         if !self.tx_active && self.phy.tx_in_flight() == 0 {
             let mut frames = 0u32;
+            let hint = self.conn.current_hint();
             while let Some(frame) = self.conn.poll_transmit(logical) {
                 if let Ok(bytes) = frame.encode() {
-                    match self.phy.send_frame(&bytes, self.hint) {
+                    match self.phy.send_frame(&bytes, hint) {
                         Ok(_) => frames += 1,
                         Err(e) => self.errors.push_back(e),
                     }
@@ -181,7 +181,7 @@ mod tests {
     use super::*;
     use crate::frame::Callsign;
     use crate::profile::ModeProfile;
-    use sonde_phy::modes::ModeTable;
+    use sonde_phy::modes::{ModeHint, ModeTable};
     use sonde_phy::phy_api::{ChannelQualityReport, RxFrame, TxToken};
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
@@ -302,13 +302,11 @@ mod tests {
             ea,
             Connection::initiator(call("K1ABC"), call("W2XYZ"), 0x1234, profile(), 8),
             clk.clone(),
-            ModeHint::MainAuto,
         );
         let mut b = Driver::new(
             eb,
             Connection::acceptor(call("W2XYZ"), call("K1ABC"), profile(), 8),
             clk.clone(),
-            ModeHint::MainAuto,
         );
         a.connect();
         let mut b_ev = Vec::new();
@@ -328,7 +326,6 @@ mod tests {
             ErrPhy,
             Connection::initiator(call("K1ABC"), call("W2XYZ"), 0x1234, profile(), 8),
             clk.clone(),
-            ModeHint::MainAuto,
         );
         a.connect();
         a.poll();
@@ -356,7 +353,6 @@ mod tests {
             phy,
             Connection::initiator(call("K1ABC"), call("W2XYZ"), 0x1234, profile(), 8),
             clk.clone(),
-            ModeHint::MainAuto,
         );
         a.connect(); // turn-recovery is 20 ms logical
         for _ in 0..50 {
@@ -382,7 +378,6 @@ mod tests {
             phy,
             Connection::initiator(call("K1ABC"), call("W2XYZ"), 0x1234, profile(), 8),
             clk.clone(),
-            ModeHint::MainAuto,
         );
         a.connect();
         a.poll(); // flush CONN → worker is now keying

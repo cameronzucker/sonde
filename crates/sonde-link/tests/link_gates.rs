@@ -26,6 +26,7 @@ use sonde_phy::phy_api::{ChannelQualityReport, PhyTransport, RxFrame, TxToken};
 
 use sonde_link::{
     ArqStrategy, Callsign, ConnState, Connection, HostCommand, HostEvent, Link, ModeProfile,
+    BASE_RUNG,
 };
 
 // ---------------------------------------------------------------------------
@@ -156,6 +157,10 @@ struct Medium {
     /// Deep-fade window `[start, end)` during which every frame is dropped
     /// (models a burst the channel cannot carry at all).
     blackout: Option<(Duration, Duration)>,
+    /// When set, only frames stamped with the BASE link mode (header MODE byte
+    /// == `BASE_RUNG`) get through — models "the fast modes no longer decode,
+    /// only the robust floor does", to exercise the link's BASE-fallback (P1).
+    base_mode_only: bool,
     stats: Stats,
 }
 
@@ -176,6 +181,7 @@ impl Medium {
             ready: [VecDeque::new(), VecDeque::new()],
             force_collision: false,
             blackout: None,
+            base_mode_only: false,
             params,
             stats: Stats::default(),
         }
@@ -205,6 +211,13 @@ impl Medium {
                 self.stats.lost += 1;
                 return;
             }
+        }
+
+        // Mode-selective channel: only BASE-mode frames decode (MODE byte at
+        // header offset 39). Anything at a faster mode is lost.
+        if self.base_mode_only && bytes.len() > 39 && bytes[39] != BASE_RUNG {
+            self.stats.lost += 1;
+            return;
         }
 
         // Gilbert-Elliott burst loss (advances the chain every transmitted frame).
@@ -289,6 +302,11 @@ impl Channel {
     /// Drop every frame in `[start, end)` (a deep-fade burst).
     fn blackout(&self, start: Duration, end: Duration) {
         self.medium.borrow_mut().blackout = Some((start, end));
+    }
+
+    /// Only BASE-mode frames decode from now on (the fast modes "stop decoding").
+    fn set_base_mode_only(&self, on: bool) {
+        self.medium.borrow_mut().base_mode_only = on;
     }
 }
 
@@ -764,4 +782,31 @@ fn g8_acceptor_originated_data_under_burst_loss() {
     p.b.send(msg.clone());
     assert!(p.run_until(8000, |p| !p.a_messages().is_empty()));
     assert_eq!(p.a_messages(), vec![msg]);
+}
+
+#[test]
+fn g9_link_converges_to_base_mode_under_degradation_and_delivers() {
+    // Connect cleanly, then the fast modes "stop decoding" (only BASE-mode frames
+    // get through). The link must FALL TO THE BASE mode (design P1) and still
+    // deliver — converging to the robust floor instead of declaring PeerLost.
+    let mut p = LinkPair::new(ChannelParams::clean(TICK));
+    p.a.connect(Duration::ZERO);
+    assert!(p.run_until(40, |p| p.both_connected()));
+
+    // The channel degrades: from now on only BASE-mode frames decode.
+    p.chan.set_base_mode_only(true);
+    let msg: Vec<u8> = (0u8..20).collect();
+    p.a.send(msg.clone());
+
+    assert!(
+        p.run_until(4000, |p| !p.b_messages().is_empty()),
+        "link must fall to BASE and deliver, not die"
+    );
+    assert_eq!(p.b_messages(), vec![msg]);
+    assert_eq!(
+        p.a.state(),
+        ConnState::Connected,
+        "survived by converging to BASE"
+    );
+    assert_eq!(p.b.state(), ConnState::Connected);
 }

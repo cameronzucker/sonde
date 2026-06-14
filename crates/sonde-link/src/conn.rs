@@ -32,8 +32,9 @@ use std::time::Duration;
 
 use crate::arq::{Reassembler, RecvBuffer, SendWindow, FIRST_SEQ};
 use crate::frame::{Callsign, FrameType, LinkFrame};
-use crate::mac::ArqStrategy;
+use crate::mac::{self, ArqStrategy, BASE_RUNG, DEFAULT_RUNG};
 use crate::profile::ModeProfile;
+use sonde_phy::modes::ModeHint;
 
 /// CONN retransmissions before a connect attempt fails.
 const MAX_CONN_RETRIES: u32 = 5;
@@ -41,6 +42,10 @@ const MAX_CONN_RETRIES: u32 = 5;
 const MAX_DISC_RETRIES: u32 = 3;
 /// Consecutive silent overs tolerated before the link is declared dead.
 const DEAD_OVERS_TOLERATED: u32 = 6;
+/// Consecutive silent overs at a non-base mode before falling to the robust
+/// BASE mode (design P1: converge to the floor under degradation rather than
+/// dying). Must be `< DEAD_OVERS_TOLERATED` so BASE gets a fresh death budget.
+const DOWNSHIFT_TO_BASE_OVERS: u32 = 3;
 
 /// Connection lifecycle state (design §4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +111,11 @@ pub struct Connection {
     /// Whether to emit the SACK bitmap. Selective repeat sets it; the floor
     /// `WholeMessage` strategy clears it (cumulative-only, the "no NACK" model).
     sack_enabled: bool,
+    /// Current link mode / ladder-rung id (stamped on every outgoing frame; the
+    /// ARQ window + strategy follow it). Starts at `DEFAULT_RUNG`.
+    current_rung: u8,
+    /// Window the connection was constructed with — restored on session reset.
+    initial_window: u32,
     silent_overs: u32,
     conn_retries: u32,
     disc_retries: u32,
@@ -152,6 +162,8 @@ impl Connection {
             awaiting_reply: false,
             owe_ack: false,
             sack_enabled: true,
+            current_rung: DEFAULT_RUNG,
+            initial_window: window,
             silent_overs: 0,
             conn_retries: 0,
             disc_retries: 0,
@@ -177,6 +189,18 @@ impl Connection {
     /// Current lifecycle state.
     pub fn state(&self) -> ConnState {
         self.state
+    }
+
+    /// The mode hint the driver should transmit under right now (the current
+    /// ladder rung). The driver reads this per send so a mid-session mode change
+    /// takes effect on the wire.
+    pub fn current_hint(&self) -> ModeHint {
+        mac::rung(self.current_rung).mode
+    }
+
+    /// Current ladder-rung id (for tests / introspection).
+    pub fn current_rung(&self) -> u8 {
+        self.current_rung
     }
 
     /// Begin connecting (initiator). No-op unless `Closed`.
@@ -264,7 +288,19 @@ impl Connection {
                 Floor::Listening if self.awaiting_reply => {
                     // We sent data and expected a reply that did not arrive.
                     self.silent_overs += 1;
-                    if self.silent_overs > DEAD_OVERS_TOLERATED {
+                    if self.current_rung != BASE_RUNG
+                        && self.silent_overs >= DOWNSHIFT_TO_BASE_OVERS
+                    {
+                        // We cannot get through at this mode — fall to the robust
+                        // BASE mode (design P1) and keep trying there with a fresh
+                        // death budget. Both ends do this symmetrically (and the
+                        // peer also follows our mode-id), so they converge to BASE
+                        // instead of dying. Re-take the floor to retransmit.
+                        self.apply_rung(BASE_RUNG);
+                        self.silent_overs = 0;
+                        self.floor = Floor::Sending;
+                        self.deadline = None;
+                    } else if self.silent_overs > DEAD_OVERS_TOLERATED {
                         self.close(Some(HostEvent::PeerLost));
                     } else {
                         // Re-take the floor to retransmit the unacked window.
@@ -335,6 +371,31 @@ impl Connection {
         self.send.has_unacked() || self.owe_ack
     }
 
+    /// Switch to ladder rung `id`: restamp the mode, resize the ARQ window in
+    /// place (preserving the seq stream + in-flight), and flip SACK on/off for
+    /// the rung's strategy. The airtime-aware timer *profile* is intentionally
+    /// NOT swapped here — real per-mode profiles come from the PHY (design §6,
+    /// not yet available); the constructed profile is kept until then.
+    fn apply_rung(&mut self, id: u8) {
+        if id == self.current_rung {
+            return;
+        }
+        self.current_rung = id;
+        let r = mac::rung(id);
+        self.send.reconfigure(r.window.window);
+        self.recv.reconfigure(r.window.window);
+        self.sack_enabled = matches!(r.strategy, ArqStrategy::SelectiveRepeat);
+    }
+
+    /// Follow a peer frame's advertised mode (the mode-id confirmation path): if
+    /// the peer is transmitting at a different rung, adopt it so our replies go
+    /// out at the same mode and the two ends converge.
+    fn follow_mode(&mut self, peer_mode: u8) {
+        if peer_mode != self.current_rung {
+            self.apply_rung(peer_mode);
+        }
+    }
+
     /// Transition to `Closed`, clearing all per-session ARQ/reassembly state so a
     /// same-object reconnect starts clean (Codex blocker #1). Optionally surface
     /// a host event. Does not touch the outbox (a queued DISC_ACK still flushes).
@@ -351,6 +412,12 @@ impl Connection {
         self.send.reset();
         self.recv.reset();
         self.reasm.reset();
+        // Restore the default mode + window so a same-object reconnect starts
+        // fresh at the top of the ladder, not stuck at a degraded BASE.
+        self.current_rung = DEFAULT_RUNG;
+        self.send.reconfigure(self.initial_window);
+        self.recv.reconfigure(self.initial_window);
+        self.sack_enabled = true;
         self.msg_end_seqs.clear();
         self.floor = Floor::Listening;
         self.awaiting_reply = false;
@@ -393,6 +460,7 @@ impl Connection {
             self.conn_id,
             seq,
         )
+        .with_mode(self.current_rung)
     }
 
     fn make_data(&self, seq: u32, payload: Vec<u8>) -> LinkFrame {
@@ -405,6 +473,7 @@ impl Connection {
         );
         f.ack_through = self.recv.ack_through();
         f.sack = self.sack_to_send();
+        f.mode = self.current_rung;
         if self.msg_end_seqs.contains(&seq) {
             f = f.end_of_msg();
         }
@@ -419,6 +488,7 @@ impl Connection {
             self.recv.ack_through(),
             self.sack_to_send(),
         )
+        .with_mode(self.current_rung)
     }
 
     /// The SACK bitmap to advertise: the live receive-buffer bitmap under
@@ -520,6 +590,7 @@ impl Connection {
 
     fn on_data(&mut self, frame: LinkFrame) {
         self.silent_overs = 0;
+        self.follow_mode(frame.mode);
         self.send.on_ack(frame.ack_through, frame.sack); // piggybacked ack
         let end_of_over = frame.is_end_of_over();
         let end_of_msg = frame.is_end_of_msg();
@@ -537,6 +608,7 @@ impl Connection {
 
     fn on_ack(&mut self, frame: &LinkFrame) {
         self.silent_overs = 0;
+        self.follow_mode(frame.mode);
         self.send.on_ack(frame.ack_through, frame.sack);
         if frame.is_end_of_over() {
             self.on_over_end();
@@ -545,6 +617,7 @@ impl Connection {
 
     fn on_keepalive(&mut self, frame: &LinkFrame) {
         self.silent_overs = 0;
+        self.follow_mode(frame.mode);
         // A keepalive may carry the floor token (an idle holder relinquishing).
         if frame.is_end_of_over() {
             self.on_over_end();
