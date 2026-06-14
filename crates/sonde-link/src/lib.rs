@@ -24,6 +24,9 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod arq;
 pub mod frame;
+pub mod profile;
 
 pub use frame::{Callsign, FrameError, FrameType, LinkFrame, LINK_MTU, LINK_OVERHEAD};
+pub use profile::ModeProfile;

@@ -47,6 +47,9 @@ pub const LINK_MTU: usize = u16::MAX as usize - LINK_OVERHEAD;
 /// FLAGS bit 0: this frame is the last of the sender's over; receiving it passes
 /// the floor (turn token). See design §3.5.
 pub const FLAG_END_OF_OVER: u8 = 0x01;
+/// FLAGS bit 1: this frame is the last fragment of a host message; the receiver
+/// reassembles the in-order run of DATA frames ending here into one message.
+pub const FLAG_END_OF_MSG: u8 = 0x02;
 
 const CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
 
@@ -215,6 +218,17 @@ impl LinkFrame {
         self.flags & FLAG_END_OF_OVER != 0
     }
 
+    /// Mark this as the last fragment of a host message (sets `END_OF_MSG`).
+    pub fn end_of_msg(mut self) -> Self {
+        self.flags |= FLAG_END_OF_MSG;
+        self
+    }
+
+    /// Whether this frame is the last fragment of a host message.
+    pub fn is_end_of_msg(&self) -> bool {
+        self.flags & FLAG_END_OF_MSG != 0
+    }
+
     /// Serialize to wire bytes (header + payload + CRC32).
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
         if self.payload.len() > LINK_MTU {
@@ -367,6 +381,24 @@ mod tests {
         assert!(f.is_end_of_over());
         let g = LinkFrame::decode(&f.encode().unwrap()).unwrap();
         assert!(g.is_end_of_over());
+    }
+
+    #[test]
+    fn end_of_msg_is_independent_of_end_of_over() {
+        // A fragment can end a message without ending the over, and vice-versa.
+        let mid =
+            LinkFrame::data(call("K1ABC"), call("W2XYZ"), 1, 3, b"frag".to_vec()).end_of_msg();
+        assert!(mid.is_end_of_msg());
+        assert!(!mid.is_end_of_over());
+        let g = LinkFrame::decode(&mid.encode().unwrap()).unwrap();
+        assert!(g.is_end_of_msg());
+        assert!(!g.is_end_of_over());
+
+        let both = LinkFrame::data(call("K1ABC"), call("W2XYZ"), 1, 4, b"last".to_vec())
+            .end_of_msg()
+            .end_of_over();
+        assert!(both.is_end_of_msg());
+        assert!(both.is_end_of_over());
     }
 
     #[test]
