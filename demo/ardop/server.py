@@ -17,9 +17,15 @@ Endpoints:
   GET /                      → demo site (demo/site/index.html)
   GET /api/modes             → mode catalogue + the provisional Auto ladder
   GET /api/run?frame=&snr=&condition=&seed=   → one multi-frame transfer (JSON)
-  GET /api/audio?id=<token>  → the concatenated transmission WAV for a run
+  GET /api/session?snr=&condition=&seed=&arqbw= → one REAL ARDOP connected session,
+                               streamed as Server-Sent Events (handshake → negotiated
+                               BW → ARQ progress → rate adaptation → delivery), plus a
+                               final audio_url for the teed on-air waterfall.
+  GET /api/audio?id=<token>  → the WAV for a run/session (PHY concat, or session air)
 
-No real radio: WAV files only (see ardop_channel.py). ardopcf is external/reference.
+No real radio: WAV files only. ardopcf is external/reference. The connected-mode
+session (testbench.run_session) runs two ardopcf instances over snd-aloop loopback —
+no PTT device, so nothing can key a radio.
 """
 import argparse
 import json
@@ -29,33 +35,18 @@ import tempfile
 import threading
 import traceback
 import uuid
+import wave
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-from ardop_channel import FRAMES, FRAME_CAPACITY, run_transfer, run_once, _write_wav_mono
+import numpy as np
+
+from testbench import (run_session, SessionParams, ARQBW_VALUES, CONDITIONS,
+                       RATE as SESSION_RATE)
 
 _SITE_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "../site"))
 _AUDIO_DIR = tempfile.mkdtemp(prefix="ardop_audio_")
-
-# Human-facing constellation label per modulation prefix (for the mode picker).
-_CONSTELLATION = {"4FSK": "4-FSK", "4PSK": "QPSK", "16QAM": "16-QAM"}
-
-# Provisional Auto ladder: pick the highest-rate frame expected to close the link
-# at a given SNR. Thresholds are PLACEHOLDERS pending the real SNR-axis calibration
-# against ARDOP's documented sensitivity (sonde-imh.1 follow-up; feeds P0). Ordered
-# high-SNR → low-SNR; first threshold the SNR clears wins.
-#
-# Floored at 4PSK.500 (128 B/frame → 24 frames for the ~3 KB demo payload): the
-# slower 4PSK.200 / 4FSK.200 modes would need 48 / 190 frames to carry it, which is
-# impractical airtime for a demo. At very low SNR Auto stays on 4PSK.500 and the
-# frames simply fail to decode — the honest "link can't close, image full of holes"
-# story, rather than a too-many-frames error. The slow modes remain Manual-only.
-_AUTO_LADDER = [
-    (15.0, "16QAM.2000.100.E"),
-    (6.0, "4PSK.1000.100.E"),
-    (-1e9, "4PSK.500.100.E"),
-]
 
 # Static assets the demo site serves. Anything else under _SITE_DIR is text/binary
 # best-effort; we only need these to render.
@@ -68,24 +59,14 @@ _MIME = {
 }
 
 
-def _constellation(frame):
-    return _CONSTELLATION.get(frame.split(".", 1)[0], "—")
-
-
-def auto_frame(snr_db):
-    """The Auto ladder's pick for a measured SNR (provisional; see _AUTO_LADDER)."""
-    for thresh, frame in _AUTO_LADDER:
-        if snr_db >= thresh:
-            return frame
-    return _AUTO_LADDER[-1][1]
-
-
-def mode_catalogue():
-    return [
-        {"id": f, "implemented": True, "constellation": _constellation(f),
-         "capacity_bytes": FRAME_CAPACITY[f]}
-        for f in FRAMES
-    ]
+def _write_wav_mono(path, samples, sr):
+    """Write float32 samples in [-1,1] to a 16-bit mono PCM WAV (for /api/audio)."""
+    pcm = (np.clip(samples, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(pcm)
 
 
 class _AudioCache:
@@ -117,6 +98,30 @@ class _AudioCache:
 
 _AUDIO = _AudioCache()
 
+# A connected session owns the two snd-aloop cards exclusively, so only ONE can run
+# at a time. A new /api/session request signals the running one to release (set the
+# abort Event), waits for the lock, then takes over — "latest lever wins", matching
+# the frontend's discard-stale-run pattern.
+_SESSION_LOCK = threading.Lock()
+_SESSION_ABORT = threading.Event()
+
+
+def _tap_to_audio_url(tap_path, rate):
+    """Convert the session's raw S16LE on-air tap → a cached WAV; return its URL.
+
+    The tap is what the *receiver* heard at the chosen SNR, so the waterfall plays
+    the genuine on-air spectrum. Returns None if the tap is empty/missing."""
+    try:
+        with open(tap_path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    if len(raw) < 2:
+        return None
+    samples = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    token = _AUDIO.put(samples, rate)
+    return f"/api/audio?id={token}"
+
 
 class Handler(BaseHTTPRequestHandler):
     def _send_json(self, code, obj):
@@ -131,20 +136,63 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     # ── API ──────────────────────────────────────────────────────────────────
-    def _api_run(self, q):
-        frame_arg = q.get("frame", ["auto"])[0]
-        snr = float(q.get("snr", ["6"])[0])
+    def _api_session(self, q):
+        """Stream ONE real ARDOP connected session as Server-Sent Events.
+
+        Param validation raises ValueError BEFORE any SSE byte is written, so bad
+        input still gets a clean 400 JSON from do_GET. Once the event-stream headers
+        are sent, every failure is surfaced as an SSE `error` event instead."""
+        snr = float(q.get("snr", ["20"])[0])
+        seed = int(q.get("seed", ["1"])[0]) & 0xFFFFFFFF
         condition = q.get("condition", ["none"])[0]
-        seed = int(q.get("seed", ["1"])[0])
-        auto = frame_arg in ("", "auto")
-        frame = auto_frame(snr) if auto else frame_arg
-        res = run_transfer(frame=frame, snr_db=snr, condition=condition, seed=seed)
-        samples = res.pop("_audio_samples")
-        token = _AUDIO.put(samples, res["sample_rate"])
-        res["audio_url"] = f"/api/audio?id={token}"
-        res["auto"] = auto
-        res["constellation"] = _constellation(frame)
-        return res
+        arqbw = q.get("arqbw", ["2000MAX"])[0]
+        if condition not in CONDITIONS:
+            raise ValueError(f"bad condition {condition!r}")
+        if arqbw not in ARQBW_VALUES:
+            raise ValueError(f"bad arqbw {arqbw!r}")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.send_header("X-Accel-Buffering", "no")  # don't let a proxy buffer the stream
+        self.end_headers()
+
+        # emit() runs from the session thread AND ardopcf host-reader threads, so
+        # serialize writes. A broken pipe (client closed the tab) flips `gone`, which
+        # the session's should_abort() polls — tearing down ardopcf instead of leaking.
+        wlock = threading.Lock()
+        state = {"gone": False}
+
+        def emit(ev):
+            with wlock:
+                if state["gone"]:
+                    return
+                if ev.get("t") == "result" and ev.get("tap_path"):
+                    url = _tap_to_audio_url(ev["tap_path"], ev.get("tap_rate", SESSION_RATE))
+                    if url:
+                        ev = {**ev, "audio_url": url}
+                try:
+                    self.wfile.write(f"data: {json.dumps(ev)}\n\n".encode())
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    state["gone"] = True
+                    _SESSION_ABORT.set()
+
+        # Take the loopback hardware: signal any running session to release, then wait.
+        _SESSION_ABORT.set()
+        with _SESSION_LOCK:
+            _SESSION_ABORT.clear()
+            params = SessionParams(
+                snr=snr, condition=condition, seed=seed, arqbw=arqbw,
+                tap=os.path.join(_AUDIO_DIR, "session_air.raw"))
+            try:
+                run_session(params, emit,
+                            should_abort=lambda: state["gone"] or _SESSION_ABORT.is_set())
+            except Exception as e:  # never 500 mid-stream — report as an SSE event
+                traceback.print_exc()
+                emit({"t": "error", "msg": str(e)})
+                emit({"t": "done"})
 
     def _api_audio(self, q):
         token = q.get("id", [""])[0]
@@ -175,20 +223,10 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         q = parse_qs(u.query)
         try:
-            if u.path == "/api/modes":
-                return self._send_json(200, {"modes": mode_catalogue(), "auto_ladder": _AUTO_LADDER})
-            if u.path == "/api/run":
-                return self._send_json(200, self._api_run(q))
+            if u.path == "/api/session":
+                return self._api_session(q)
             if u.path == "/api/audio":
                 return self._api_audio(q)
-            if u.path == "/api/frames":  # back-compat with the MVP
-                return self._send_json(200, {"frames": FRAMES})
-            if u.path == "/api/run_once":  # single-frame MVP, kept for debugging
-                return self._send_json(200, run_once(
-                    frame=q.get("frame", ["4PSK.500.100.E"])[0],
-                    snr_db=float(q.get("snr", ["6"])[0]),
-                    condition=q.get("condition", ["none"])[0],
-                    seed=int(q.get("seed", ["1"])[0])))
             return self._serve_static(u.path)
         except ValueError as e:  # rejected/invalid input → client error
             return self._send_json(400, {"error": str(e)})

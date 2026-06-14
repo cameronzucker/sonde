@@ -8,3 +8,4 @@ worktrees/
 .claude/worktrees/
 .claude/session-leases/
 .claude/worktree-archives/
+ARDOPDebug*.log

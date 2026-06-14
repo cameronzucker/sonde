@@ -38,6 +38,9 @@ def main():
     ap.add_argument("--condition", default="none")  # reserved for Watterson taps
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--ref-rms", type=float, default=REF_RMS)
+    ap.add_argument("--tap", default=None,
+                    help="also write the impaired (on-air) PCM to this file, for the "
+                         "live waterfall. Raw S16LE, same rate as the stream.")
     args = ap.parse_args()
 
     rng = np.random.default_rng(args.seed)
@@ -45,16 +48,29 @@ def main():
 
     rin = sys.stdin.buffer
     wout = sys.stdout.buffer
+    # Optional tap: capture exactly what the *receiver* hears (signal + the same
+    # noise we add to the link), so the waterfall is the honest on-air spectrum at
+    # the chosen SNR — not a separate, prettier rendering. Append-mode so a caller
+    # can truncate it once at session start and we never clobber a fresh path.
+    tap = open(args.tap, "wb") if args.tap else None
     nbytes = BLOCK * 2
-    while True:
-        chunk = rin.read(nbytes)
-        if not chunk:
-            break
-        sig = np.frombuffer(chunk, dtype="<i2").astype(np.float32)
-        noise = rng.normal(0.0, noise_std, size=sig.shape).astype(np.float32)
-        out = np.clip(sig + noise, -32768, 32767).astype("<i2")
-        wout.write(out.tobytes())
-        wout.flush()
+    try:
+        while True:
+            chunk = rin.read(nbytes)
+            if not chunk:
+                break
+            sig = np.frombuffer(chunk, dtype="<i2").astype(np.float32)
+            noise = rng.normal(0.0, noise_std, size=sig.shape).astype(np.float32)
+            out = np.clip(sig + noise, -32768, 32767).astype("<i2")
+            buf = out.tobytes()
+            wout.write(buf)
+            wout.flush()
+            if tap is not None:
+                tap.write(buf)
+                tap.flush()
+    finally:
+        if tap is not None:
+            tap.close()
 
 
 if __name__ == "__main__":

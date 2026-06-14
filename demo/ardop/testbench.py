@@ -17,9 +17,16 @@ Prereq: snd-aloop loaded as two cards (the runner does this):
 
 ardopcf is external/reference (clean-sheet, ADR 0014). Virtual audio only; the
 stations have NO PTT device, so nothing can key a real radio — no RF.
+
+Two entry points share the same orchestration:
+  * `run_session(params, emit, should_abort)` — drives ONE connected session and
+    calls `emit(event)` at each milestone (handshake, negotiated BW, ARQ progress,
+    rate adaptation, delivery). Used by the demo backend to stream a live timeline.
+  * `main()` — a thin CLI wrapper whose `emit` pretty-prints the same events.
 """
 import argparse
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -30,12 +37,13 @@ ARDOPCF = os.environ.get("ARDOPCF", os.path.expanduser("~/Code/ardopcf-spike/bui
 HERE = os.path.dirname(os.path.abspath(__file__))
 FILTER = os.path.join(HERE, "channel_filter.py")
 PAYLOAD = os.path.join(HERE, "../site/assets/payload.bin")
-RATE = "12000"
+RATE = 12000  # Hz, the loopback + on-air sample rate
 
 # ardopcf data frame types (the modes it adapts among during a transfer), vs the
 # robust connect frames (ConReq/ConAck) which we don't count as data adaptation.
-import re as _re
-_DATA_FRAME = _re.compile(r"Sending Frame Type ((?:4FSK|4PSK|8PSK|16QAM)\.\S+)")
+_DATA_FRAME = re.compile(r"Sending Frame Type ((?:4FSK|4PSK|8PSK|16QAM)\.\S+)")
+# A cemented connection reports the negotiated bandwidth: "CONNECTED <call> <bw>".
+_CONNECTED = re.compile(r"CONNECTED\s+(\S+)\s+(\d+)")
 
 
 def data_modes_from_log(path):
@@ -52,15 +60,23 @@ def data_modes_from_log(path):
     return out
 
 
-def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+def parse_connected(line):
+    """(remote_call, bandwidth_hz) from a 'CONNECTED <call> <bw>' line, or (None, None)."""
+    m = _CONNECTED.search(line.upper())
+    if not m:
+        return None, None
+    return m.group(1), int(m.group(2))
 
 
 class Host:
-    """ardopcf host command socket with a background line reader (keeps history)."""
+    """ardopcf host command socket with a background line reader (keeps history).
 
-    def __init__(self, name, port):
+    Each received protocol line is forwarded to the optional `on_line(name, line)`
+    callback so a caller can stream the live handshake without polling history."""
+
+    def __init__(self, name, port, on_line=None):
         self.name = name
+        self.on_line = on_line
         self.sock = socket.create_connection(("127.0.0.1", port), timeout=10)
         self.sock.settimeout(0.3)
         self.lines = []
@@ -87,10 +103,13 @@ class Host:
                 if s:
                     with self.lock:
                         self.lines.append(s)
-                    log(f"  {self.name} >> {s}")
+                    if self.on_line:
+                        try:
+                            self.on_line(self.name, s)
+                        except Exception:
+                            pass
 
     def send(self, cmd):
-        log(f"  {self.name} << {cmd}")
         self.sock.sendall((cmd + "\r").encode())
 
     def wait_for(self, substrs, timeout):
@@ -183,11 +202,13 @@ def launch_ardopcf(card, port, logpath):
 CONDITIONS = {"none", "good", "moderate", "poor", "flutter"}
 
 
-def launch_bridge(src_card, dst_card, snr, condition, seed):
+def launch_bridge(src_card, dst_card, snr, condition, seed, tap=None):
     """arecord src dev1 | channel_filter | aplay dst dev1, one direction.
 
-    Built as chained Popens (NO shell) so the SNR/condition values — which will
-    later come from the UI via the backend — can't be shell-injected."""
+    Built as chained Popens (NO shell) so the SNR/condition values — which come
+    from the UI via the backend — can't be shell-injected. `tap`, when set, asks
+    channel_filter to also write the impaired on-air PCM to that file (used for the
+    data direction only, to feed the live waterfall)."""
     if condition not in CONDITIONS:
         raise ValueError(f"bad condition {condition!r}")
     snr = float(snr)
@@ -199,14 +220,17 @@ def launch_bridge(src_card, dst_card, snr, condition, seed):
     # still within ARDOP's half-duplex timing.
     lowlat = ["--buffer-time=100000", "--period-time=20000"]
     rec = subprocess.Popen(
-        ["arecord", "-t", "raw", "-f", "S16_LE", "-r", RATE, "-c1", *lowlat,
+        ["arecord", "-t", "raw", "-f", "S16_LE", "-r", str(RATE), "-c1", *lowlat,
          "-D", f"plughw:CARD={src_card},DEV=1"], stdout=subprocess.PIPE, stderr=dn)
+    flt_cmd = ["python3", "-u", FILTER, "--snr", str(snr),
+               "--condition", condition, "--seed", str(seed)]
+    if tap:
+        flt_cmd += ["--tap", tap]
     flt = subprocess.Popen(
-        ["python3", "-u", FILTER, "--snr", str(snr), "--condition", condition, "--seed", str(seed)],
-        stdin=rec.stdout, stdout=subprocess.PIPE, stderr=dn)
+        flt_cmd, stdin=rec.stdout, stdout=subprocess.PIPE, stderr=dn)
     rec.stdout.close()  # let arecord see SIGPIPE if the filter dies
     ply = subprocess.Popen(
-        ["aplay", "-t", "raw", "-f", "S16_LE", "-r", RATE, "-c1", *lowlat,
+        ["aplay", "-t", "raw", "-f", "S16_LE", "-r", str(RATE), "-c1", *lowlat,
          "-D", f"plughw:CARD={dst_card},DEV=1"], stdin=flt.stdout, stderr=dn)
     flt.stdout.close()
     return [rec, flt, ply]
@@ -223,92 +247,154 @@ def wait_port(port, timeout=15):
     return False
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--snr", type=float, default=20)
-    ap.add_argument("--condition", default="none")
-    ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--arqbw", default="2000MAX")
-    ap.add_argument("--call-a", default="N0AAA")
-    ap.add_argument("--call-b", default="N0BBB")
-    ap.add_argument("--timeout", type=float, default=60)
-    ap.add_argument("--payload", default=PAYLOAD, help="file to transfer over the link")
-    ap.add_argument("--data-timeout", type=float, default=90)
-    args = ap.parse_args()
-
-    # Turn SIGTERM (e.g. `timeout`, or the backend killing us) into SystemExit so
-    # the finally-block teardown runs — otherwise arecord/aplay leak and hold the
-    # loopback devices, breaking the next run.
-    signal.signal(signal.SIGTERM, lambda *a: (_ for _ in ()).throw(SystemExit(143)))
-
-    procs, files = [], []
-    hosts = []
-    dataconns = []
+def aloop_ready():
+    """True iff the two snd-aloop cards (aldA/aldB) the bridge needs are present."""
     try:
-        log(f"launching ardopcf A (aldA:8515) and B (aldB:8525), SNR={args.snr} dB")
+        out = subprocess.run(["aplay", "-l"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "aldA" in out and "aldB" in out
+
+
+class SessionParams:
+    """Tunables for one connected session (defaults match the proven CLI run)."""
+
+    def __init__(self, snr=20.0, condition="none", seed=1, arqbw="2000MAX",
+                 call_a="N0AAA", call_b="N0BBB", timeout=60.0, payload=PAYLOAD,
+                 data_timeout=90.0, tap=None):
+        self.snr = float(snr)
+        self.condition = condition
+        self.seed = int(seed)
+        self.arqbw = arqbw
+        self.call_a = call_a
+        self.call_b = call_b
+        self.timeout = float(timeout)
+        self.payload = payload
+        self.data_timeout = float(data_timeout)
+        self.tap = tap  # file path for the data-direction on-air PCM, or None
+
+
+# Allowlist of ARQBW values ardopcf accepts (operator-facing bandwidth ceiling).
+ARQBW_VALUES = {"200MAX", "500MAX", "1000MAX", "2000MAX",
+                "200FORCED", "500FORCED", "1000FORCED", "2000FORCED"}
+
+
+def run_session(params, emit, should_abort=None):
+    """Drive ONE real ARDOP connected session, streaming milestones to `emit`.
+
+    `emit(event)` receives dicts with a "t" (type) key — see the module docstring
+    and the demo backend for the vocabulary. `should_abort()` (optional) is polled
+    in the long waits; return True to tear the session down early (e.g. the web
+    client disconnected). Returns a process exit code (0 pass / 2 no-connect /
+    3 partial / 4 environment / 143 aborted)."""
+    if params.condition not in CONDITIONS:
+        raise ValueError(f"bad condition {params.condition!r}")
+    if params.arqbw not in ARQBW_VALUES:
+        raise ValueError(f"bad arqbw {params.arqbw!r}")
+    abort = should_abort or (lambda: False)
+
+    if not aloop_ready():
+        emit({"t": "error", "msg": "snd-aloop cards (aldA/aldB) not loaded — run the "
+              "modprobe from the handoff before starting a session."})
+        emit({"t": "done"})
+        return 4
+
+    procs, files, hosts, dataconns = [], [], [], []
+    # Truncate the tap up front so a fresh session's waterfall never shows stale air.
+    if params.tap:
+        open(params.tap, "wb").close()
+    started = time.time()
+    try:
+        emit({"t": "phase", "phase": "init",
+              "msg": f"launching two ardopcf stations · SNR {params.snr:g} dB · {params.condition}"})
         pa, fa = launch_ardopcf("aldA", 8515, "/tmp/tb_ardopA.log"); procs.append(pa); files.append(fa)
         pb, fb = launch_ardopcf("aldB", 8525, "/tmp/tb_ardopB.log"); procs.append(pb); files.append(fb)
         if not (wait_port(8515) and wait_port(8525)):
-            log("FAIL: ardopcf host ports never opened"); return 1
+            emit({"t": "error", "msg": "ardopcf host ports never opened"})
+            return 4
 
-        log("starting channel bridges (both directions)")
-        procs += launch_bridge("aldA", "aldB", args.snr, args.condition, args.seed)
-        procs += launch_bridge("aldB", "aldA", args.snr, args.condition, args.seed + 1)
+        emit({"t": "phase", "phase": "bridge", "msg": "channel bridges up (both directions)"})
+        # Tap the data direction (A->B) for the waterfall; B->A is ACKs only.
+        procs += launch_bridge("aldA", "aldB", params.snr, params.condition, params.seed, tap=params.tap)
+        procs += launch_bridge("aldB", "aldA", params.snr, params.condition, params.seed + 1)
         time.sleep(1.0)
 
-        A = Host("A", 8515); B = Host("B", 8525); hosts = [A, B]
+        on_line = lambda name, line: emit({"t": "host", "station": name, "line": line})
+        A = Host("A", 8515, on_line=on_line); B = Host("B", 8525, on_line=on_line)
+        hosts = [A, B]
+        emit({"t": "station", "station": "A", "call": params.call_a, "role": "caller"})
+        emit({"t": "station", "station": "B", "call": params.call_b, "role": "answerer"})
 
-        for H, call in ((A, args.call_a), (B, args.call_b)):
+        for H, call in ((A, params.call_a), (B, params.call_b)):
             H.send("INITIALIZE")
             H.send(f"MYCALL {call}")
             H.send("PROTOCOLMODE ARQ")
-            H.send(f"ARQBW {args.arqbw}")
+            H.send(f"ARQBW {params.arqbw}")
             H.send("ARQTIMEOUT 90")
             H.send("CWID FALSE")
         time.sleep(0.5)
 
-        log("B: LISTEN TRUE (answerer)")
+        emit({"t": "phase", "phase": "listen", "msg": f"{params.call_b} listening (answerer)"})
         B.send("LISTEN TRUE")
         time.sleep(0.5)
-        log(f"A: ARQCALL {args.call_b} (caller dials the remote station)")
-        A.send(f"ARQCALL {args.call_b} 5")
+        emit({"t": "phase", "phase": "call",
+              "msg": f"{params.call_a} dials {params.call_b} — ARQ CONNECT request"})
+        A.send(f"ARQCALL {params.call_b} 5")
 
         # Success = a CEMENTED connection: ardopcf emits "CONNECTED <call> <bw>"
-        # only after the full ConReq→ConAck→ack handshake + bandwidth negotiation.
-        ca = A.wait_for("CONNECTED", args.timeout)
+        # only after the full ConReq->ConAck->ack handshake + bandwidth negotiation.
+        ca = A.wait_for("CONNECTED", params.timeout)
         cb = B.wait_for("CONNECTED", 5)
-        if ca:
-            log(f"*** CONNECTED (handshake + bandwidth negotiated) ***  A: {ca!r}  B: {cb!r}")
-            # ── Data transfer over the live ARQ link ──────────────────────────
-            with open(args.payload, "rb") as f:
-                payload = f.read()
-            dA = DataConn("A", 8516); dB = DataConn("B", 8526)
-            dataconns += [dA, dB]
-            log(f"DATA: A loads {len(payload)} bytes ({os.path.basename(args.payload)}) into the ARQ buffer")
-            dA.send_data(payload)
-            end = time.time() + args.data_timeout
-            while time.time() < end:
-                if len(dB.received()) >= len(payload):
-                    break
-                time.sleep(0.3)
-            got = dB.received()
-            delivered = got[:len(payload)] == payload
-            log(f"DATA: B received {len(got)}/{len(payload)} bytes  delivered_intact={delivered}")
+        if abort():
+            emit({"t": "error", "msg": "aborted"}); return 143
+        if not ca:
+            emit({"t": "result", "outcome": "fail", "bandwidth": None, "modes": [],
+                  "received": 0, "total": 0, "duration_s": time.time() - started,
+                  "image_hex": "", "tap_path": params.tap, "tap_rate": RATE,
+                  "msg": "no CONNECT within timeout — link can't close at this SNR"})
+            return 2
 
-            A.send("DISCONNECT")
-            A.wait_for(["DISCONNECTED", "NEWSTATE DISC"], 15)
+        _, bw = parse_connected(ca)
+        emit({"t": "connected", "call_a": params.call_a, "call_b": params.call_b,
+              "bandwidth": bw, "raw_a": ca, "raw_b": cb})
+
+        # ── Data transfer over the live ARQ link ──────────────────────────────
+        with open(params.payload, "rb") as f:
+            payload = f.read()
+        total = len(payload)
+        dA = DataConn("A", 8516); dB = DataConn("B", 8526); dataconns += [dA, dB]
+        emit({"t": "data_start", "bytes": total, "name": os.path.basename(params.payload)})
+        dA.send_data(payload)
+
+        seen_modes, last_recv = [], -1
+        end = time.time() + params.data_timeout
+        while time.time() < end:
+            if abort():
+                emit({"t": "error", "msg": "aborted"}); return 143
+            got = len(dB.received())
+            if got != last_recv:
+                emit({"t": "progress", "received": got, "total": total})
+                last_recv = got
             modes = data_modes_from_log("/tmp/tb_ardopA.log")
-            log(f"DATA: rate adaptation — A used data modes: {modes or '(none logged)'}")
-            if delivered:
-                log("RESULT: PASS — real ARDOP connect + ARQ data transfer through the channel sim")
-                rc = 0
-            else:
-                log("RESULT: PARTIAL — connected but payload not fully delivered in time")
-                rc = 3
-        else:
-            log("RESULT: FAIL — no CONNECT within timeout (see /tmp/tb_*.log)")
-            rc = 2
-        return rc
+            if modes != seen_modes:
+                seen_modes = modes
+                emit({"t": "mode", "modes": modes, "current": modes[-1] if modes else None})
+            if got >= total:
+                break
+            time.sleep(0.3)
+
+        got = dB.received()
+        intact = got[:total] == payload
+        emit({"t": "delivered", "received": len(got), "total": total, "intact": intact})
+
+        A.send("DISCONNECT")
+        A.wait_for(["DISCONNECTED", "NEWSTATE DISC"], 15)
+        modes = data_modes_from_log("/tmp/tb_ardopA.log")
+        outcome = "pass" if intact else "partial"
+        emit({"t": "result", "outcome": outcome, "bandwidth": bw, "modes": modes,
+              "received": len(got), "total": total, "duration_s": time.time() - started,
+              "image_hex": got.hex(), "tap_path": params.tap, "tap_rate": RATE})
+        return 0 if intact else 3
     finally:
         for D in dataconns:
             D.close()
@@ -330,6 +416,60 @@ def main():
                 f.close()
             except OSError:
                 pass
+        emit({"t": "done"})
+
+
+def _cli_emit(ev):
+    """Pretty-print one session event to stdout (the CLI's view of the stream)."""
+    t = ev.get("t")
+    ts = time.strftime("%H:%M:%S")
+    if t == "host":
+        print(f"[{ts}]   {ev['station']} >> {ev['line']}", flush=True)
+    elif t == "phase":
+        print(f"[{ts}] {ev['msg']}", flush=True)
+    elif t == "station":
+        print(f"[{ts}] station {ev['station']} = {ev['call']} ({ev['role']})", flush=True)
+    elif t == "connected":
+        print(f"[{ts}] *** CONNECTED — negotiated BW {ev['bandwidth']} Hz ***  "
+              f"A:{ev['raw_a']!r} B:{ev['raw_b']!r}", flush=True)
+    elif t == "data_start":
+        print(f"[{ts}] DATA: loading {ev['bytes']} B ({ev['name']}) into the ARQ buffer", flush=True)
+    elif t == "progress":
+        print(f"[{ts}] DATA: {ev['received']}/{ev['total']} B delivered", flush=True)
+    elif t == "mode":
+        print(f"[{ts}] RATE: data modes used → {ev['modes'] or '(none yet)'}", flush=True)
+    elif t == "delivered":
+        print(f"[{ts}] DATA: {ev['received']}/{ev['total']} B  intact={ev['intact']}", flush=True)
+    elif t == "result":
+        print(f"[{ts}] RESULT: {ev['outcome'].upper()} — {ev.get('msg', '')}".rstrip(" —"), flush=True)
+    elif t == "error":
+        print(f"[{ts}] ERROR: {ev['msg']}", flush=True)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--snr", type=float, default=20)
+    ap.add_argument("--condition", default="none")
+    ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--arqbw", default="2000MAX")
+    ap.add_argument("--call-a", default="N0AAA")
+    ap.add_argument("--call-b", default="N0BBB")
+    ap.add_argument("--timeout", type=float, default=60)
+    ap.add_argument("--payload", default=PAYLOAD, help="file to transfer over the link")
+    ap.add_argument("--data-timeout", type=float, default=90)
+    ap.add_argument("--tap", default=None, help="capture data-direction on-air PCM here")
+    args = ap.parse_args()
+
+    # Turn SIGTERM (e.g. `timeout`, or the backend killing us) into SystemExit so
+    # the finally-block teardown runs — otherwise arecord/aplay leak and hold the
+    # loopback devices, breaking the next run.
+    signal.signal(signal.SIGTERM, lambda *a: (_ for _ in ()).throw(SystemExit(143)))
+
+    params = SessionParams(
+        snr=args.snr, condition=args.condition, seed=args.seed, arqbw=args.arqbw,
+        call_a=args.call_a, call_b=args.call_b, timeout=args.timeout,
+        payload=args.payload, data_timeout=args.data_timeout, tap=args.tap)
+    return run_session(params, _cli_emit)
 
 
 if __name__ == "__main__":
