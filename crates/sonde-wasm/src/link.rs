@@ -55,7 +55,7 @@ fn build_symbols(
         // Subtract the header bytes so payload ranges stay contiguous and
         // non-overlapping (the frontend paints byte_start..byte_end).
         let header_bytes_here = if stream_byte < 2 { 2 } else { 0 };
-        let byte_end = payload_byte + (cap - header_bytes_here);
+        let byte_end = (payload_byte + (cap - header_bytes_here)).min(payload.len());
         out.push(SymbolRec {
             idx: i,
             sample_start,
@@ -107,6 +107,14 @@ fn mean_band_snr(
 
 /// Run the payload over the link. Only `floor-wblo` is implemented; other
 /// modes return `PhyError::ModeUnavailable`.
+///
+/// CHANNEL CONDITIONS & RECOVERY: the floor-wblo receiver does not equalize
+/// multipath. Only the AWGN-only `"none"` condition recovers the payload
+/// cleanly; the Watterson conditions (`good`/`moderate`/`poor`/`flutter`) apply
+/// complex multipath fading the bare receiver cannot undo, so they will
+/// generally return `recovered_ok: false` (with a well-formed LinkResult and a
+/// real spectrogram). That degradation is itself part of the demo — it shows
+/// why equalization / mode adaptation matters.
 pub fn run_link_core(
     payload: &[u8],
     offsets: &FieldOffsets,
@@ -243,5 +251,32 @@ mod tests {
         for w in r.symbols.windows(2) {
             assert_eq!(w[0].byte_end, w[1].byte_start, "ranges must be contiguous");
         }
+        assert_eq!(
+            r.symbols.last().unwrap().byte_end,
+            payload.len(),
+            "last byte_end clamps to payload len"
+        );
+    }
+
+    #[test]
+    fn multipath_condition_is_well_formed_and_does_not_panic() {
+        let payload: Vec<u8> = (0..120).map(|i| (i % 251) as u8).collect();
+        let off = offsets_for(payload.len());
+        // Watterson multipath at 0 dB SNR: the bare floor receiver has no
+        // equalizer, so we expect a well-formed result, NOT clean recovery.
+        // Observed (poor/0.0/3): recovered_ok=false, ber=1.0.
+        let r = run_link_core(&payload, &off, "floor-wblo", 0.0, "poor", 3).unwrap();
+        // Well-formed regardless of decode success:
+        assert!(r.ber >= 0.0 && r.ber <= 1.0, "ber in [0,1], got {}", r.ber);
+        assert!(!r.symbols.is_empty());
+        assert_eq!(
+            r.spectrogram.mag_q.len(),
+            r.spectrogram.rows * r.spectrogram.cols
+        );
+        // Document the limitation: multipath does not recover with floor-wblo.
+        assert!(
+            !r.recovered_ok,
+            "multipath should not recover with the non-equalizing floor receiver"
+        );
     }
 }

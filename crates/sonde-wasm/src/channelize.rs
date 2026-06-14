@@ -29,6 +29,10 @@ pub fn apply_channel(
     let clean: Vec<Complex<f32>> = samples.iter().map(|&s| Complex::new(s, 0.0)).collect();
 
     // "none" skips the Watterson multipath entirely (AWGN-only channel).
+    // This is the only condition the non-equalizing floor-wblo receiver can
+    // decode correctly, which is why decode-correctness tests use "none".
+    // The Watterson conditions ("good"/"moderate"/"poor"/"flutter") apply
+    // complex multipath fading that the bare receiver cannot undo.
     let mut observed = if condition == "none" {
         clean.clone()
     } else {

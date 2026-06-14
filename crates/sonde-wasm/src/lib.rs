@@ -27,6 +27,10 @@ pub fn recommend_mode(snr_db: f32) -> String {
 /// Run the payload over the link. `offsets_json` is the builder's
 /// `payload.offsets.json`. Returns a JSON `LinkResult`, or a JSON
 /// `{"error": "..."}` object on failure. `seed` is u32 to avoid JS BigInt.
+///
+/// `condition` is one of "none" (AWGN-only, the only condition that recovers
+/// cleanly today), "good"/"moderate"/"poor"/"flutter" (Watterson multipath —
+/// expect `recovered_ok:false` until the receiver gains equalization).
 #[wasm_bindgen]
 pub fn run_link(
     payload: &[u8],
