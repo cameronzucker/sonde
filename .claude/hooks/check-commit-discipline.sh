@@ -58,7 +58,21 @@ if ! printf '%s' "$cmd" | grep -qE 'Agent:[[:space:]]+[a-z0-9_-]+'; then
 fi
 
 # Check 3: branch protection — main is blocked unless ALLOW_INTEGRATION_COMMIT=1
-branch=$(cd "$REPO" 2>/dev/null && git rev-parse --abbrev-ref HEAD 2>/dev/null) || branch=""
+#
+# Resolve the branch from the commit's WORKING DIRECTORY (the payload .cwd,
+# constrained under $REPO), NOT from $REPO. The main checkout sits on `main`
+# (ADR 0002 main-as-integration), so resolving from $REPO falsely classified
+# EVERY worktree commit as a `main` commit and denied it. Mirrors the
+# resolution block-main-checkout-race.sh already uses (its lines ~62-74).
+payload_cwd=$(printf '%s' "$input" | jq -r '.cwd // ""')
+cwd_for_git="$REPO"
+if [[ -n "$payload_cwd" && -d "$payload_cwd" ]]; then
+    resolved_cwd=$(cd "$payload_cwd" 2>/dev/null && pwd)
+    if [[ "$resolved_cwd" == "$REPO" || "$resolved_cwd" == "$REPO"/* ]]; then
+        cwd_for_git="$resolved_cwd"
+    fi
+fi
+branch=$(git -C "$cwd_for_git" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 
 case "$branch" in
     main)
