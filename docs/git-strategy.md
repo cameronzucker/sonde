@@ -5,7 +5,7 @@ decisions, alternatives, and watched failure modes — lives in
 [ADR 0002](adr/0002-git-workflow-and-governance.md). Where this doc and the ADR
 appear to disagree, the ADR is the source of truth and this doc gets a corrective
 commit. Sonde derives this playbook from its sibling
-Tuxlink (private sibling repo)'s `CLAUDE.md` git sections,
+Tuxlink (private)'s `CLAUDE.md` git sections,
 adapted for Sonde's `main`-as-integration model.
 
 ## The model in one breath
