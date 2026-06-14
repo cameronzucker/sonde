@@ -19,10 +19,13 @@
 //! via `END_OF_OVER`. The connection initiator owns the first floor. On
 //! receiving the end of a peer's over, a station takes the floor **only if it
 //! has unacked data or owes an ack for DATA just received** (the quiescence
-//! rule); otherwise the exchange settles. A turn-recovery timer re-takes the
-//! floor if the peer's over is lost; sustained silence past
-//! `DEAD_OVERS_TOLERATED` is reported as `PeerLost` (honest failure, never a
-//! hang or silent corruption).
+//! rule); otherwise the floor goes **`Idle`** (free) and *either* station may
+//! later acquire it when it next has something to send — the model is symmetric,
+//! so neither station hogs an idle floor and an acceptor can originate data.
+//! A turn-recovery timer re-takes the floor if a *data*-sender's reply is lost;
+//! sustained silence past `DEAD_OVERS_TOLERATED` is reported as `PeerLost`
+//! (honest failure, never a hang or silent corruption). Closing the connection
+//! resets all ARQ/reassembly state so a same-object reconnect starts clean.
 
 use std::collections::{HashSet, VecDeque};
 use std::time::Duration;
@@ -57,8 +60,11 @@ pub enum ConnState {
 enum Floor {
     /// This station holds the floor (may key up).
     Sending,
-    /// The peer holds the floor (this station listens).
+    /// The peer holds the floor (this station listens for its over).
     Listening,
+    /// Nobody holds the floor — the link is quiescent. Either station may
+    /// acquire it by transmitting when it has something to say.
+    Idle,
 }
 
 /// Events surfaced to the host (subsystem #8 will map these to its API).
@@ -81,7 +87,6 @@ pub struct Connection {
     local: Callsign,
     remote: Callsign,
     profile: ModeProfile,
-    initiator: bool,
     conn_id: u16,
 
     state: ConnState,
@@ -115,12 +120,12 @@ impl Connection {
         profile: ModeProfile,
         window: u32,
     ) -> Self {
-        Self::new(local, remote, conn_id, profile, window, true)
+        Self::new(local, remote, conn_id, profile, window)
     }
 
     /// Construct a connection acceptor (adopts the peer's CONN_ID).
     pub fn acceptor(local: Callsign, remote: Callsign, profile: ModeProfile, window: u32) -> Self {
-        Self::new(local, remote, 0, profile, window, false)
+        Self::new(local, remote, 0, profile, window)
     }
 
     fn new(
@@ -129,13 +134,11 @@ impl Connection {
         conn_id: u16,
         profile: ModeProfile,
         window: u32,
-        initiator: bool,
     ) -> Self {
         Self {
             local,
             remote,
             profile,
-            initiator,
             conn_id,
             state: ConnState::Closed,
             floor: Floor::Listening,
@@ -226,9 +229,9 @@ impl Connection {
             FrameType::ConnAck => self.on_conn_ack(&frame),
             FrameType::Disc => self.on_disc(&frame),
             FrameType::DiscAck => self.on_disc_ack(),
-            FrameType::Data if self.session_ok(&frame) => self.on_data(frame, now),
-            FrameType::Ack if self.session_ok(&frame) => self.on_ack(&frame, now),
-            FrameType::Keepalive if self.session_ok(&frame) => self.silent_overs = 0,
+            FrameType::Data if self.session_ok(&frame) => self.on_data(frame),
+            FrameType::Ack if self.session_ok(&frame) => self.on_ack(&frame),
+            FrameType::Keepalive if self.session_ok(&frame) => self.on_keepalive(&frame),
             _ => {}
         }
     }
@@ -240,9 +243,7 @@ impl Connection {
             ConnState::Connecting if due => {
                 self.conn_retries += 1;
                 if self.conn_retries > MAX_CONN_RETRIES {
-                    self.state = ConnState::Closed;
-                    self.deadline = None;
-                    self.events.push_back(HostEvent::ConnectFailed);
+                    self.close(Some(HostEvent::ConnectFailed));
                 } else {
                     let conn = self.make_control(FrameType::Conn, FIRST_SEQ);
                     self.outbox.push_back(conn);
@@ -252,42 +253,30 @@ impl Connection {
             ConnState::Disconnecting if due => {
                 self.disc_retries += 1;
                 if self.disc_retries > MAX_DISC_RETRIES {
-                    self.state = ConnState::Closed;
-                    self.deadline = None;
-                    self.events.push_back(HostEvent::Disconnected);
+                    self.close(Some(HostEvent::Disconnected));
                 } else {
                     let disc = self.make_control(FrameType::Disc, 0);
                     self.outbox.push_back(disc);
                     self.deadline = Some(now + self.profile.turn_recovery_timeout());
                 }
             }
-            ConnState::Connected => match self.floor {
-                Floor::Listening if due => {
+            ConnState::Connected if due => match self.floor {
+                Floor::Listening if self.awaiting_reply => {
+                    // We sent data and expected a reply that did not arrive.
                     self.silent_overs += 1;
                     if self.silent_overs > DEAD_OVERS_TOLERATED {
-                        self.state = ConnState::Closed;
-                        self.deadline = None;
-                        self.events.push_back(HostEvent::PeerLost);
+                        self.close(Some(HostEvent::PeerLost));
                     } else {
-                        // Re-take the floor to retransmit unacked data (or probe).
+                        // Re-take the floor to retransmit the unacked window.
                         self.floor = Floor::Sending;
-                        if !self.send.has_unacked() {
-                            self.owe_ack = true; // force a probe over
-                        }
                         self.deadline = None;
                     }
                 }
-                // Idle floor holder: keepalive to hold the link up.
-                Floor::Sending
-                    if self.outbox.is_empty() && !self.send.has_unacked() && !self.owe_ack =>
-                {
-                    if due {
-                        let ka = self.make_control(FrameType::Keepalive, 0);
-                        self.outbox.push_back(ka);
-                        self.deadline = Some(now + self.profile.keepalive_interval());
-                    } else if self.deadline.is_none() {
-                        self.deadline = Some(now + self.profile.keepalive_interval());
-                    }
+                Floor::Listening => {
+                    // We passed the floor with nothing pending and the peer
+                    // declined (or said nothing) — the link is quiescent.
+                    self.floor = Floor::Idle;
+                    self.deadline = None;
                 }
                 _ => {}
             },
@@ -297,25 +286,32 @@ impl Connection {
 
     /// Next frame to transmit, if any (drains the current over frame by frame).
     pub fn poll_transmit(&mut self, now: Duration) -> Option<LinkFrame> {
-        if self.outbox.is_empty()
-            && self.state == ConnState::Connected
-            && self.floor == Floor::Sending
-            && (self.send.has_unacked() || self.owe_ack)
-        {
-            self.build_over();
+        if self.state == ConnState::Connected && self.outbox.is_empty() {
+            // Acquire the free floor if we have something to say.
+            if self.floor == Floor::Idle && self.want_floor() {
+                self.floor = Floor::Sending;
+            }
+            // While we hold the floor, build this over (data, ack, or — with
+            // nothing pending — a keepalive that passes the floor back).
+            if self.floor == Floor::Sending {
+                self.build_over();
+            }
         }
         let f = self.outbox.pop_front();
         if let Some(ref frame) = f {
             if self.state == ConnState::Connected && frame.is_end_of_over() {
-                // Our over is done — pass the floor.
-                self.floor = Floor::Listening;
+                // Our over is done. If we sent data we await an ack (Listening +
+                // turn-recovery); if we just relinquished (ack/keepalive, nothing
+                // pending) the floor is free (Idle) so either side can acquire it.
                 self.awaiting_reply = self.send.has_unacked();
-                let wait = if self.awaiting_reply {
-                    self.profile.turn_recovery_timeout() + self.backoff_jitter()
+                if self.awaiting_reply {
+                    self.floor = Floor::Listening;
+                    self.deadline =
+                        Some(now + self.profile.turn_recovery_timeout() + self.backoff_jitter());
                 } else {
-                    self.death_watch()
-                };
-                self.deadline = Some(now + wait);
+                    self.floor = Floor::Idle;
+                    self.deadline = None;
+                }
             }
         }
         f
@@ -333,10 +329,36 @@ impl Connection {
 
     // ---- internals ------------------------------------------------------
 
-    /// Idle-listener death watch: silence longer than this past several
-    /// keepalive intervals trips re-take/`PeerLost`.
-    fn death_watch(&self) -> Duration {
-        self.profile.keepalive_interval() * DEAD_OVERS_TOLERATED
+    /// Whether we have a reason to hold the floor: unacked data to (re)send, or
+    /// an ack we owe for DATA just received.
+    fn want_floor(&self) -> bool {
+        self.send.has_unacked() || self.owe_ack
+    }
+
+    /// Transition to `Closed`, clearing all per-session ARQ/reassembly state so a
+    /// same-object reconnect starts clean (Codex blocker #1). Optionally surface
+    /// a host event. Does not touch the outbox (a queued DISC_ACK still flushes).
+    fn close(&mut self, event: Option<HostEvent>) {
+        self.state = ConnState::Closed;
+        self.reset_session();
+        if let Some(e) = event {
+            self.events.push_back(e);
+        }
+    }
+
+    /// Reset per-session state to a fresh start (keeps callsigns/profile/conn_id).
+    fn reset_session(&mut self) {
+        self.send.reset();
+        self.recv.reset();
+        self.reasm.reset();
+        self.msg_end_seqs.clear();
+        self.floor = Floor::Listening;
+        self.awaiting_reply = false;
+        self.owe_ack = false;
+        self.silent_overs = 0;
+        self.conn_retries = 0;
+        self.disc_retries = 0;
+        self.deadline = None;
     }
 
     /// Deterministic, bounded jitter added to the turn-recovery deadline so two
@@ -419,7 +441,14 @@ impl Connection {
             .map(|(seq, p)| self.make_data(seq, p))
             .collect();
         if built.is_empty() {
-            built.push(self.make_ack());
+            // Nothing to send: an ACK if we owe one for received DATA, else a
+            // bare KEEPALIVE — either way the over ends and the floor passes, so
+            // an idle holder relinquishes instead of starving the peer.
+            if self.owe_ack {
+                built.push(self.make_ack());
+            } else {
+                built.push(self.make_control(FrameType::Keepalive, 0));
+            }
         }
         let last = built.pop().expect("over has >= 1 frame").end_of_over();
         built.push(last);
@@ -430,10 +459,12 @@ impl Connection {
     fn accept_connection_as_acceptor(&mut self, conn_id: u16, seq: u32, now: Duration) {
         self.conn_id = conn_id;
         self.state = ConnState::Connected;
+        // The initiator owns the first floor; listen for it, but fall back to
+        // the free `Idle` floor if it never speaks (so we can originate).
         self.floor = Floor::Listening;
         self.awaiting_reply = false;
         self.silent_overs = 0;
-        self.deadline = Some(now + self.death_watch());
+        self.deadline = Some(now + self.profile.turn_recovery_timeout() + self.backoff_jitter());
         self.events.push_back(HostEvent::Connected);
         let ack = self.make_control(FrameType::ConnAck, seq);
         self.outbox.push_back(ack);
@@ -477,24 +508,17 @@ impl Connection {
         {
             let ack = self.make_control(FrameType::DiscAck, 0);
             self.outbox.push_back(ack);
-            let was_open = self.state != ConnState::Closed;
-            self.state = ConnState::Closed;
-            self.deadline = None;
-            if was_open {
-                self.events.push_back(HostEvent::Disconnected);
-            }
+            self.close(Some(HostEvent::Disconnected));
         }
     }
 
     fn on_disc_ack(&mut self) {
         if self.state == ConnState::Disconnecting {
-            self.state = ConnState::Closed;
-            self.deadline = None;
-            self.events.push_back(HostEvent::Disconnected);
+            self.close(Some(HostEvent::Disconnected));
         }
     }
 
-    fn on_data(&mut self, frame: LinkFrame, now: Duration) {
+    fn on_data(&mut self, frame: LinkFrame) {
         self.silent_overs = 0;
         self.send.on_ack(frame.ack_through, frame.sack); // piggybacked ack
         let end_of_over = frame.is_end_of_over();
@@ -507,36 +531,39 @@ impl Connection {
         }
         self.owe_ack = true;
         if end_of_over {
-            self.on_over_end(now);
+            self.on_over_end();
         }
     }
 
-    fn on_ack(&mut self, frame: &LinkFrame, now: Duration) {
+    fn on_ack(&mut self, frame: &LinkFrame) {
         self.silent_overs = 0;
         self.send.on_ack(frame.ack_through, frame.sack);
         if frame.is_end_of_over() {
-            self.on_over_end(now);
+            self.on_over_end();
+        }
+    }
+
+    fn on_keepalive(&mut self, frame: &LinkFrame) {
+        self.silent_overs = 0;
+        // A keepalive may carry the floor token (an idle holder relinquishing).
+        if frame.is_end_of_over() {
+            self.on_over_end();
         }
     }
 
     /// The peer ended its over (passed the floor). Take the floor only if we
-    /// have unacked data or owe an ack (the quiescence rule); otherwise settle —
-    /// the initiator holds the idle floor, the acceptor relaxes into a death
-    /// watch.
-    fn on_over_end(&mut self, now: Duration) {
-        if self.send.has_unacked() || self.owe_ack {
+    /// have unacked data or owe an ack (the quiescence rule); otherwise the link
+    /// goes `Idle` (free) — either station can then acquire it when it next has
+    /// something to say. This is symmetric: neither station hogs an idle floor.
+    fn on_over_end(&mut self) {
+        self.silent_overs = 0;
+        if self.want_floor() {
             self.floor = Floor::Sending;
-            self.deadline = None;
         } else {
+            self.floor = Floor::Idle;
             self.awaiting_reply = false;
-            if self.initiator {
-                self.floor = Floor::Sending; // hold the idle floor; keepalive
-                self.deadline = Some(now + self.profile.keepalive_interval());
-            } else {
-                self.floor = Floor::Listening;
-                self.deadline = Some(now + self.death_watch());
-            }
         }
+        self.deadline = None;
     }
 }
 
@@ -551,6 +578,16 @@ mod tests {
     fn profile() -> ModeProfile {
         // Small per-over MTU so multi-frame messages are easy to force.
         ModeProfile::new(Duration::from_millis(10), 4)
+    }
+
+    fn messages(events: &[HostEvent]) -> Vec<Vec<u8>> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                HostEvent::DataReceived(d) => Some(d.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     const TICK: Duration = Duration::from_millis(10);
@@ -616,13 +653,11 @@ mod tests {
         }
 
         fn b_messages(&self) -> Vec<Vec<u8>> {
-            self.b_events
-                .iter()
-                .filter_map(|e| match e {
-                    HostEvent::DataReceived(d) => Some(d.clone()),
-                    _ => None,
-                })
-                .collect()
+            messages(&self.b_events)
+        }
+
+        fn a_messages(&self) -> Vec<Vec<u8>> {
+            messages(&self.a_events)
         }
 
         fn run(&mut self, max_steps: usize) {
@@ -986,5 +1021,95 @@ mod tests {
             }
         }
         assert_eq!(got, vec![b"floor-msg!".to_vec()]);
+    }
+
+    // ---- bidirectional floor + session reset (Codex blockers #1, #2) -----
+
+    #[test]
+    fn acceptor_can_originate_data_to_the_initiator() {
+        // The acceptor, idle and listening, must be able to acquire the floor and
+        // send its own host data — not wait forever on an idle initiator.
+        let mut p = Pair::new();
+        p.a.connect(Duration::ZERO);
+        p.run(20); // settle to idle
+        p.b.send(b"from-acceptor".to_vec());
+        p.run(80);
+        assert_eq!(p.a_messages(), vec![b"from-acceptor".to_vec()]);
+    }
+
+    #[test]
+    fn both_directions_deliver_in_one_session() {
+        let mut p = Pair::new();
+        p.a.connect(Duration::ZERO);
+        p.run(20);
+        p.a.send(b"a->b".to_vec());
+        p.b.send(b"b->a".to_vec());
+        p.run(120);
+        assert_eq!(p.b_messages(), vec![b"a->b".to_vec()]);
+        assert_eq!(p.a_messages(), vec![b"b->a".to_vec()]);
+    }
+
+    #[test]
+    fn disconnect_resets_arq_and_reassembly_so_a_reconnect_is_clean() {
+        let mut b = acc();
+        b.handle_frame(
+            LinkFrame::control(
+                FrameType::Conn,
+                call("K1ABC"),
+                call("W2XYZ"),
+                0x1234,
+                FIRST_SEQ,
+            ),
+            Duration::ZERO,
+        );
+        while b.poll_event().is_some() {}
+        // A partial message: one fragment, NOT end-of-msg ⇒ reassembler holds it
+        // and the receive high-water advances.
+        b.handle_frame(
+            LinkFrame::data(call("K1ABC"), call("W2XYZ"), 0x1234, 1, b"STALE".to_vec()),
+            Duration::ZERO,
+        );
+        assert_eq!(b.recv.ack_through(), 1, "precondition: recv advanced");
+
+        // Peer disconnects.
+        b.handle_frame(
+            LinkFrame::control(FrameType::Disc, call("K1ABC"), call("W2XYZ"), 0x1234, 0),
+            Duration::ZERO,
+        );
+        assert_eq!(b.state(), ConnState::Closed);
+        assert_eq!(b.recv.ack_through(), 0, "recv buffer reset on close");
+
+        // Reconnect (new session id) and send a clean, complete single-fragment
+        // message. It must deliver exactly itself — the stale "STALE" fragment
+        // must NOT bleed into it.
+        while b.poll_event().is_some() {}
+        b.handle_frame(
+            LinkFrame::control(
+                FrameType::Conn,
+                call("K1ABC"),
+                call("W2XYZ"),
+                0xBEEF,
+                FIRST_SEQ,
+            ),
+            Duration::ZERO,
+        );
+        while b.poll_event().is_some() {}
+        b.handle_frame(
+            LinkFrame::data(call("K1ABC"), call("W2XYZ"), 0xBEEF, 1, b"CLEAN".to_vec())
+                .end_of_msg()
+                .end_of_over(),
+            Duration::ZERO,
+        );
+        let got: Vec<Vec<u8>> = std::iter::from_fn(|| b.poll_event())
+            .filter_map(|e| match e {
+                HostEvent::DataReceived(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![b"CLEAN".to_vec()],
+            "no stale reassembly bleed-through"
+        );
     }
 }

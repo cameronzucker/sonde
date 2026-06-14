@@ -537,6 +537,10 @@ impl LinkPair {
     fn b_messages(&self) -> Vec<Vec<u8>> {
         delivered_messages(&self.b_events)
     }
+
+    fn a_messages(&self) -> Vec<Vec<u8>> {
+        delivered_messages(&self.a_events)
+    }
 }
 
 #[test]
@@ -706,4 +710,58 @@ fn host_command_surface_drives_the_full_lifecycle() {
     assert!(p.run_until(600, |p| p.a.state() == ConnState::Closed
         && p.b.state() == ConnState::Closed));
     assert!(p.b_events.contains(&HostEvent::Disconnected));
+}
+
+#[test]
+fn g7_bidirectional_delivery_under_burst_loss() {
+    // Both stations originate host data over one lossy half-duplex channel; both
+    // messages must be delivered byte-exact (the floor must be shareable, not
+    // initiator-hogged). Codex blocker #2.
+    let params = ChannelParams {
+        seed: 0xB1D1,
+        p_g2b: 0.12,
+        p_b2g: 0.45,
+        loss_good: 0.03,
+        loss_bad: 0.5,
+        corruption_prob: 0.02,
+        rtt: TICK,
+    };
+    let mut p = LinkPair::new(params);
+    p.a.connect(Duration::ZERO);
+    assert!(p.run_until(400, |p| p.both_connected()));
+
+    let to_b: Vec<u8> = (0u8..24).collect();
+    let to_a: Vec<u8> = (100u8..130).collect();
+    p.a.send(to_b.clone());
+    p.b.send(to_a.clone());
+    assert!(
+        p.run_until(8000, |p| !p.a_messages().is_empty()
+            && !p.b_messages().is_empty()),
+        "both directions must deliver"
+    );
+    assert_eq!(p.b_messages(), vec![to_b]);
+    assert_eq!(p.a_messages(), vec![to_a]);
+}
+
+#[test]
+fn g8_acceptor_originated_data_under_burst_loss() {
+    // The acceptor (never the initiator) is the only one with data. It must
+    // acquire the idle floor and deliver — the initiator must not starve it.
+    let params = ChannelParams {
+        seed: 0xACC0,
+        p_g2b: 0.12,
+        p_b2g: 0.45,
+        loss_good: 0.03,
+        loss_bad: 0.5,
+        corruption_prob: 0.0,
+        rtt: TICK,
+    };
+    let mut p = LinkPair::new(params);
+    p.a.connect(Duration::ZERO);
+    assert!(p.run_until(400, |p| p.both_connected()));
+
+    let msg: Vec<u8> = (0u8..20).collect();
+    p.b.send(msg.clone());
+    assert!(p.run_until(8000, |p| !p.a_messages().is_empty()));
+    assert_eq!(p.a_messages(), vec![msg]);
 }
