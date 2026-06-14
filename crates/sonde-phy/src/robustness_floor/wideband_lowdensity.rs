@@ -648,4 +648,46 @@ mod tests {
             );
         }
     }
+
+    // ─── coded-path error rejection (Task B3) ──────────────────────────
+
+    #[test]
+    fn receive_multi_rejects_input_shorter_than_one_block() {
+        let floor = WidebandLowDensityFloor::new();
+        let too_short = vec![0.0_f32; 10];
+        assert!(matches!(
+            floor.receive_multi(&too_short),
+            Err(PhyError::FrameDetect(_))
+        ));
+    }
+
+    #[test]
+    fn receive_multi_rejects_truncated_multiblock() {
+        // Block 0's header declares many blocks; supplying only block 0's
+        // samples must surface FrameDetect (the later blocks are truncated).
+        let floor = WidebandLowDensityFloor::new();
+        let payload: Vec<u8> = (0..600).map(|i| (i % 251) as u8).collect();
+        let full = floor.transmit_multi(&payload).unwrap();
+        let one_block = floor.symbol_size_samples() * floor.symbols_per_block();
+        assert!(full.len() > one_block, "test needs a multi-block payload");
+        let truncated = &full[..one_block];
+        assert!(matches!(
+            floor.receive_multi(truncated),
+            Err(PhyError::FrameDetect(_))
+        ));
+    }
+
+    #[test]
+    fn receive_multi_with_sync_rejects_truncated_after_preamble() {
+        let floor = WidebandLowDensityFloor::new();
+        let payload: Vec<u8> = (0..600).map(|i| (i % 251) as u8).collect();
+        let full = floor.transmit_multi_with_preamble(&payload).unwrap();
+        let trunc_len =
+            PREAMBLE_LEN_SAMPLES + floor.symbol_size_samples() * floor.symbols_per_block();
+        let truncated = &full[..trunc_len];
+        assert!(matches!(
+            floor.receive_multi_with_sync(truncated),
+            Err(PhyError::FrameDetect(_))
+        ));
+    }
 }
