@@ -2,3 +2,9 @@ target/
 Cargo.lock
 *.wav
 *.bin
+
+# Worktree workflow (ADR 0002 / docs/git-strategy.md)
+worktrees/
+.claude/worktrees/
+.claude/session-leases/
+.claude/worktree-archives/
