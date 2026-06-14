@@ -1,0 +1,21 @@
+{
+  "total_len": 3025,
+  "fields": [
+    {
+      "label": "header",
+      "start": 0,
+      "end": 132
+    },
+    {
+      "label": "body",
+      "start": 132,
+      "end": 356
+    },
+    {
+      "label": "image",
+      "start": 356,
+      "end": 3025
+    }
+  ],
+  "image_byte_len": 2669
+}

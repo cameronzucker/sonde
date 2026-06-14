@@ -1,0 +1,8 @@
+site/pkg/
+site/assets/source.jpg
+
+# Playwright smoke-test harness (installed via `npm install` in demo/)
+node_modules/
+test-results/
+playwright-report/
+.last-run.json

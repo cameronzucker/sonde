@@ -9,6 +9,8 @@ members = [
     "crates/sonde-tx",
     "crates/sonde-rx",
     "hf-channel-sim",
+    "crates/sonde-demo-builder",
+    "crates/sonde-wasm",
 ]
 
 [workspace.package]
@@ -37,3 +39,9 @@ proptest = "1"
 criterion = "0.8"
 hound = "3"           # .wav read/write for audio_loopback_check + bench-rig captures
 cpal = "0.15"         # feature-gated; default-off
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+wasm-bindgen = "0.2"
+getrandom = "0.2"
