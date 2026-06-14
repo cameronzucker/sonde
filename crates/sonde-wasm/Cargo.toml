@@ -1,0 +1,9 @@
+[package]
+name = "sonde-wasm"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+# Placeholder — Task 5 will expand this into the full WASM DSP engine crate.
+
+[lib]
+crate-type = ["cdylib", "rlib"]
