@@ -25,8 +25,10 @@
 #![warn(missing_docs)]
 
 pub mod arq;
+pub mod conn;
 pub mod frame;
 pub mod profile;
 
+pub use conn::{ConnState, Connection, HostEvent};
 pub use frame::{Callsign, FrameError, FrameType, LinkFrame, LINK_MTU, LINK_OVERHEAD};
 pub use profile::ModeProfile;
