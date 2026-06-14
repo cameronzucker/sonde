@@ -45,7 +45,16 @@ Deciders: <names or session monikers of people involved>
 
 ## File naming
 
-`NNNN-<short-slug>.md`, zero-padded to 4 digits. Numbers are assigned in chronological order; once an ADR has a number, it never changes.
+`NNNN-<short-slug>.md`, zero-padded to 4 digits. Numbers are assigned in chronological order. Once an ADR is **merged to `main`** (`Accepted`), its number is permanent and never reused. A not-yet-merged (`Proposed`) ADR on a branch may be renumbered to resolve a concurrent-allocation collision — see "Allocating a number" below.
+
+## Allocating a number (multi-session)
+
+Sonde has several Claude Code sessions live at once, so two branches can grab the same next number. Per [ADR 0004](0004-adr-numbering-under-concurrency.md), allocation is **claim-next, renumber-on-collision**:
+
+1. Take the next free number from this index **on the latest `origin/main`** (not your stale branch point).
+2. Add your index row here with status `Proposed` as the first commit on your branch, so the claim shows in your PR.
+3. Before opening the PR, refresh `origin/main` and skim open PRs (`gh pr list`). If your number was taken by something that merged or is ahead of you, **the later-to-merge ADR renumbers** (rename the file, fix the `# NNNN.` heading, the index row, and inbound links) — cheap, because it is still `Proposed`.
+4. The merger confirms the number is still free on `main` before landing.
 
 ## Lifecycle
 
@@ -60,6 +69,7 @@ Deciders: <names or session monikers of people involved>
 | [0001](0001-record-architecture-decisions.md) | Record architecture decisions | Accepted |
 | [0002](0002-git-workflow-and-governance.md) | Git workflow and governance (main-as-integration, per-task branches, no-squash, worktrees, destructive-git ban) | Accepted |
 | [0003](0003-sonde-phy-runtime-adapter.md) | SondePhy runtime adapter architecture | Accepted |
+| [0004](0004-adr-numbering-under-concurrency.md) | Allocate ADR numbers by claim-next, renumber-on-collision | Accepted |
 
 ## References
 
