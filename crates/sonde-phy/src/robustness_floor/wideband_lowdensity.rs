@@ -33,7 +33,10 @@ pub const PREAMBLE_LEN_SAMPLES: usize = 192;
 /// wider, not denser" — see overview §5.A.1.
 pub struct WidebandLowDensityFloor {
     params: OfdmParams,
-    fec: Box<dyn FecCodec>,
+    // `+ Send` so the floor stays `Send` for downstream worker-thread
+    // adapters (e.g. sonde-phy-runtime's `FloorWaveform`); a bare
+    // `dyn` trait object would strip the auto-trait. All codecs are Send.
+    fec: Box<dyn FecCodec + Send>,
 }
 
 impl WidebandLowDensityFloor {
@@ -49,7 +52,7 @@ impl WidebandLowDensityFloor {
     }
 
     /// Floor with an injected concrete codec (e.g. `FloorRate14Codec`).
-    pub fn with_fec(fec: Box<dyn FecCodec>) -> Self {
+    pub fn with_fec(fec: Box<dyn FecCodec + Send>) -> Self {
         Self {
             params: OfdmParams::for_mode(OfdmModeName::Wide),
             fec,
