@@ -41,5 +41,11 @@ jobs:
       - name: Clippy (warnings = errors, all targets)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # sonde-phy-runtime's production soundcard path is feature-gated
+      # (`hardware`, default-off) and not exercised by automated tests per
+      # RADIO-1. Compile-check it here so it can't bit-rot.
+      - name: Clippy (sonde-phy-runtime hardware feature)
+        run: cargo clippy -p sonde-phy-runtime --features hardware --all-targets -- -D warnings
+
       - name: Test
         run: cargo test --workspace
