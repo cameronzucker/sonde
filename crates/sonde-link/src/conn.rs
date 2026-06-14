@@ -1,0 +1,867 @@
+//! Sans-IO connection state machine (design §4) — half-duplex, turn-taking.
+//!
+//! `Connection` does **no I/O and reads no wall-clock**. It is driven purely by
+//! method calls with logical time injected (`now: Duration`):
+//! - host intent: [`Connection::connect`], [`Connection::send`],
+//!   [`Connection::disconnect`];
+//! - inbound frames: [`Connection::handle_frame`];
+//! - the clock: [`Connection::handle_timeout`];
+//! - outputs: [`Connection::poll_transmit`] (next frame to put on the wire) and
+//!   [`Connection::poll_event`] (host-facing events).
+//!
+//! This keeps the floor/turn timers, ARQ, and retransmission fully reproducible
+//! from a seed, and lets the same core drive both the in-memory lossy medium
+//! (gates G1–G4) and a real `PhyTransport` (G5) through a thin `Link<P>` adapter.
+//!
+//! # Floor model (design §3.5)
+//!
+//! The `PhyTransport` seam has no carrier-sense, so the floor is passed in-band
+//! via `END_OF_OVER`. The connection initiator owns the first floor. On
+//! receiving the end of a peer's over, a station takes the floor **only if it
+//! has unacked data or owes an ack for DATA just received** (the quiescence
+//! rule); otherwise the exchange settles. A turn-recovery timer re-takes the
+//! floor if the peer's over is lost; sustained silence past
+//! `DEAD_OVERS_TOLERATED` is reported as `PeerLost` (honest failure, never a
+//! hang or silent corruption).
+
+use std::collections::{HashSet, VecDeque};
+use std::time::Duration;
+
+use crate::arq::{Reassembler, RecvBuffer, SendWindow, FIRST_SEQ};
+use crate::frame::{Callsign, FrameType, LinkFrame};
+use crate::profile::ModeProfile;
+
+/// CONN retransmissions before a connect attempt fails.
+const MAX_CONN_RETRIES: u32 = 5;
+/// DISC retransmissions before teardown completes best-effort.
+const MAX_DISC_RETRIES: u32 = 3;
+/// Consecutive silent overs tolerated before the link is declared dead.
+const DEAD_OVERS_TOLERATED: u32 = 6;
+
+/// Connection lifecycle state (design §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnState {
+    /// No session.
+    Closed,
+    /// CONN sent, awaiting CONN_ACK.
+    Connecting,
+    /// Session up.
+    Connected,
+    /// DISC sent, awaiting DISC_ACK.
+    Disconnecting,
+}
+
+/// Half-duplex floor sub-state within `Connected`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Floor {
+    /// This station holds the floor (may key up).
+    Sending,
+    /// The peer holds the floor (this station listens).
+    Listening,
+}
+
+/// Events surfaced to the host (subsystem #8 will map these to its API).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostEvent {
+    /// The session is established.
+    Connected,
+    /// A whole, in-order host message was reassembled and delivered.
+    DataReceived(Vec<u8>),
+    /// The session was torn down cleanly.
+    Disconnected,
+    /// The link died (sustained silence) — honest failure.
+    PeerLost,
+    /// A connect attempt exhausted its retries.
+    ConnectFailed,
+}
+
+/// A half-duplex, connected-mode link connection to a single peer.
+pub struct Connection {
+    local: Callsign,
+    remote: Callsign,
+    profile: ModeProfile,
+    initiator: bool,
+    conn_id: u16,
+
+    state: ConnState,
+    floor: Floor,
+
+    send: SendWindow,
+    recv: RecvBuffer,
+    reasm: Reassembler,
+    msg_end_seqs: HashSet<u32>,
+
+    outbox: VecDeque<LinkFrame>,
+    events: VecDeque<HostEvent>,
+
+    deadline: Option<Duration>,
+    awaiting_reply: bool,
+    owe_ack: bool,
+    silent_overs: u32,
+    conn_retries: u32,
+    disc_retries: u32,
+}
+
+impl Connection {
+    /// Construct the connection initiator (owns the first floor after CONN_ACK).
+    pub fn initiator(
+        local: Callsign,
+        remote: Callsign,
+        conn_id: u16,
+        profile: ModeProfile,
+        window: u32,
+    ) -> Self {
+        Self::new(local, remote, conn_id, profile, window, true)
+    }
+
+    /// Construct a connection acceptor (adopts the peer's CONN_ID).
+    pub fn acceptor(local: Callsign, remote: Callsign, profile: ModeProfile, window: u32) -> Self {
+        Self::new(local, remote, 0, profile, window, false)
+    }
+
+    fn new(
+        local: Callsign,
+        remote: Callsign,
+        conn_id: u16,
+        profile: ModeProfile,
+        window: u32,
+        initiator: bool,
+    ) -> Self {
+        Self {
+            local,
+            remote,
+            profile,
+            initiator,
+            conn_id,
+            state: ConnState::Closed,
+            floor: Floor::Listening,
+            send: SendWindow::new(window),
+            recv: RecvBuffer::new(window),
+            reasm: Reassembler::new(),
+            msg_end_seqs: HashSet::new(),
+            outbox: VecDeque::new(),
+            events: VecDeque::new(),
+            deadline: None,
+            awaiting_reply: false,
+            owe_ack: false,
+            silent_overs: 0,
+            conn_retries: 0,
+            disc_retries: 0,
+        }
+    }
+
+    /// Current lifecycle state.
+    pub fn state(&self) -> ConnState {
+        self.state
+    }
+
+    /// Begin connecting (initiator). No-op unless `Closed`.
+    pub fn connect(&mut self, now: Duration) {
+        if self.state != ConnState::Closed {
+            return;
+        }
+        self.state = ConnState::Connecting;
+        self.conn_retries = 0;
+        let conn = self.make_control(FrameType::Conn, FIRST_SEQ);
+        self.outbox.push_back(conn);
+        self.deadline = Some(now + self.profile.turn_recovery_timeout());
+    }
+
+    /// Enqueue a host message for reliable, in-order delivery. Fragmented across
+    /// DATA frames per the mode's per-over MTU; reassembled at the peer.
+    pub fn send(&mut self, data: Vec<u8>) {
+        let frag = self.profile.per_over_mtu().max(1);
+        let mut last = FIRST_SEQ;
+        if data.is_empty() {
+            last = self.send.enqueue(Vec::new());
+        } else {
+            for chunk in data.chunks(frag) {
+                last = self.send.enqueue(chunk.to_vec());
+            }
+        }
+        self.msg_end_seqs.insert(last);
+    }
+
+    /// Begin a clean teardown.
+    pub fn disconnect(&mut self, now: Duration) {
+        if self.state != ConnState::Connected {
+            return;
+        }
+        self.state = ConnState::Disconnecting;
+        self.disc_retries = 0;
+        let disc = self.make_control(FrameType::Disc, 0);
+        self.outbox.push_back(disc);
+        self.deadline = Some(now + self.profile.turn_recovery_timeout());
+    }
+
+    /// Feed one decoded inbound frame.
+    pub fn handle_frame(&mut self, frame: LinkFrame, now: Duration) {
+        // Addressing: ignore frames not from our peer / not for us.
+        if frame.src != self.remote || frame.dst != self.local {
+            return;
+        }
+        match frame.frame_type {
+            FrameType::Conn => self.on_conn(&frame, now),
+            FrameType::ConnAck => self.on_conn_ack(&frame),
+            FrameType::Disc => self.on_disc(&frame),
+            FrameType::DiscAck => self.on_disc_ack(),
+            FrameType::Data if self.session_ok(&frame) => self.on_data(frame, now),
+            FrameType::Ack if self.session_ok(&frame) => self.on_ack(&frame, now),
+            FrameType::Keepalive if self.session_ok(&frame) => self.silent_overs = 0,
+            _ => {}
+        }
+    }
+
+    /// Advance timers to `now`.
+    pub fn handle_timeout(&mut self, now: Duration) {
+        let due = matches!(self.deadline, Some(d) if now >= d);
+        match self.state {
+            ConnState::Connecting if due => {
+                self.conn_retries += 1;
+                if self.conn_retries > MAX_CONN_RETRIES {
+                    self.state = ConnState::Closed;
+                    self.deadline = None;
+                    self.events.push_back(HostEvent::ConnectFailed);
+                } else {
+                    let conn = self.make_control(FrameType::Conn, FIRST_SEQ);
+                    self.outbox.push_back(conn);
+                    self.deadline = Some(now + self.profile.turn_recovery_timeout());
+                }
+            }
+            ConnState::Disconnecting if due => {
+                self.disc_retries += 1;
+                if self.disc_retries > MAX_DISC_RETRIES {
+                    self.state = ConnState::Closed;
+                    self.deadline = None;
+                    self.events.push_back(HostEvent::Disconnected);
+                } else {
+                    let disc = self.make_control(FrameType::Disc, 0);
+                    self.outbox.push_back(disc);
+                    self.deadline = Some(now + self.profile.turn_recovery_timeout());
+                }
+            }
+            ConnState::Connected => match self.floor {
+                Floor::Listening if due => {
+                    self.silent_overs += 1;
+                    if self.silent_overs > DEAD_OVERS_TOLERATED {
+                        self.state = ConnState::Closed;
+                        self.deadline = None;
+                        self.events.push_back(HostEvent::PeerLost);
+                    } else {
+                        // Re-take the floor to retransmit unacked data (or probe).
+                        self.floor = Floor::Sending;
+                        if !self.send.has_unacked() {
+                            self.owe_ack = true; // force a probe over
+                        }
+                        self.deadline = None;
+                    }
+                }
+                // Idle floor holder: keepalive to hold the link up.
+                Floor::Sending
+                    if self.outbox.is_empty() && !self.send.has_unacked() && !self.owe_ack =>
+                {
+                    if due {
+                        let ka = self.make_control(FrameType::Keepalive, 0);
+                        self.outbox.push_back(ka);
+                        self.deadline = Some(now + self.profile.keepalive_interval());
+                    } else if self.deadline.is_none() {
+                        self.deadline = Some(now + self.profile.keepalive_interval());
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    /// Next frame to transmit, if any (drains the current over frame by frame).
+    pub fn poll_transmit(&mut self, now: Duration) -> Option<LinkFrame> {
+        if self.outbox.is_empty()
+            && self.state == ConnState::Connected
+            && self.floor == Floor::Sending
+            && (self.send.has_unacked() || self.owe_ack)
+        {
+            self.build_over();
+        }
+        let f = self.outbox.pop_front();
+        if let Some(ref frame) = f {
+            if self.state == ConnState::Connected && frame.is_end_of_over() {
+                // Our over is done — pass the floor.
+                self.floor = Floor::Listening;
+                self.awaiting_reply = self.send.has_unacked();
+                let wait = if self.awaiting_reply {
+                    self.profile.turn_recovery_timeout()
+                } else {
+                    self.death_watch()
+                };
+                self.deadline = Some(now + wait);
+            }
+        }
+        f
+    }
+
+    /// Next host-facing event, if any.
+    pub fn poll_event(&mut self) -> Option<HostEvent> {
+        self.events.pop_front()
+    }
+
+    /// When the next timer is due (for the driver to schedule a wake-up).
+    pub fn next_timeout(&self) -> Option<Duration> {
+        self.deadline
+    }
+
+    // ---- internals ------------------------------------------------------
+
+    /// Idle-listener death watch: silence longer than this past several
+    /// keepalive intervals trips re-take/`PeerLost`.
+    fn death_watch(&self) -> Duration {
+        self.profile.keepalive_interval() * DEAD_OVERS_TOLERATED
+    }
+
+    fn session_ok(&self, frame: &LinkFrame) -> bool {
+        self.state == ConnState::Connected && frame.conn_id == self.conn_id
+    }
+
+    fn make_control(&self, frame_type: FrameType, seq: u32) -> LinkFrame {
+        LinkFrame::control(
+            frame_type,
+            self.local.clone(),
+            self.remote.clone(),
+            self.conn_id,
+            seq,
+        )
+    }
+
+    fn make_data(&self, seq: u32, payload: Vec<u8>) -> LinkFrame {
+        let mut f = LinkFrame::data(
+            self.local.clone(),
+            self.remote.clone(),
+            self.conn_id,
+            seq,
+            payload,
+        );
+        f.ack_through = self.recv.ack_through();
+        f.sack = self.recv.sack();
+        if self.msg_end_seqs.contains(&seq) {
+            f = f.end_of_msg();
+        }
+        f
+    }
+
+    fn make_ack(&self) -> LinkFrame {
+        LinkFrame::ack(
+            self.local.clone(),
+            self.remote.clone(),
+            self.conn_id,
+            self.recv.ack_through(),
+            self.recv.sack(),
+        )
+    }
+
+    /// Build this over's frames into the outbox: up to `W` unacked DATA frames
+    /// (gaps + fresh), or a bare ACK if there is no data. The last frame carries
+    /// `END_OF_OVER` (the floor token).
+    fn build_over(&mut self) {
+        let frames = self.send.over_frames();
+        let mut built: Vec<LinkFrame> = frames
+            .into_iter()
+            .map(|(seq, p)| self.make_data(seq, p))
+            .collect();
+        if built.is_empty() {
+            built.push(self.make_ack());
+        }
+        let last = built.pop().expect("over has >= 1 frame").end_of_over();
+        built.push(last);
+        self.owe_ack = false;
+        self.outbox.extend(built);
+    }
+
+    fn accept_connection_as_acceptor(&mut self, conn_id: u16, seq: u32, now: Duration) {
+        self.conn_id = conn_id;
+        self.state = ConnState::Connected;
+        self.floor = Floor::Listening;
+        self.awaiting_reply = false;
+        self.silent_overs = 0;
+        self.deadline = Some(now + self.death_watch());
+        self.events.push_back(HostEvent::Connected);
+        let ack = self.make_control(FrameType::ConnAck, seq);
+        self.outbox.push_back(ack);
+    }
+
+    fn on_conn(&mut self, frame: &LinkFrame, now: Duration) {
+        match self.state {
+            ConnState::Closed => self.accept_connection_as_acceptor(frame.conn_id, frame.seq, now),
+            ConnState::Connected => {
+                if frame.conn_id == self.conn_id {
+                    // Idempotent: peer didn't hear our CONN_ACK — resend it.
+                    let ack = self.make_control(FrameType::ConnAck, frame.seq);
+                    self.outbox.push_back(ack);
+                }
+                // Different conn_id while connected ⇒ stale/half-open: drop.
+            }
+            ConnState::Connecting => {
+                // CONN/CONN collision: tie-break by callsign (higher keeps the
+                // initiator role; lower becomes the acceptor — design §4).
+                if self.local.as_str() <= self.remote.as_str() {
+                    self.accept_connection_as_acceptor(frame.conn_id, frame.seq, now);
+                }
+            }
+            ConnState::Disconnecting => {}
+        }
+    }
+
+    fn on_conn_ack(&mut self, frame: &LinkFrame) {
+        if self.state == ConnState::Connecting && frame.conn_id == self.conn_id {
+            self.state = ConnState::Connected;
+            self.floor = Floor::Sending; // initiator owns the first floor
+            self.silent_overs = 0;
+            self.deadline = None;
+            self.events.push_back(HostEvent::Connected);
+        }
+    }
+
+    fn on_disc(&mut self, frame: &LinkFrame) {
+        if (self.state == ConnState::Connected || self.state == ConnState::Disconnecting)
+            && frame.conn_id == self.conn_id
+        {
+            let ack = self.make_control(FrameType::DiscAck, 0);
+            self.outbox.push_back(ack);
+            let was_open = self.state != ConnState::Closed;
+            self.state = ConnState::Closed;
+            self.deadline = None;
+            if was_open {
+                self.events.push_back(HostEvent::Disconnected);
+            }
+        }
+    }
+
+    fn on_disc_ack(&mut self) {
+        if self.state == ConnState::Disconnecting {
+            self.state = ConnState::Closed;
+            self.deadline = None;
+            self.events.push_back(HostEvent::Disconnected);
+        }
+    }
+
+    fn on_data(&mut self, frame: LinkFrame, now: Duration) {
+        self.silent_overs = 0;
+        self.send.on_ack(frame.ack_through, frame.sack); // piggybacked ack
+        let end_of_over = frame.is_end_of_over();
+        let end_of_msg = frame.is_end_of_msg();
+        let delivered = self.recv.accept(frame.seq, frame.payload, end_of_msg);
+        for d in delivered {
+            if let Some(msg) = self.reasm.push(d) {
+                self.events.push_back(HostEvent::DataReceived(msg));
+            }
+        }
+        self.owe_ack = true;
+        if end_of_over {
+            self.on_over_end(now);
+        }
+    }
+
+    fn on_ack(&mut self, frame: &LinkFrame, now: Duration) {
+        self.silent_overs = 0;
+        self.send.on_ack(frame.ack_through, frame.sack);
+        if frame.is_end_of_over() {
+            self.on_over_end(now);
+        }
+    }
+
+    /// The peer ended its over (passed the floor). Take the floor only if we
+    /// have unacked data or owe an ack (the quiescence rule); otherwise settle —
+    /// the initiator holds the idle floor, the acceptor relaxes into a death
+    /// watch.
+    fn on_over_end(&mut self, now: Duration) {
+        if self.send.has_unacked() || self.owe_ack {
+            self.floor = Floor::Sending;
+            self.deadline = None;
+        } else {
+            self.awaiting_reply = false;
+            if self.initiator {
+                self.floor = Floor::Sending; // hold the idle floor; keepalive
+                self.deadline = Some(now + self.profile.keepalive_interval());
+            } else {
+                self.floor = Floor::Listening;
+                self.deadline = Some(now + self.death_watch());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call(s: &str) -> Callsign {
+        Callsign::new(s).unwrap()
+    }
+
+    fn profile() -> ModeProfile {
+        // Small per-over MTU so multi-frame messages are easy to force.
+        ModeProfile::new(Duration::from_millis(10), 4)
+    }
+
+    const TICK: Duration = Duration::from_millis(10);
+
+    /// A perfect (lossless) in-memory pipe between two connections, advancing a
+    /// logical clock. Returns once no frames moved in a full round (settled).
+    struct Pair {
+        a: Connection,
+        b: Connection,
+        now: Duration,
+        a_events: Vec<HostEvent>,
+        b_events: Vec<HostEvent>,
+    }
+
+    impl Pair {
+        fn new() -> Self {
+            let a = Connection::initiator(call("K1ABC"), call("W2XYZ"), 0x1234, profile(), 8);
+            let b = Connection::acceptor(call("W2XYZ"), call("K1ABC"), profile(), 8);
+            Self {
+                a,
+                b,
+                now: Duration::ZERO,
+                a_events: Vec::new(),
+                b_events: Vec::new(),
+            }
+        }
+
+        fn drain_events(&mut self) {
+            while let Some(e) = self.a.poll_event() {
+                self.a_events.push(e);
+            }
+            while let Some(e) = self.b.poll_event() {
+                self.b_events.push(e);
+            }
+        }
+
+        /// One round: a transmits its over to b, then b to a, then timers fire.
+        fn step(&mut self) -> bool {
+            self.step_drop(None)
+        }
+
+        /// Like `step`, but drop the frame at `drop_a_idx` in A's over (to
+        /// deterministically model a single in-transit loss A→B).
+        fn step_drop(&mut self, drop_a_idx: Option<usize>) -> bool {
+            let mut moved = false;
+            let mut i = 0;
+            while let Some(f) = self.a.poll_transmit(self.now) {
+                moved = true;
+                if Some(i) != drop_a_idx {
+                    self.b.handle_frame(f, self.now);
+                }
+                i += 1;
+            }
+            while let Some(f) = self.b.poll_transmit(self.now) {
+                moved = true;
+                self.a.handle_frame(f, self.now);
+            }
+            self.now += TICK;
+            self.a.handle_timeout(self.now);
+            self.b.handle_timeout(self.now);
+            self.drain_events();
+            moved
+        }
+
+        fn b_messages(&self) -> Vec<Vec<u8>> {
+            self.b_events
+                .iter()
+                .filter_map(|e| match e {
+                    HostEvent::DataReceived(d) => Some(d.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn run(&mut self, max_steps: usize) {
+            for _ in 0..max_steps {
+                if !self.step() {
+                    return;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn handshake_connects_both_sides_initiator_holds_first_floor() {
+        let mut p = Pair::new();
+        p.a.connect(Duration::ZERO);
+        p.run(20);
+        assert_eq!(p.a.state(), ConnState::Connected);
+        assert_eq!(p.b.state(), ConnState::Connected);
+        assert!(p.a_events.contains(&HostEvent::Connected));
+        assert!(p.b_events.contains(&HostEvent::Connected));
+    }
+
+    #[test]
+    fn single_small_message_is_delivered_byte_exact() {
+        let mut p = Pair::new();
+        p.a.connect(Duration::ZERO);
+        p.run(20);
+        p.a.send(b"hi".to_vec());
+        p.run(40);
+        assert_eq!(
+            p.b_events
+                .iter()
+                .filter_map(|e| match e {
+                    HostEvent::DataReceived(d) => Some(d.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![b"hi".to_vec()]
+        );
+    }
+
+    #[test]
+    fn multi_frame_message_reassembles_in_order() {
+        // per_over_mtu = 4 ⇒ this 10-byte message fragments across 3 frames.
+        let mut p = Pair::new();
+        p.a.connect(Duration::ZERO);
+        p.run(20);
+        p.a.send(b"0123456789".to_vec());
+        p.run(60);
+        let got: Vec<Vec<u8>> = p
+            .b_events
+            .iter()
+            .filter_map(|e| match e {
+                HostEvent::DataReceived(d) => Some(d.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(got, vec![b"0123456789".to_vec()]);
+    }
+
+    #[test]
+    fn multiple_messages_arrive_in_order_without_duplication() {
+        let mut p = Pair::new();
+        p.a.connect(Duration::ZERO);
+        p.run(20);
+        p.a.send(b"first".to_vec());
+        p.a.send(b"second".to_vec());
+        p.a.send(b"third".to_vec());
+        p.run(100);
+        let got: Vec<Vec<u8>> = p
+            .b_events
+            .iter()
+            .filter_map(|e| match e {
+                HostEvent::DataReceived(d) => Some(d.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]
+        );
+    }
+
+    #[test]
+    fn clean_teardown_disconnects_both_sides() {
+        let mut p = Pair::new();
+        p.a.connect(Duration::ZERO);
+        p.run(20);
+        p.a.disconnect(p.now);
+        p.run(20);
+        assert_eq!(p.a.state(), ConnState::Closed);
+        assert_eq!(p.b.state(), ConnState::Closed);
+        assert!(p.a_events.contains(&HostEvent::Disconnected));
+        assert!(p.b_events.contains(&HostEvent::Disconnected));
+    }
+
+    #[test]
+    fn exchange_settles_after_delivery_no_duplicate_data() {
+        // The quiescence rule must stop data chatter: the message is delivered
+        // exactly once even though the idle link keeps a keepalive heartbeat.
+        let mut p = Pair::new();
+        p.a.connect(Duration::ZERO);
+        p.run(20);
+        p.a.send(b"x".to_vec());
+        p.run(200);
+        let count = p
+            .b_events
+            .iter()
+            .filter(|e| matches!(e, HostEvent::DataReceived(_)))
+            .count();
+        assert_eq!(count, 1, "message delivered exactly once, no duplicates");
+        assert_eq!(p.a.state(), ConnState::Connected);
+        assert_eq!(p.b.state(), ConnState::Connected);
+    }
+
+    // ---- SM hardening (design §4 watched failure modes) -----------------
+
+    fn init() -> Connection {
+        Connection::initiator(call("K1ABC"), call("W2XYZ"), 0x1234, profile(), 8)
+    }
+    fn acc() -> Connection {
+        Connection::acceptor(call("W2XYZ"), call("K1ABC"), profile(), 8)
+    }
+
+    #[test]
+    fn handshake_recovers_from_a_lost_conn() {
+        let mut a = init();
+        let mut b = acc();
+        a.connect(Duration::ZERO);
+        let lost = a.poll_transmit(Duration::ZERO).unwrap();
+        assert_eq!(lost.frame_type, FrameType::Conn); // dropped in transit
+
+        let t = a.profile.turn_recovery_timeout();
+        a.handle_timeout(t); // connect-retry fires
+        let conn = a.poll_transmit(t).unwrap();
+        assert_eq!(conn.frame_type, FrameType::Conn);
+        b.handle_frame(conn, t);
+        let ack = b.poll_transmit(t).unwrap();
+        a.handle_frame(ack, t);
+
+        assert_eq!(a.state(), ConnState::Connected);
+        assert_eq!(b.state(), ConnState::Connected);
+    }
+
+    #[test]
+    fn handshake_recovers_from_a_lost_conn_ack() {
+        let mut a = init();
+        let mut b = acc();
+        a.connect(Duration::ZERO);
+        let conn = a.poll_transmit(Duration::ZERO).unwrap();
+        b.handle_frame(conn, Duration::ZERO);
+        let lost_ack = b.poll_transmit(Duration::ZERO).unwrap();
+        assert_eq!(lost_ack.frame_type, FrameType::ConnAck); // dropped
+
+        let t = a.profile.turn_recovery_timeout();
+        a.handle_timeout(t); // A retransmits CONN
+        let conn2 = a.poll_transmit(t).unwrap();
+        b.handle_frame(conn2, t); // B resends CONN_ACK idempotently
+        let ack = b.poll_transmit(t).unwrap();
+        assert_eq!(ack.frame_type, FrameType::ConnAck);
+        a.handle_frame(ack, t);
+
+        assert_eq!(a.state(), ConnState::Connected);
+        assert_eq!(b.state(), ConnState::Connected);
+    }
+
+    #[test]
+    fn frame_with_wrong_conn_id_is_rejected_half_open() {
+        let mut b = acc();
+        b.handle_frame(
+            LinkFrame::control(
+                FrameType::Conn,
+                call("K1ABC"),
+                call("W2XYZ"),
+                0x1234,
+                FIRST_SEQ,
+            ),
+            Duration::ZERO,
+        );
+        assert_eq!(b.state(), ConnState::Connected);
+        while b.poll_event().is_some() {} // drain the Connected event
+                                          // A DATA frame stamped with a *different* session id must be ignored.
+        let stale = LinkFrame::data(call("K1ABC"), call("W2XYZ"), 0x9999, 1, b"x".to_vec())
+            .end_of_msg()
+            .end_of_over();
+        b.handle_frame(stale, Duration::ZERO);
+        assert!(
+            b.poll_event().is_none(),
+            "stale-session DATA must not deliver"
+        );
+    }
+
+    #[test]
+    fn frame_from_a_third_party_is_ignored() {
+        let mut b = acc();
+        b.handle_frame(
+            LinkFrame::control(
+                FrameType::Conn,
+                call("K1ABC"),
+                call("W2XYZ"),
+                0x1234,
+                FIRST_SEQ,
+            ),
+            Duration::ZERO,
+        );
+        while b.poll_event().is_some() {}
+        // Correct session id but the SRC is not our peer.
+        let intruder = LinkFrame::data(call("N0BODY"), call("W2XYZ"), 0x1234, 1, b"x".to_vec())
+            .end_of_msg()
+            .end_of_over();
+        b.handle_frame(intruder, Duration::ZERO);
+        assert!(b.poll_event().is_none());
+    }
+
+    #[test]
+    fn lost_data_frame_is_recovered_by_selective_repeat() {
+        let mut p = Pair::new();
+        p.a.connect(Duration::ZERO);
+        p.run(20);
+        p.a.send(b"ABCDEFGHIJ".to_vec()); // 3 fragments (mtu=4)
+        p.step_drop(Some(1)); // lose the middle fragment on the first over
+        p.run(40);
+        assert_eq!(p.b_messages(), vec![b"ABCDEFGHIJ".to_vec()]);
+    }
+
+    #[test]
+    fn duplicate_data_is_not_delivered_twice() {
+        let mut b = acc();
+        b.handle_frame(
+            LinkFrame::control(
+                FrameType::Conn,
+                call("K1ABC"),
+                call("W2XYZ"),
+                0x1234,
+                FIRST_SEQ,
+            ),
+            Duration::ZERO,
+        );
+        while b.poll_event().is_some() {}
+        let data = LinkFrame::data(call("K1ABC"), call("W2XYZ"), 0x1234, 1, b"hi".to_vec())
+            .end_of_msg()
+            .end_of_over();
+        b.handle_frame(data.clone(), Duration::ZERO);
+        b.handle_frame(data, Duration::ZERO); // a retransmit the receiver already has
+        let n = std::iter::from_fn(|| b.poll_event())
+            .filter(|e| matches!(e, HostEvent::DataReceived(_)))
+            .count();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn simultaneous_connect_resolves_by_callsign_tiebreak() {
+        // Both stations initiate at once (CONN/CONN collision).
+        let mut a = Connection::initiator(call("K1ABC"), call("W2XYZ"), 0x1111, profile(), 8);
+        let mut b = Connection::initiator(call("W2XYZ"), call("K1ABC"), 0x2222, profile(), 8);
+        a.connect(Duration::ZERO);
+        b.connect(Duration::ZERO);
+        // Exchange a few rounds in both directions.
+        for _ in 0..6 {
+            while let Some(f) = a.poll_transmit(Duration::ZERO) {
+                b.handle_frame(f, Duration::ZERO);
+            }
+            while let Some(f) = b.poll_transmit(Duration::ZERO) {
+                a.handle_frame(f, Duration::ZERO);
+            }
+        }
+        assert_eq!(a.state(), ConnState::Connected);
+        assert_eq!(b.state(), ConnState::Connected);
+        // Exactly one took the acceptor role ⇒ both agree on a single conn_id.
+        assert_eq!(a.conn_id, b.conn_id);
+    }
+
+    #[test]
+    fn sustained_silence_yields_peer_lost_not_a_hang() {
+        let mut p = Pair::new();
+        p.a.connect(Duration::ZERO);
+        p.run(20);
+        p.a.send(b"x".to_vec());
+        // Every A→B frame is lost forever; A must eventually give up explicitly.
+        for _ in 0..60 {
+            p.step_drop(Some(0));
+            if p.a.state() == ConnState::Closed {
+                break;
+            }
+        }
+        assert_eq!(p.a.state(), ConnState::Closed);
+        assert!(p.a_events.contains(&HostEvent::PeerLost));
+        assert!(
+            p.b_messages().is_empty(),
+            "never delivered ⇒ no silent corruption"
+        );
+    }
+}

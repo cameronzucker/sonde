@@ -8,6 +8,7 @@ members = [
     "crates/sonde-rig-rts",
     "crates/sonde-tx",
     "crates/sonde-rx",
+    "crates/sonde-link",
     "hf-channel-sim",
     "crates/sonde-demo-builder",
     "crates/sonde-wasm",
