@@ -33,7 +33,7 @@ sonde-phy = { path = "crates/sonde-phy" }
 sonde-rig-rts = { path = "crates/sonde-rig-rts" }
 bitvec = "1"
 crc = "3"
-rand = "0.8"
+rand = "0.10"
 rand_chacha = "0.3"
 proptest = "1"
 criterion = "0.8"
