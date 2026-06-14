@@ -56,6 +56,14 @@ impl SendWindow {
         seq
     }
 
+    /// Clear all state back to a fresh session (keeps the configured window).
+    /// Used when a connection closes so a same-object reconnect starts clean.
+    pub fn reset(&mut self) {
+        self.base = FIRST_SEQ;
+        self.next_seq = FIRST_SEQ;
+        self.frames.clear();
+    }
+
     /// Whether any enqueued frame is still unacked.
     pub fn has_unacked(&self) -> bool {
         !self.frames.is_empty()
@@ -154,6 +162,12 @@ impl RecvBuffer {
         out
     }
 
+    /// Clear all state back to a fresh session (keeps the configured window).
+    pub fn reset(&mut self) {
+        self.next_expected = FIRST_SEQ;
+        self.buffered.clear();
+    }
+
     /// Cumulative in-order high-water received (`0` ⇒ nothing yet).
     pub fn ack_through(&self) -> u32 {
         self.next_expected - 1
@@ -194,6 +208,12 @@ impl Reassembler {
         } else {
             None
         }
+    }
+
+    /// Discard any partially-accumulated message (used on session reset so a
+    /// half-received message never bleeds into a later session).
+    pub fn reset(&mut self) {
+        self.buf.clear();
     }
 }
 
