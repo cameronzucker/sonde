@@ -1,0 +1,27 @@
+[package]
+name = "sonde-phy-runtime"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Production PhyTransport runtime for sonde: a half-duplex pump that bridges the async-shaped PhyTransport trait (queued send_frame / poll_rx) to the blocking encode->PTT->audio and capture->demod stack. Generic over a Waveform (HF floor today, FM tomorrow) and a Radio (soundcard in production, in-memory loopback in tests)."
+
+[dependencies]
+# Core (hardware-free) path: only the PHY waveform + error/mode types. No cpal,
+# no ALSA — FloorWaveform wraps WidebandLowDensityFloor, which is core PHY.
+sonde-phy.workspace = true
+
+# Hardware path only (feature = "hardware"): real soundcard + serial-RTS PTT.
+# Optional so `cargo test` / default CI build the hardware-free core without
+# pulling cpal -> alsa-sys.
+sonde-rig-rts = { workspace = true, optional = true }
+sonde-tx = { path = "../sonde-tx", optional = true }
+
+[features]
+# Production soundcard+PTT Radio (the `soundcard` module). Off by default so
+# `cargo test` and default CI build the hardware-free core; the soundcard path
+# is compiled only when an operator builds for a real bench. Pulls sonde-phy's
+# audio-device (cpal) feature plus the TX composition + PTT crates.
+hardware = ["dep:sonde-tx", "dep:sonde-rig-rts", "sonde-phy/audio-device"]

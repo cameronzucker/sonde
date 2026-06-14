@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/sonde-fec",
     "crates/sonde-phy",
+    "crates/sonde-phy-runtime",
     "crates/sonde-rig-cm108",
     "crates/sonde-rig-rts",
     "crates/sonde-tx",
