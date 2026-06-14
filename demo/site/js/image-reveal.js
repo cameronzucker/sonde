@@ -203,10 +203,11 @@ export function createImageReveal(canvasEl) {
   }
 
   /**
-   * Show a "DECODE FAILED — frame did not sync" placeholder.
+   * Show a centered two-line placeholder (defaults to a decode-failure message).
+   * Also used by connected mode for "RECEIVING…" and "CONNECT FAILED" states.
    * Clears any cached state so the next render() re-evaluates.
    */
-  function showFailed() {
+  function showFailed(line1 = "DECODE FAILED", line2 = "frame did not sync") {
     _cachedSig = null;
     _cachedBitmap = null;
     _cachedPixelData = null;
@@ -219,9 +220,6 @@ export function createImageReveal(canvasEl) {
     ctx.fillStyle = BG;
     ctx.fillRect(0, 0, W, H);
 
-    // Centered muted message.
-    const line1 = "DECODE FAILED";
-    const line2 = "frame did not sync";
     const fontSize = Math.round(W / 22); // scales with canvas width (~14px at 320px)
 
     ctx.font = `${fontSize}px "IBM Plex Mono", "Courier New", monospace`;

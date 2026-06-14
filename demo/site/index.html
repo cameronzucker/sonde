@@ -43,12 +43,15 @@
     <div class="honesty" role="note">
       <span class="honesty__mark" aria-hidden="true">▲</span>
       <p>
-        <strong>Real reference modem · simulated channel · not on-air.</strong>
-        Each run drives a real <strong>ARDOP</strong> modem (ardopcf) end-to-end through a
-        synthetic HF channel on the backend, then plays back what actually decoded. No radio
-        is keyed. ARDOP is a known-good external baseline — the bar Sonde is being built to
-        meet — and is never reimplemented here. There is no link layer, so a frame the channel
-        corrupts is simply lost: watch the image gain <em>holes</em> as conditions worsen.
+        <strong>Two real modems · a live connection · simulated channel · not on-air.</strong>
+        Each session stands up <strong>two real ARDOP</strong> stations (ardopcf) and runs an
+        actual <strong>connection</strong> between them — CONNECT handshake, bandwidth
+        negotiation, and <strong>adaptive-rate ARQ</strong> — with their audio bridged through a
+        synthetic HF channel on the backend. No radio is keyed. ARDOP has a link layer, so lost
+        blocks are <em>retransmitted</em>: at a workable SNR the image arrives <strong>intact</strong>,
+        the modems <strong>adapt the rate down</strong> as conditions worsen, and below the cliff
+        the <strong>connection never closes</strong>. ARDOP is a known-good external baseline — the
+        bar Sonde is being built to meet — and is never reimplemented here.
       </p>
     </div>
 
@@ -82,8 +85,8 @@
             <label class="ctl__label" for="snr-slider">Signal-to-noise ratio</label>
             <output class="ctl__value" id="snr-readout">—</output>
           </div>
-          <input class="slider" type="range" id="snr-slider" min="-12" max="60" step="1" value="30" />
-          <div class="slider__scale" aria-hidden="true"><span>−12</span><span>24</span><span>60 dB</span></div>
+          <input class="slider" type="range" id="snr-slider" min="-18" max="40" step="1" value="15" />
+          <div class="slider__scale" aria-hidden="true"><span>−18</span><span>11</span><span>40 dB</span></div>
         </div>
 
         <div class="ctl">
@@ -98,19 +101,25 @@
         </div>
 
         <div class="ctl">
-          <span class="ctl__label">Mode selection</span>
-          <div class="toggle" id="mode-toggle" role="group" aria-label="Auto or manual mode selection">
-            <button type="button" class="toggle__opt is-active" data-mode-sel="auto" aria-pressed="true">Auto</button>
-            <button type="button" class="toggle__opt" data-mode-sel="manual" aria-pressed="false">Manual</button>
+          <span class="ctl__label">ARQ bandwidth ceiling</span>
+          <div class="segmented" id="bw-group" role="group" aria-label="ARQ bandwidth ceiling">
+            <button type="button" class="seg" data-arqbw="200MAX" aria-pressed="false">200</button>
+            <button type="button" class="seg" data-arqbw="500MAX" aria-pressed="false">500</button>
+            <button type="button" class="seg" data-arqbw="1000MAX" aria-pressed="false">1000</button>
+            <button type="button" class="seg" data-arqbw="2000MAX" aria-pressed="true">2000 Hz</button>
           </div>
-          <select class="picker" id="mode-picker" disabled aria-label="Manual waveform mode">
-            <option value="">Auto-selected by Sonde</option>
-          </select>
+          <p class="ctl__note">The widest mode the modems may negotiate. ARDOP picks &amp; adapts the
+            actual data mode within this ceiling — you don't pick it.</p>
         </div>
 
+        <button type="button" class="runbtn" id="run-btn" aria-busy="false">
+          <span class="runbtn__glyph" aria-hidden="true">⇄</span>
+          <span class="runbtn__txt">Run connected session</span>
+        </button>
+
         <div class="adaptation" id="adaptation-readout" aria-live="polite">
-          <span class="adaptation__tag">ADAPTATION</span>
-          <span class="adaptation__text">Awaiting first link run…</span>
+          <span class="adaptation__tag">STATUS</span>
+          <span class="adaptation__text">Set the channel, then run a connected session…</span>
         </div>
       </section>
 
@@ -122,17 +131,17 @@
         </div>
         <div class="stats">
           <div class="stat stat--wide">
-            <span class="stat__k">Active mode</span>
+            <span class="stat__k">Negotiated / adapting mode</span>
             <span class="stat__v" id="stat-mode">—</span>
             <span class="stat__sub" id="stat-constellation">—</span>
           </div>
           <div class="stat">
-            <span class="stat__k">Measured SNR</span>
+            <span class="stat__k">Channel SNR</span>
             <span class="stat__v" id="stat-snr">—</span>
           </div>
           <div class="stat">
-            <span class="stat__k">Bit error rate</span>
-            <span class="stat__v" id="stat-ber">—</span>
+            <span class="stat__k">Negotiated BW</span>
+            <span class="stat__v" id="stat-bw">—</span>
           </div>
           <div class="stat">
             <span class="stat__k">Throughput</span>
@@ -152,44 +161,36 @@
           <span class="panel__hint">recovered frames → JPEG</span>
         </div>
         <div class="recon">
-          <canvas id="recon-image" width="320" height="240" aria-label="Progressively decoded reconnaissance photo"></canvas>
-          <p class="recon__cap">The SITREP carries a ~3&nbsp;KB recon photo. It renders from the
-            frames that <em>decoded</em> as the link plays out — intact at high SNR, holes where frames are lost at the margin.</p>
+          <canvas id="recon-image" width="320" height="240" aria-label="Reconnaissance photo delivered over the ARQ link"></canvas>
+          <p class="recon__cap">The SITREP carries a ~3&nbsp;KB recon photo. ARQ retransmits lost blocks,
+            so it lands <em>intact</em> at a workable SNR — just slower as the rate adapts down. Below the
+            cliff the connection never closes and nothing arrives.</p>
         </div>
       </section>
 
-      <!-- FRAME DECODE LOG -->
+      <!-- CONNECTION / ARQ LOG -->
       <section class="panel panel--console" aria-labelledby="console-label">
         <div class="panel__head">
-          <h2 class="panel__title" id="console-label"><span class="idx">05</span> Frame Decode Log</h2>
+          <h2 class="panel__title" id="console-label"><span class="idx">05</span> Connection / ARQ Log</h2>
           <span class="panel__hint">
-            per-frame result · <span class="flip">decoded <span id="frame-log-stat">0/0</span></span>
+            live protocol timeline · <span class="flip">delivered <span id="session-progress">0/0 B</span></span>
           </span>
         </div>
         <div class="flog">
-          <div class="flog__bar">each ARDOP frame: decode PASS/FAIL · RS bytes corrected · residual BER</div>
-          <div class="flog__stream" id="frame-log-stream"><span class="console__idle">— awaiting playback —</span></div>
+          <div class="flog__bar">handshake · negotiated bandwidth · rate adaptation · ARQ delivery</div>
+          <div class="flog__stream" id="session-log-stream"><span class="console__idle">— awaiting session —</span></div>
         </div>
       </section>
 
       <!-- TRANSPORT -->
-      <section class="panel panel--transport" aria-label="Playback transport">
-        <button type="button" class="transport__play" id="play-btn" aria-label="Play or pause the link playback">
-          <span class="transport__glyph">▶</span><span class="transport__txt">Play link</span>
+      <section class="panel panel--transport" aria-label="On-air audio playback">
+        <button type="button" class="transport__play" id="play-btn" disabled aria-label="Play or pause the on-air audio">
+          <span class="transport__glyph">▶</span><span class="transport__txt">Play on-air audio</span>
         </button>
         <div class="transport__track">
-          <input class="scrub" type="range" id="scrub" min="0" max="1000" step="1" value="0" aria-label="Scrub playback position" />
+          <input class="scrub" type="range" id="scrub" min="0" max="1000" step="1" value="0" aria-label="Scrub audio position" />
         </div>
-        <label class="transport__speed">
-          <span>Speed</span>
-          <select id="speed" aria-label="Playback speed">
-            <option value="0.5">0.5×</option>
-            <option value="1" selected>1×</option>
-            <option value="2">2×</option>
-            <option value="4">4×</option>
-          </select>
-        </label>
-        <button type="button" class="transport__mute" id="mute-btn" aria-pressed="false" aria-label="Mute or unmute link audio" title="Audio: hear the modulated waveform">
+        <button type="button" class="transport__mute" id="mute-btn" aria-pressed="false" aria-label="Mute or unmute on-air audio" title="Audio: hear what the receiver heard">
           <span class="transport__glyph" id="mute-glyph">🔊</span>
         </button>
       </section>
@@ -199,9 +200,16 @@
     <section class="explainer" aria-label="What you're seeing">
       <h3>What you're seeing</h3>
       <ol>
-        <li><strong>Set the channel.</strong> Drag SNR and pick a condition. <em>Auto</em> picks the fastest frame type expected to close the link; <em>Manual</em> lets you force one (robust modes need many more frames).</li>
-        <li><strong>ARDOP runs the real modem.</strong> The backend chunks a ~3&nbsp;KB image across real ARDOP frames, pushes each through a synthetic HF channel, and decodes it — real modulation, real Reed–Solomon FEC, no shortcuts.</li>
-        <li><strong>Press play.</strong> The waterfall sweeps the real transmission, the frame log shows each frame's decode and FEC effort, and the recon photo rebuilds from the frames that survived — with holes where frames were lost.</li>
+        <li><strong>Set the channel, then run a session.</strong> Drag SNR, pick a condition, choose the
+          ARQ <em>bandwidth ceiling</em> (the widest mode allowed), and press <em>Run connected session</em>.
+          A session is real airtime — give it time to play out.</li>
+        <li><strong>Two real ARDOP stations connect.</strong> The backend runs a real CONNECT handshake,
+          negotiates a bandwidth, and transfers a ~3&nbsp;KB image over <strong>adaptive-rate ARQ</strong> —
+          their audio bridged through a synthetic HF channel. Real modulation, real FEC, real retransmission.</li>
+        <li><strong>Watch it adapt.</strong> The connection/ARQ log streams the handshake, the negotiated mode,
+          and every rate change; the recon photo lands intact (ARQ retransmits) — slower as the rate drops, and
+          not at all once the SNR falls below the connect cliff. Press play to hear the on-air audio and sweep its
+          live spectrum.</li>
       </ol>
     </section>
 

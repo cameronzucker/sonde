@@ -379,6 +379,49 @@ body {
 .flog__stream::-webkit-scrollbar { width: 8px; }
 .flog__stream::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 8px; }
 
+/* ── Run-session button (primary action in the control panel) ───────────── */
+.ctl__note { font-size: 11.5px; line-height: 1.5; color: var(--faint); margin: 9px 2px 0; }
+.runbtn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 10px;
+  width: 100%; margin-top: 14px;
+  font-family: var(--font-display); font-weight: 600; font-size: 14px;
+  padding: 13px 22px; border-radius: var(--radius-s); cursor: pointer;
+  color: #05201d; border: 0;
+  background: linear-gradient(180deg, var(--teal), var(--teal-deep));
+  box-shadow: 0 0 18px rgba(47, 212, 196, 0.3);
+  transition: transform 0.12s, box-shadow 0.16s, opacity 0.16s;
+}
+.runbtn:hover { transform: translateY(-1px); box-shadow: 0 0 26px rgba(47, 212, 196, 0.45); }
+.runbtn:active { transform: translateY(0); }
+.runbtn:disabled {
+  opacity: 0.6; cursor: progress; transform: none; box-shadow: none;
+  background: linear-gradient(180deg, #1c2a39, #16212f); color: var(--muted);
+}
+.runbtn__glyph { font-size: 15px; }
+
+/* ── Connection / ARQ log (connected-mode protocol timeline) ─────────────── */
+.flip #session-progress { color: var(--teal); font-weight: 600; }
+.slog__row {
+  display: flex; align-items: center; gap: 11px;
+  padding: 4px 0; border-bottom: 1px dashed var(--line);
+}
+.slog__row--fail { opacity: 0.9; }
+.slog__pill {
+  font-family: var(--font-mono); font-weight: 600; font-size: 10.5px;
+  padding: 2px 7px; border-radius: 4px; letter-spacing: 0.08em;
+  min-width: 42px; text-align: center; flex: none;
+}
+.slog__pill--call { color: var(--ink); background: rgba(150,178,208,0.14); }
+.slog__pill--link { color: var(--muted); background: rgba(150,178,208,0.10); }
+.slog__pill--conn { color: var(--green-ok); background: rgba(68,209,141,0.14); }
+.slog__pill--rate { color: var(--amber); background: rgba(255,157,66,0.15); }
+.slog__pill--arq  { color: var(--teal); background: rgba(47,212,196,0.14); }
+.slog__pill--ok   { color: var(--green-ok); background: rgba(68,209,141,0.18); }
+.slog__pill--fail { color: var(--red); background: rgba(255,93,93,0.16); }
+.slog__pill--info { color: var(--faint); background: rgba(150,178,208,0.07); }
+.slog__text { color: var(--muted); flex: 1; min-width: 0; }
+.slog__meta { color: var(--faint); font-family: var(--font-mono); font-size: 11.5px; white-space: nowrap; }
+
 /* ── Transport (contained bar, real height — not a skinny strip) ───────── */
 .panel--transport {
   flex-direction: row; align-items: center; gap: 20px;
