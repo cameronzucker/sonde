@@ -28,8 +28,13 @@ pub fn apply_channel(
 ) -> (Vec<f32>, Vec<Complex<f32>>, Vec<Complex<f32>>) {
     let clean: Vec<Complex<f32>> = samples.iter().map(|&s| Complex::new(s, 0.0)).collect();
 
-    let mut chan = WattersonChannel::from_condition(seed, parse_condition(condition), SAMPLE_RATE_HZ as f64);
-    let mut observed = chan.process_block(&clean);
+    // "none" skips the Watterson multipath entirely (AWGN-only channel).
+    let mut observed = if condition == "none" {
+        clean.clone()
+    } else {
+        let mut chan = WattersonChannel::from_condition(seed, parse_condition(condition), SAMPLE_RATE_HZ as f64);
+        chan.process_block(&clean)
+    };
 
     let mut awgn = AwgnGenerator::new(seed ^ 0xA5A5_A5A5_A5A5_A5A5);
     awgn.add_noise(&mut observed, snr_db);
