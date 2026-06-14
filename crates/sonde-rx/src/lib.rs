@@ -161,10 +161,12 @@ pub fn resolve_expected(arg: &str) -> Result<Vec<u8>, RxError> {
 
 /// Demodulate one symbol's worth of samples into a byte payload.
 ///
-/// For [`FrameMode::Raw`]: takes the FIRST `mode.symbol_size_samples()`
-/// of the input; errors with [`RxError::InsufficientSamples`] if the
-/// input is shorter than that. v0.0.1 behavior — requires manual
-/// trimming of arbitrary-length captures.
+/// For [`FrameMode::Raw`]: decodes the coded FEC blocks at the START of
+/// the input via [`WidebandLowDensityFloor::receive`], which reads only
+/// the blocks the length header declares and ignores trailing samples.
+/// Errors with [`RxError::InsufficientSamples`] when the input is
+/// shorter than a single OFDM symbol (it cannot then hold even one coded
+/// block). Requires the capture to be aligned to the first coded block.
 ///
 /// For [`FrameMode::Sync`]: scans for the Zadoff-Chu preamble via
 /// [`WidebandLowDensityFloor::receive_with_sync`] and decodes the
@@ -176,8 +178,17 @@ pub fn decode_one_symbol(
     samples: &[f32],
     frame_mode: FrameMode,
 ) -> Result<Vec<u8>, RxError> {
+    let make_floor =
+        || WidebandLowDensityFloor::with_fec(Box::new(sonde_fec::codec::FloorRate14Codec::new()));
     match (mode, frame_mode) {
         (Mode::WideFloor, FrameMode::Raw) => {
+            // The coded floor spans one FEC block across many OFDM
+            // symbols, so a single-symbol slice can no longer hold a
+            // codeword. Keep the cheap one-symbol floor as the
+            // InsufficientSamples short-circuit (a buffer below one
+            // symbol cannot possibly carry a coded block), then hand the
+            // full buffer to `receive`, which reads exactly the coded
+            // blocks it needs and ignores any trailing samples.
             let needed = mode.symbol_size_samples();
             if samples.len() < needed {
                 return Err(RxError::InsufficientSamples {
@@ -185,19 +196,16 @@ pub fn decode_one_symbol(
                     needed,
                 });
             }
-            let slice = &samples[..needed];
-            WidebandLowDensityFloor::new()
-                .receive(slice)
-                .map_err(RxError::Phy)
+            make_floor().receive(samples).map_err(RxError::Phy)
         }
         (Mode::WideFloor, FrameMode::Sync) => {
-            let (_start, bytes) = WidebandLowDensityFloor::new()
+            let (_start, bytes) = make_floor()
                 .receive_with_sync(samples)
                 .map_err(RxError::Phy)?;
             Ok(bytes)
         }
         (Mode::WideFloor, FrameMode::MultiSync) => {
-            let (_start, bytes) = WidebandLowDensityFloor::new()
+            let (_start, bytes) = make_floor()
                 .receive_multi_with_sync(samples)
                 .map_err(RxError::Phy)?;
             Ok(bytes)
@@ -213,19 +221,21 @@ pub fn decode_one_symbol_with_offset(
     samples: &[f32],
     frame_mode: FrameMode,
 ) -> Result<(Option<usize>, Vec<u8>), RxError> {
+    let make_floor =
+        || WidebandLowDensityFloor::with_fec(Box::new(sonde_fec::codec::FloorRate14Codec::new()));
     match (mode, frame_mode) {
         (Mode::WideFloor, FrameMode::Raw) => {
             let bytes = decode_one_symbol(mode, samples, frame_mode)?;
             Ok((None, bytes))
         }
         (Mode::WideFloor, FrameMode::Sync) => {
-            let (start, bytes) = WidebandLowDensityFloor::new()
+            let (start, bytes) = make_floor()
                 .receive_with_sync(samples)
                 .map_err(RxError::Phy)?;
             Ok((Some(start), bytes))
         }
         (Mode::WideFloor, FrameMode::MultiSync) => {
-            let (start, bytes) = WidebandLowDensityFloor::new()
+            let (start, bytes) = make_floor()
                 .receive_multi_with_sync(samples)
                 .map_err(RxError::Phy)?;
             Ok((Some(start), bytes))
@@ -497,6 +507,13 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    /// A floor wired with the same real codec `decode_one_symbol` now
+    /// uses (`FloorRate14Codec`). Round-trip tests must produce samples
+    /// through this codec so the encode/decode sides match.
+    fn coded_floor() -> WidebandLowDensityFloor {
+        WidebandLowDensityFloor::with_fec(Box::new(sonde_fec::codec::FloorRate14Codec::new()))
+    }
+
     // ─── Mode ───────────────────────────────────────────────────────
 
     #[test]
@@ -552,22 +569,20 @@ mod tests {
         // decoder are inverse operations on a clean channel. No
         // hardware, no WAV file, no audio device — purely lib-level.
         let payload = b"HELLO";
-        let samples = WidebandLowDensityFloor::new().transmit(payload).unwrap();
+        let samples = coded_floor().transmit(payload).unwrap();
         let decoded = decode_one_symbol(Mode::WideFloor, &samples, FrameMode::Raw).unwrap();
         assert_eq!(decoded, payload);
     }
 
     #[test]
     fn roundtrip_wide_floor_handles_max_payload() {
-        // 9 bytes is roughly the wide-floor single-symbol capacity
-        // (74 data sub-carriers / 8 bits = 9 bytes; receive() trims
-        // trailing zeros).
+        // Under the rate-1/4 coded floor, a payload spans whole FEC
+        // blocks (no longer a single OFDM symbol); the length header
+        // means there are no trailing-zero ambiguities. A 9-byte ASCII
+        // payload round-trips exactly.
         let payload = b"ABCDEFGHI";
-        let samples = WidebandLowDensityFloor::new().transmit(payload).unwrap();
+        let samples = coded_floor().transmit(payload).unwrap();
         let decoded = decode_one_symbol(Mode::WideFloor, &samples, FrameMode::Raw).unwrap();
-        // The decoder trims trailing zeros so payloads ending in 0x00
-        // would round-trip lossy; our ASCII payload has no NULs so
-        // it round-trips clean.
         assert_eq!(decoded, payload);
     }
 
@@ -581,9 +596,10 @@ mod tests {
     #[test]
     fn decode_uses_only_first_symbol_size_samples() {
         // Encode a known payload; pad the buffer with garbage AFTER
-        // the symbol. The decoder should ignore the trailing garbage.
+        // the coded blocks. The decoder reads only the blocks the
+        // length header declares and ignores the trailing garbage.
         let payload = b"hi";
-        let mut samples = WidebandLowDensityFloor::new().transmit(payload).unwrap();
+        let mut samples = coded_floor().transmit(payload).unwrap();
         samples.extend(std::iter::repeat(0.5_f32).take(10_000));
         let decoded = decode_one_symbol(Mode::WideFloor, &samples, FrameMode::Raw).unwrap();
         assert_eq!(decoded, payload);
@@ -597,7 +613,7 @@ mod tests {
         // workflow boils down to this minus the manual SDR/file
         // step in between.
         let payload = b"WAV";
-        let samples = WidebandLowDensityFloor::new().transmit(payload).unwrap();
+        let samples = coded_floor().transmit(payload).unwrap();
         let buf = AudioBuffer::from_samples(samples);
         let dir = std::env::temp_dir();
         let path = dir.join(format!("sonde-rx-test-wav-{}.wav", std::process::id()));
@@ -766,9 +782,7 @@ mod tests {
         // transmit_with_preamble produces preamble + symbol; we decode
         // it via sync mode and recover the payload.
         let payload = b"HELLO";
-        let samples = WidebandLowDensityFloor::new()
-            .transmit_with_preamble(payload)
-            .unwrap();
+        let samples = coded_floor().transmit_with_preamble(payload).unwrap();
         let decoded = decode_one_symbol(Mode::WideFloor, &samples, FrameMode::Sync).unwrap();
         assert_eq!(decoded, payload);
     }
@@ -779,9 +793,7 @@ mod tests {
         // length captures (e.g. an off-air WAV with silence before the
         // signal) decode without manual trimming.
         let payload = b"OFFSET";
-        let core = WidebandLowDensityFloor::new()
-            .transmit_with_preamble(payload)
-            .unwrap();
+        let core = coded_floor().transmit_with_preamble(payload).unwrap();
         let mut samples = vec![0.0_f32; 1000];
         samples.extend_from_slice(&core);
         let decoded = decode_one_symbol(Mode::WideFloor, &samples, FrameMode::Sync).unwrap();
@@ -792,9 +804,7 @@ mod tests {
     fn decode_sync_with_offset_reports_start_sample() {
         // decode_one_symbol_with_offset returns Some(start) in sync mode.
         let payload = b"HELLO";
-        let core = WidebandLowDensityFloor::new()
-            .transmit_with_preamble(payload)
-            .unwrap();
+        let core = coded_floor().transmit_with_preamble(payload).unwrap();
         let mut samples = vec![0.0_f32; 500];
         samples.extend_from_slice(&core);
         let (start, decoded) =
@@ -829,7 +839,7 @@ mod tests {
         // In raw mode the start sample concept doesn't apply; we
         // return None.
         let payload = b"hi";
-        let samples = WidebandLowDensityFloor::new().transmit(payload).unwrap();
+        let samples = coded_floor().transmit(payload).unwrap();
         let (start, decoded) =
             decode_one_symbol_with_offset(Mode::WideFloor, &samples, FrameMode::Raw).unwrap();
         assert_eq!(start, None);
@@ -868,11 +878,8 @@ mod tests {
         // --frame-mode sync produces a CLEAN MATCH without manual
         // trimming.
         let payload = b"WAVSYNC";
-        let buffer = AudioBuffer::from_samples(
-            WidebandLowDensityFloor::new()
-                .transmit_with_preamble(payload)
-                .unwrap(),
-        );
+        let buffer =
+            AudioBuffer::from_samples(coded_floor().transmit_with_preamble(payload).unwrap());
         let dir = std::env::temp_dir();
         let path = dir.join(format!(
             "sonde-rx-sync-roundtrip-{}.wav",
@@ -907,9 +914,7 @@ mod tests {
     #[test]
     fn decode_multi_sync_roundtrip_via_transmit_multi_with_preamble() {
         let payload = b"HELLO_MULTI";
-        let samples = WidebandLowDensityFloor::new()
-            .transmit_multi_with_preamble(payload)
-            .unwrap();
+        let samples = coded_floor().transmit_multi_with_preamble(payload).unwrap();
         let decoded = decode_one_symbol(Mode::WideFloor, &samples, FrameMode::MultiSync).unwrap();
         assert_eq!(decoded, payload);
     }
@@ -917,7 +922,7 @@ mod tests {
     #[test]
     fn decode_multi_sync_handles_100_byte_payload() {
         let payload: Vec<u8> = (0..100).map(|i| (i * 13 % 251) as u8).collect();
-        let samples = WidebandLowDensityFloor::new()
+        let samples = coded_floor()
             .transmit_multi_with_preamble(&payload)
             .unwrap();
         let decoded = decode_one_symbol(Mode::WideFloor, &samples, FrameMode::MultiSync).unwrap();
@@ -927,7 +932,7 @@ mod tests {
     #[test]
     fn decode_multi_sync_handles_1000_byte_payload() {
         let payload: Vec<u8> = (0..1000).map(|i| (i % 251) as u8).collect();
-        let samples = WidebandLowDensityFloor::new()
+        let samples = coded_floor()
             .transmit_multi_with_preamble(&payload)
             .unwrap();
         let decoded = decode_one_symbol(Mode::WideFloor, &samples, FrameMode::MultiSync).unwrap();
@@ -937,7 +942,7 @@ mod tests {
     #[test]
     fn decode_multi_sync_handles_leading_silence() {
         let payload: Vec<u8> = (0..30).map(|i| (i * 7 % 251) as u8).collect();
-        let core = WidebandLowDensityFloor::new()
+        let core = coded_floor()
             .transmit_multi_with_preamble(&payload)
             .unwrap();
         let mut samples = vec![0.0_f32; 1500];
@@ -949,9 +954,7 @@ mod tests {
     #[test]
     fn decode_multi_sync_with_offset_reports_preamble_start() {
         let payload = b"OFFSET";
-        let core = WidebandLowDensityFloor::new()
-            .transmit_multi_with_preamble(payload)
-            .unwrap();
+        let core = coded_floor().transmit_multi_with_preamble(payload).unwrap();
         let mut samples = vec![0.0_f32; 800];
         samples.extend_from_slice(&core);
         let (start, decoded) =
@@ -990,7 +993,7 @@ mod tests {
         // 100-byte payload that Sync (single-symbol) couldn't carry.
         let payload: Vec<u8> = (0..100).map(|i| ((i * 17 + 3) % 251) as u8).collect();
         let buffer = AudioBuffer::from_samples(
-            WidebandLowDensityFloor::new()
+            coded_floor()
                 .transmit_multi_with_preamble(&payload)
                 .unwrap(),
         );
@@ -1005,5 +1008,15 @@ mod tests {
         let decoded =
             decode_one_symbol(Mode::WideFloor, read_back.samples(), FrameMode::MultiSync).unwrap();
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn decode_one_symbol_uses_floor_fec_round_trip() {
+        use sonde_fec::codec::FloorRate14Codec;
+        use sonde_phy::robustness_floor::wideband_lowdensity::WidebandLowDensityFloor;
+        let floor = WidebandLowDensityFloor::with_fec(Box::new(FloorRate14Codec::new()));
+        let samples = floor.transmit_multi_with_preamble(b"RXFEC").unwrap();
+        let out = decode_one_symbol(Mode::WideFloor, &samples, FrameMode::MultiSync).unwrap();
+        assert_eq!(out, b"RXFEC");
     }
 }

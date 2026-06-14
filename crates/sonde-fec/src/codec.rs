@@ -94,6 +94,107 @@ impl OfdmAdaptiveCodec {
     }
 }
 
+/// LDPC codec for the rate-1/4 wide-band low-density robustness floor
+/// (`CodeFamily::FloorRate14`). Same CRC + interleave + SPA composition
+/// as [`OfdmAdaptiveCodec`]; fixed rate 1/4, n=2048, k=512.
+pub struct FloorRate14Codec {
+    h: ParityCheckMatrix,
+    encoder: LdpcEncoder,
+    decoder: LdpcDecoder,
+    n: usize,
+    ldpc_k: usize,
+}
+
+impl FloorRate14Codec {
+    /// Build the floor codec. Constructs the rank-full H, encoder, and
+    /// SPA decoder up-front; per-encode/decode is then data-plane work.
+    pub fn new() -> Self {
+        let h = codes::build(CodeFamily::FloorRate14);
+        let encoder = LdpcEncoder::new(&h);
+        let decoder = LdpcDecoder::new(&h);
+        let n = h.n;
+        let ldpc_k = h.k;
+        Self {
+            h,
+            encoder,
+            decoder,
+            n,
+            ldpc_k,
+        }
+    }
+
+    /// LDPC payload bits per block (excluding the 32-bit CRC).
+    fn payload_bits(&self) -> usize {
+        self.ldpc_k - 32
+    }
+
+    /// Borrowed access to the underlying parity-check matrix
+    /// (diagnostics; not part of the `FecCodec` contract). Mirrors
+    /// [`OfdmAdaptiveCodec::parity_check_matrix`] and keeps the `h`
+    /// field live for parity/diagnostics.
+    pub fn parity_check_matrix(&self) -> &ParityCheckMatrix {
+        &self.h
+    }
+}
+
+impl Default for FloorRate14Codec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FecCodec for FloorRate14Codec {
+    fn encode(&self, info_bits: &[u8]) -> Vec<u8> {
+        assert_eq!(
+            info_bits.len(),
+            self.payload_bits(),
+            "FloorRate14Codec::encode: info_bits {} != payload k {}",
+            info_bits.len(),
+            self.payload_bits()
+        );
+        let info = bytes_to_bitvec(info_bits);
+        let with_crc = append_crc32(info.as_bitslice());
+        debug_assert_eq!(with_crc.len(), self.ldpc_k);
+        let codeword = self.encoder.encode(with_crc.as_bitslice());
+        debug_assert_eq!(codeword.len(), self.n);
+        let interleaved = interleave(codeword.as_bitslice(), INTERLEAVER_ROWS);
+        bitvec_to_bytes(interleaved.as_bitslice())
+    }
+
+    fn decode_soft(&self, llr: &[f32]) -> Result<Vec<u8>, FecError> {
+        if llr.len() != self.n {
+            return Err(FecError::DecodeFailure(format!(
+                "decode_soft: llr.len() {} != n {}",
+                llr.len(),
+                self.n
+            )));
+        }
+        let perm = deinterleave_index_perm(self.n, INTERLEAVER_ROWS);
+        let deint_llrs: Vec<f32> = (0..self.n).map(|i| llr[perm[i]]).collect();
+        let outcome = self.decoder.decode(&deint_llrs, MAX_ITERS_OFDM);
+        let info_plus_crc: BitVec<u8> = outcome.decoded[..self.ldpc_k].iter().copied().collect();
+        verify_crc32(info_plus_crc.as_bitslice()).map_err(|e| {
+            FecError::DecodeFailure(format!(
+                "CRC mismatch after {} iterations: {e}",
+                outcome.iterations_used
+            ))
+        })?;
+        Ok(bitvec_to_bytes(&info_plus_crc[..self.payload_bits()]))
+    }
+
+    fn rate(&self) -> CodeRate {
+        CodeRate { num: 1, den: 4 }
+    }
+
+    fn block_info_bits(&self) -> usize {
+        self.payload_bits()
+    }
+
+    fn block_coded_bits(&self) -> usize {
+        self.n
+    }
+}
+
 fn bytes_to_bitvec(bits: &[u8]) -> BitVec<u8> {
     bits.iter().map(|&b| b != 0).collect()
 }
@@ -285,5 +386,43 @@ mod tests {
             result.is_err(),
             "heavily corrupted codeword should fail decode + CRC verify"
         );
+    }
+
+    #[test]
+    fn floor_rate14_block_sizes_and_rate() {
+        let codec = FloorRate14Codec::new();
+        assert_eq!(codec.block_info_bits(), 480);
+        assert_eq!(codec.block_coded_bits(), 2048);
+        let r = codec.rate();
+        assert_eq!((r.num, r.den), (1, 4));
+    }
+
+    #[test]
+    fn floor_rate14_round_trip_zero_noise() {
+        let codec = FloorRate14Codec::new();
+        let payload = random_bits(codec.block_info_bits(), 0xF100_0014);
+        let encoded = codec.encode(&payload);
+        assert_eq!(encoded.len(), codec.block_coded_bits());
+        let llrs: Vec<f32> = encoded
+            .iter()
+            .map(|&b| if b == 0 { 10.0 } else { -10.0 })
+            .collect();
+        let recovered = codec.decode_soft(&llrs).expect("decode_soft");
+        assert_eq!(recovered, payload, "floor codec round-trip lossless");
+    }
+
+    #[test]
+    fn floor_rate14_corrupted_returns_error() {
+        let codec = FloorRate14Codec::new();
+        let payload = random_bits(codec.block_info_bits(), 7);
+        let encoded = codec.encode(&payload);
+        let mut llrs: Vec<f32> = encoded
+            .iter()
+            .map(|&b| if b == 0 { 1.0 } else { -1.0 })
+            .collect();
+        for i in (0..llrs.len()).step_by(2) {
+            llrs[i] = -llrs[i];
+        }
+        assert!(codec.decode_soft(&llrs).is_err());
     }
 }

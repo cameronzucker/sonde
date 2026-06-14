@@ -13,6 +13,7 @@ categories = ["hardware-support", "command-line-utilities"]
 [dependencies]
 thiserror.workspace = true
 sonde-phy = { workspace = true, features = ["audio-device"] }
+sonde-fec.workspace = true
 libc = "0.2"
 
 [dev-dependencies]

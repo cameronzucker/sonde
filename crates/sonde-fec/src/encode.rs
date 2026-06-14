@@ -207,9 +207,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "floor_rate14 random (3,4) regular LDPC is rank-deficient under \
-                naive systematic encoding; tracked by tuxlink-bbin follow-up for \
-                PEG (progressive-edge-growth) or column-swap-pivot construction"]
     fn encoder_handles_floor_rate14() {
         let h = codes::build(CodeFamily::FloorRate14);
         let enc = Encoder::new(&h);

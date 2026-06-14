@@ -11,5 +11,6 @@
 //!   from FT8/JS8 weak-signal design. Reserved for crowded-band slots
 //!   where wide-band isn't available.
 
+pub mod coded_framing;
 pub mod narrow_fsk;
 pub mod wideband_lowdensity;
