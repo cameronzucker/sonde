@@ -38,11 +38,12 @@ pub struct SymbolRec {
     pub sample_end: usize,
     pub t_start_s: f32,
     pub t_end_s: f32,
-    /// The payload bytes this symbol is intended to carry (ground truth /
-    /// transmitted bytes from the encoded stream).
+    /// The payload bytes this symbol carries (ground truth / TX side), by
+    /// first-bit attribution over the coded framing — see `link::build_symbols`.
     pub bytes: Vec<u8>,
-    /// The bytes actually DECODED for this symbol on the RX side (same length
-    /// as `bytes` when decode succeeded; empty when the frame failed to sync).
+    /// The recovered payload bytes attributed to this symbol's range on the RX
+    /// side. Equals `bytes` on a clean decode; differs (corrupted) in the
+    /// synced-but-corrupted regime; empty when the frame failed to sync/decode.
     pub rx_bytes: Vec<u8>,
     pub byte_start: usize,
     pub byte_end: usize,

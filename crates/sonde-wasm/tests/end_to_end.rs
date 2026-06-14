@@ -34,7 +34,8 @@ fn sitrep_shaped_payload_recovers_at_high_snr() {
     let r = run_link_core(&payload, &off, "floor-wblo", 80.0, "none", 7).unwrap();
     assert!(r.recovered_ok, "5 KB SITREP should recover at 80 dB");
     assert_eq!(r.ber, 0.0);
-    // ~5 KB at 9 bytes/symbol ≈ 558 symbols ≈ 30 s of audio.
+    // ~5 KB framed as 16-bit-header + payload bits at 74 bits/symbol is several
+    // hundred OFDM symbols ≈ 30 s of audio at the floor's symbol rate.
     assert!(
         r.time_to_deliver_s > 25.0 && r.time_to_deliver_s < 35.0,
         "got {} s",

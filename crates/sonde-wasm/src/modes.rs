@@ -5,7 +5,6 @@
 use crate::types::ModeInfo;
 use sonde_phy::modes::{ModeHint, ModeTable};
 use sonde_phy::ofdm_main::ofdm_params::{OfdmModeName, OfdmParams};
-use sonde_phy::robustness_floor::wideband_lowdensity::WidebandLowDensityFloor;
 
 /// Modes implemented end-to-end today.
 pub fn is_implemented(mode_id: &str) -> bool {
@@ -33,25 +32,18 @@ fn constellation(mode_id: &str) -> &'static str {
 }
 
 fn data_bytes_per_symbol(mode_id: &str) -> usize {
-    match mode_id {
-        "floor-wblo" => WidebandLowDensityFloor::new().data_bytes_per_symbol(),
+    let mode = match mode_id {
+        // The floor runs the Wide OFDM grid at BPSK (data sub-carriers / 8).
+        // Headline byte figure; the floor actually frames at the bit level —
+        // see the coded-framing path in sonde-phy.
+        "floor-wblo" | "ofdm-wide" => OfdmModeName::Wide,
         // For unimplemented OFDM modes, report the BPSK-equivalent data-carrier
         // count as a lower bound until QAM loading is known.
-        "ofdm-narrow" => {
-            OfdmParams::for_mode(OfdmModeName::Narrow)
-                .data_indices()
-                .len()
-                / 8
-        }
-        "ofdm-mid" => OfdmParams::for_mode(OfdmModeName::Mid).data_indices().len() / 8,
-        "ofdm-wide" => {
-            OfdmParams::for_mode(OfdmModeName::Wide)
-                .data_indices()
-                .len()
-                / 8
-        }
-        _ => 0,
-    }
+        "ofdm-narrow" => OfdmModeName::Narrow,
+        "ofdm-mid" => OfdmModeName::Mid,
+        _ => return 0,
+    };
+    OfdmParams::for_mode(mode).data_indices().len() / 8
 }
 
 /// Full mode catalogue for the UI.

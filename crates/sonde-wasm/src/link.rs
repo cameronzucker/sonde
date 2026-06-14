@@ -7,6 +7,7 @@ use crate::spectrogram::stft;
 use crate::types::{FieldOffsets, LinkResult, SpectrogramGrid, SymbolRec};
 use sonde_phy::audio_io::SAMPLE_RATE_HZ;
 use sonde_phy::error::PhyError;
+use sonde_phy::robustness_floor::coded_framing::{blocks_for_payload, HEADER_BITS};
 use sonde_phy::robustness_floor::wideband_lowdensity::{
     WidebandLowDensityFloor, PREAMBLE_LEN_SAMPLES,
 };
@@ -20,51 +21,57 @@ fn field_for_byte(offsets: &FieldOffsets, byte_idx: usize) -> String {
         .unwrap_or_else(|| "pad".to_string())
 }
 
-/// Build per-symbol records from the encoded byte stream ground truth.
-/// The multi-symbol frame stream is `[len_hi, len_lo, payload..., pad...]`
-/// chunked into `cap`-byte symbols, after the 192-sample preamble.
+/// Build per-symbol records that mirror the coded floor's real on-air layout.
+///
+/// The coded floor frames the payload as a global info-bit stream
+/// `[16-bit BE len][payload bits][zero pad]` (see [`coded_framing`]), then —
+/// with the demo's default rate-1 `IdentityFec` — lays `dps` info bits onto
+/// each BPSK OFDM symbol. So symbol `i` carries framed info bits
+/// `[i*dps, (i+1)*dps)`. We attribute each PAYLOAD byte to the symbol holding
+/// its first (MSB) bit, so the byte ranges the frontend paints stay contiguous
+/// and non-overlapping even though `dps` is not a multiple of 8 and individual
+/// bytes straddle two symbols.
+///
+/// NOTE: this 1-symbol-per-block, coded==info mapping is exact only for the
+/// rate-1 `IdentityFec` floor the demo uses today. A real codec (coded bits >
+/// info bits) would expand each block across more symbols and this mapping
+/// would need revisiting.
+///
+/// [`coded_framing`]: sonde_phy::robustness_floor::coded_framing
 fn build_symbols(
     payload: &[u8],
-    cap: usize,
+    dps: usize,
     symbol_size: usize,
     offsets: &FieldOffsets,
 ) -> Vec<SymbolRec> {
-    let mut stream: Vec<u8> = Vec::new();
-    stream.push((payload.len() >> 8) as u8);
-    stream.push((payload.len() & 0xff) as u8);
-    stream.extend_from_slice(payload);
-    let symbols_needed = stream.len().div_ceil(cap);
-    stream.resize(symbols_needed * cap, 0);
+    // Smallest payload-byte index whose first (MSB) bit sits at or beyond the
+    // framed-stream bit position `bit`. Payload byte k's first bit is at
+    // HEADER_BITS + k*8, so this inverts that relation.
+    let first_payload_byte = |bit: usize| bit.saturating_sub(HEADER_BITS).div_ceil(8);
 
+    let n_symbols = blocks_for_payload(payload.len(), dps);
     let sr = SAMPLE_RATE_HZ as f32;
-    let mut out = Vec::with_capacity(symbols_needed);
-    for i in 0..symbols_needed {
-        let chunk = &stream[i * cap..(i + 1) * cap];
+    let mut out = Vec::with_capacity(n_symbols);
+    for i in 0..n_symbols {
+        let byte_start = first_payload_byte(i * dps).min(payload.len());
+        let byte_end = first_payload_byte((i + 1) * dps).min(payload.len());
         let sample_start = PREAMBLE_LEN_SAMPLES + i * symbol_size;
         let sample_end = sample_start + symbol_size;
-        // Map this symbol's first non-header stream byte to a payload field.
-        let stream_byte = i * cap;
-        let payload_byte = stream_byte.saturating_sub(2);
-        let field = if stream_byte < 2 {
-            "header(framing)".to_string()
+        let field = if byte_end > byte_start {
+            field_for_byte(offsets, byte_start)
         } else {
-            field_for_byte(offsets, payload_byte)
+            // Symbol carries only the framing header and/or trailing pad bits.
+            "framing/pad".to_string()
         };
-        // Symbol 0 spends 2 of its `cap` bytes on the length header, so it
-        // carries `cap - 2` real payload bytes. Later symbols carry `cap`.
-        // Subtract the header bytes so payload ranges stay contiguous and
-        // non-overlapping (the frontend paints byte_start..byte_end).
-        let header_bytes_here = if stream_byte < 2 { 2 } else { 0 };
-        let byte_end = (payload_byte + (cap - header_bytes_here)).min(payload.len());
         out.push(SymbolRec {
             idx: i,
             sample_start,
             sample_end,
             t_start_s: sample_start as f32 / sr,
             t_end_s: sample_end as f32 / sr,
-            bytes: chunk.to_vec(),
+            bytes: payload[byte_start..byte_end].to_vec(),
             rx_bytes: Vec::new(),
-            byte_start: payload_byte,
+            byte_start,
             byte_end,
             field,
         });
@@ -130,33 +137,47 @@ pub fn run_link_core(
         )));
     }
     let floor = WidebandLowDensityFloor::new();
-    let cap = floor.data_bytes_per_symbol();
     let symbol_size = floor.symbol_size_samples();
+    // Info bits carried per BPSK OFDM symbol (one per data sub-carrier). For
+    // the rate-1 IdentityFec floor this equals the FEC block size, so one
+    // symbol == one block — see [`build_symbols`].
+    let dps = floor.params().data_indices().len();
 
-    // Encode (preamble + multi-symbol body).
+    // Encode (preamble + coded multi-symbol body).
     let tx = floor.transmit_multi_with_preamble(payload)?;
     let total_samples = tx.len();
 
     // Channel.
     let (observed_real, clean_c, observed_c) = apply_channel(&tx, snr_db, condition, seed);
 
-    // Decode (detailed: payload + per-symbol RX bytes).
-    let (recovered_ok, ber, recovered_bytes, rx_symbols): (bool, f32, Vec<u8>, Vec<Vec<u8>>) =
-        match floor.receive_multi_detailed(&observed_real) {
-            Ok(frame) => {
-                let ok = frame.payload == payload;
-                let ber = bit_error_rate(&frame.payload, payload);
-                (ok, ber, frame.payload, frame.symbols)
-            }
-            Err(_) => (false, 1.0, Vec::new(), Vec::new()),
-        };
+    // Decode the whole frame. The coded floor decodes per FEC block from soft
+    // LLRs — there is no per-symbol byte decode — so per-symbol RX bytes are
+    // attributed from the recovered payload over each symbol's byte range.
+    //   Ok(p), p == payload → clean recovery (BER 0)
+    //   Ok(p), p != payload → synced but corrupted: the length header survived
+    //                         but body bits flipped (IdentityFec never rejects)
+    //   Err(_)              → preamble miss, or a corrupted header → truncation
+    let (recovered_ok, ber, recovered_bytes) = match floor.receive_multi_with_sync(&observed_real) {
+        Ok((_start, rx)) => {
+            let ok = rx == payload;
+            let ber = bit_error_rate(&rx, payload);
+            (ok, ber, rx)
+        }
+        Err(_) => (false, 1.0, Vec::new()),
+    };
 
     let measured_snr_db = mean_band_snr(&clean_c, &observed_c);
 
-    let mut symbols = build_symbols(payload, cap, symbol_size, offsets);
-    // Attach per-symbol RX bytes (aligned by index; empty when sync failed).
-    for (i, sym) in symbols.iter_mut().enumerate() {
-        sym.rx_bytes = rx_symbols.get(i).cloned().unwrap_or_default();
+    let mut symbols = build_symbols(payload, dps, symbol_size, offsets);
+    // Attach per-symbol RX bytes: slice the recovered payload over each
+    // symbol's byte range (empty when sync/decode failed, or when the recovered
+    // payload is shorter than this symbol's range).
+    for sym in symbols.iter_mut() {
+        if !recovered_bytes.is_empty() {
+            let end = sym.byte_end.min(recovered_bytes.len());
+            let start = sym.byte_start.min(end);
+            sym.rx_bytes = recovered_bytes[start..end].to_vec();
+        }
     }
     let sr = SAMPLE_RATE_HZ as f32;
     let time_to_deliver_s = total_samples as f32 / sr;
@@ -218,8 +239,10 @@ mod tests {
         assert!(r.recovered_ok, "should recover at 80 dB");
         assert_eq!(r.ber, 0.0);
         assert!(r.throughput_bps > 0.0);
-        // Symbols cover the whole payload + 2-byte header at 9 bytes/symbol.
-        let expected_symbols = (payload.len() + 2).div_ceil(9);
+        // One symbol per FEC block (rate-1 IdentityFec floor); the symbol count
+        // matches the floor's own framing of the 16-bit header + payload bits.
+        let dps = WidebandLowDensityFloor::new().params().data_indices().len();
+        let expected_symbols = blocks_for_payload(payload.len(), dps);
         assert_eq!(r.symbols.len(), expected_symbols);
         assert_eq!(r.symbol_size_samples, 2560);
     }
@@ -248,14 +271,18 @@ mod tests {
 
     #[test]
     fn symbol_payload_ranges_are_contiguous_and_nonoverlapping() {
-        // 20-byte payload -> stream = 2 header + 20 = 22 bytes -> ceil(22/9)=3 symbols.
+        // 20-byte payload: framed stream = 16-bit header + 160 payload bits =
+        // 176 bits -> ceil(176/74) = 3 symbols.
         let payload: Vec<u8> = (0..20).map(|i| i as u8).collect();
         let off = offsets_for(payload.len());
         let r = run_link_core(&payload, &off, "floor-wblo", 80.0, "none", 1).unwrap();
-        // Symbol 0 carries cap-2 = 7 payload bytes; later symbols carry 9.
+        // Symbol 0 spends its first 16 bits on the length header, leaving 58
+        // bits = payload bytes 0..8 (byte 7's first bit, at 72, still lands in
+        // symbol 0's [0,74) window even though the byte straddles into symbol 1).
         assert_eq!(r.symbols[0].byte_start, 0);
-        assert_eq!(r.symbols[0].byte_end, 7);
-        // Contiguous, non-overlapping across all symbols.
+        assert_eq!(r.symbols[0].byte_end, 8);
+        // Contiguous, non-overlapping across all symbols (each byte attributed
+        // to the symbol holding its first bit).
         for w in r.symbols.windows(2) {
             assert_eq!(w[0].byte_end, w[1].byte_start, "ranges must be contiguous");
         }
