@@ -32,7 +32,11 @@ pub fn apply_channel(
     let mut observed = if condition == "none" {
         clean.clone()
     } else {
-        let mut chan = WattersonChannel::from_condition(seed, parse_condition(condition), SAMPLE_RATE_HZ as f64);
+        let mut chan = WattersonChannel::from_condition(
+            seed,
+            parse_condition(condition),
+            SAMPLE_RATE_HZ as f64,
+        );
         chan.process_block(&clean)
     };
 
@@ -56,7 +60,11 @@ mod tests {
         // loose tolerance (multipath rotates phase but conserves power).
         let e_in: f32 = samples.iter().map(|s| s * s).sum();
         let e_out: f32 = observed.iter().map(|s| s * s).sum();
-        assert!((e_out / e_in - 1.0).abs() < 0.5, "energy ratio {}", e_out / e_in);
+        assert!(
+            (e_out / e_in - 1.0).abs() < 0.5,
+            "energy ratio {}",
+            e_out / e_in
+        );
     }
 
     #[test]
@@ -67,7 +75,12 @@ mod tests {
         let e_lo: f32 = o_lo.iter().map(|s| s * s).sum();
         let e_sig: f32 = samples.iter().map(|s| s * s).sum();
         // At -5 dB, noise power should exceed signal power.
-        assert!(e_lo > e_sig, "low-snr energy {} should exceed signal {}", e_lo, e_sig);
+        assert!(
+            e_lo > e_sig,
+            "low-snr energy {} should exceed signal {}",
+            e_lo,
+            e_sig
+        );
     }
 
     #[test]

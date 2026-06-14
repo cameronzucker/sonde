@@ -45,7 +45,11 @@ fn build_symbols(
         // Map this symbol's first non-header stream byte to a payload field.
         let stream_byte = i * cap;
         let payload_byte = stream_byte.saturating_sub(2);
-        let field = if stream_byte < 2 { "header(framing)".to_string() } else { field_for_byte(offsets, payload_byte) };
+        let field = if stream_byte < 2 {
+            "header(framing)".to_string()
+        } else {
+            field_for_byte(offsets, payload_byte)
+        };
         // Symbol 0 spends 2 of its `cap` bytes on the length header, so it
         // carries `cap - 2` real payload bytes. Later symbols carry `cap`.
         // Subtract the header bytes so payload ranges stay contiguous and
@@ -72,13 +76,20 @@ fn bit_error_rate(a: &[u8], b: &[u8]) -> f32 {
     if n == 0 {
         return 1.0;
     }
-    let diff_bits: u64 = a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones() as u64).sum();
+    let diff_bits: u64 = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| (x ^ y).count_ones() as u64)
+        .sum();
     // Count missing bytes (length mismatch) as fully errored.
     let extra = (a.len().max(b.len()) - n) as u64 * 8;
     (diff_bits + extra) as f32 / ((a.len().max(b.len())) as f32 * 8.0)
 }
 
-fn mean_band_snr(clean: &[num_complex::Complex<f32>], observed: &[num_complex::Complex<f32>]) -> f32 {
+fn mean_band_snr(
+    clean: &[num_complex::Complex<f32>],
+    observed: &[num_complex::Complex<f32>],
+) -> f32 {
     use hf_channel_sim::estimate_subcarrier_snr;
     let fft_size = 2048usize;
     let n = (clean.len().min(observed.len()) / fft_size) * fft_size;
@@ -163,9 +174,21 @@ mod tests {
         FieldOffsets {
             total_len: len,
             fields: vec![
-                Field { label: "header".into(), start: 0, end: len / 3 },
-                Field { label: "body".into(), start: len / 3, end: 2 * len / 3 },
-                Field { label: "image".into(), start: 2 * len / 3, end: len },
+                Field {
+                    label: "header".into(),
+                    start: 0,
+                    end: len / 3,
+                },
+                Field {
+                    label: "body".into(),
+                    start: len / 3,
+                    end: 2 * len / 3,
+                },
+                Field {
+                    label: "image".into(),
+                    start: 2 * len / 3,
+                    end: len,
+                },
             ],
             image_byte_len: len / 3,
         }
@@ -199,7 +222,10 @@ mod tests {
         let off = offsets_for(payload.len());
         let r = run_link_core(&payload, &off, "floor-wblo", 80.0, "none", 1).unwrap();
         assert!(r.spectrogram.cols <= 400);
-        assert_eq!(r.spectrogram.mag_q.len(), r.spectrogram.rows * r.spectrogram.cols);
+        assert_eq!(
+            r.spectrogram.mag_q.len(),
+            r.spectrogram.rows * r.spectrogram.cols
+        );
         // Lowest freq row >= ~250 Hz band edge.
         assert!(*r.spectrogram.freqs_hz.first().unwrap() >= 200.0);
     }

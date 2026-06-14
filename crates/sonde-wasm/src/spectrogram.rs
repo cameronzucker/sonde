@@ -95,7 +95,13 @@ pub fn stft(
         .map(|&v| (((v - lo) / span) * 255.0).round().clamp(0.0, 255.0) as u8)
         .collect();
 
-    SpectrogramGrid { rows, cols, freqs_hz, times_s, mag_q }
+    SpectrogramGrid {
+        rows,
+        cols,
+        freqs_hz,
+        times_s,
+        mag_q,
+    }
 }
 
 #[cfg(test)]

@@ -37,9 +37,19 @@ fn data_bytes_per_symbol(mode_id: &str) -> usize {
         "floor-wblo" => WidebandLowDensityFloor::new().data_bytes_per_symbol(),
         // For unimplemented OFDM modes, report the BPSK-equivalent data-carrier
         // count as a lower bound until QAM loading is known.
-        "ofdm-narrow" => OfdmParams::for_mode(OfdmModeName::Narrow).data_indices().len() / 8,
+        "ofdm-narrow" => {
+            OfdmParams::for_mode(OfdmModeName::Narrow)
+                .data_indices()
+                .len()
+                / 8
+        }
         "ofdm-mid" => OfdmParams::for_mode(OfdmModeName::Mid).data_indices().len() / 8,
-        "ofdm-wide" => OfdmParams::for_mode(OfdmModeName::Wide).data_indices().len() / 8,
+        "ofdm-wide" => {
+            OfdmParams::for_mode(OfdmModeName::Wide)
+                .data_indices()
+                .len()
+                / 8
+        }
         _ => 0,
     }
 }
@@ -47,10 +57,20 @@ fn data_bytes_per_symbol(mode_id: &str) -> usize {
 /// Full mode catalogue for the UI.
 pub fn list_modes() -> Vec<ModeInfo> {
     // ModeTable has no public iterator; enumerate the known ids in ladder order.
-    let ids = ["floor-wblo", "ofdm-narrow", "ofdm-mid", "ofdm-wide", "floor-nfsk"];
+    let ids = [
+        "floor-wblo",
+        "ofdm-narrow",
+        "ofdm-mid",
+        "ofdm-wide",
+        "floor-nfsk",
+    ];
     ids.iter()
         .map(|&id| {
-            let family = if id.starts_with("ofdm") { "OfdmMain" } else { "RobustnessFloor" };
+            let family = if id.starts_with("ofdm") {
+                "OfdmMain"
+            } else {
+                "RobustnessFloor"
+            };
             ModeInfo {
                 id: id.to_string(),
                 family: family.to_string(),
