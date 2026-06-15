@@ -22,6 +22,15 @@ use rustfft::FftPlanner;
 /// level. `2.0 = 20 · 0.1` reproduces the legacy clamp exactly at `n0 = 0.1`.
 const LLR_CLAMP_NUM: f32 = 2.0;
 
+/// Centered triangular kernel for time-smoothing the pilot channel observations
+/// across consecutive OFDM symbols (see [`OfdmReceiver::demodulate_frame`],
+/// sonde-vb9). Span 9 symbols ≈ 0.48 s @ 53 ms/symbol: ~8 dB pilot-noise
+/// reduction on a static channel while attenuating a 1 Hz Doppler only ≈ −2 dB,
+/// safe for the floor's ≤1 Hz coherence. The weights need not pre-sum to 1 —
+/// `demodulate_frame` renormalizes by whatever weights fall in-range, so the
+/// estimate stays unbiased at the frame edges.
+const PILOT_TIME_SMOOTH_KERNEL: [f32; 9] = [1.0, 2.0, 3.0, 4.0, 5.0, 4.0, 3.0, 2.0, 1.0];
+
 /// Guard, in FFT bins, kept clear around the occupied band, its real-signal
 /// mirror, DC, and Nyquist when sampling the noise floor. 8 bins (~190 Hz @
 /// FFT 2048) clears soft-clip / windowing spectral leakage at the band edges.
@@ -211,43 +220,159 @@ impl<'a> OfdmReceiver<'a> {
     /// `bits_per_subcarrier` follows the same indexing as the
     /// transmitter side.
     pub fn demodulate_one_symbol(&self, samples: &[f32], bits_per_subcarrier: &[u8]) -> Vec<f32> {
+        self.llrs_from_freq(&self.symbol_fft(samples), bits_per_subcarrier)
+    }
+
+    /// Demodulate a whole frame of CONSECUTIVE OFDM symbols, time-smoothing the
+    /// pilot channel observations across symbols before each symbol's
+    /// equalization. Returns one LLR vector per input symbol, in order.
+    ///
+    /// Per-symbol pilot estimation is too noisy at the coded path's low
+    /// per-symbol SNR (a rate-1/4 code spreads each info bit over 4 symbols, so
+    /// every coded symbol sits ~6 dB below the uncoded per-symbol SNR) — the
+    /// dominant ~4 dB loss behind sonde-vb9. But the HF floor's channel is
+    /// slowly varying (Doppler ≤1 Hz ⇒ coherence ≥1 s ≫ the 53 ms symbol), so
+    /// the pilot at a given bin is nearly constant across neighbouring symbols.
+    /// A short centered triangular time-average ([`PILOT_TIME_SMOOTH_KERNEL`])
+    /// therefore cuts pilot-estimate noise ~8 dB while attenuating ≤1 Hz Doppler
+    /// only ~2 dB. The thermal-noise estimate stays per-symbol (the empty bins
+    /// the smoothing never touches), so it still tracks nonstationary noise.
+    pub fn demodulate_frame(
+        &self,
+        symbols: &[&[f32]],
+        bits_per_subcarrier: &[u8],
+    ) -> Vec<Vec<f32>> {
+        let freqs: Vec<Vec<Complex<f32>>> = symbols.iter().map(|s| self.symbol_fft(s)).collect();
+        let n_sym = freqs.len();
+        if n_sym == 0 {
+            return Vec::new();
+        }
+        let p = self.params;
+        let pilots = p.pilot_indices();
+        let half = (PILOT_TIME_SMOOTH_KERNEL.len() / 2) as isize;
+        // Per-symbol thermal noise (empty-bin estimate), measured on the RAW FFTs
+        // before any pilot substitution — it drives the adaptive blend's noise
+        // model below.
+        let n0: Vec<f32> = freqs
+            .iter()
+            .map(|f| estimate_noise_variance(f, p))
+            .collect();
+        (0..n_sym)
+            .map(|t| {
+                let mut freq = freqs[t].clone();
+                for &pbin in pilots {
+                    freq[pbin] = self.blend_pilot(&freqs, &n0, t, pbin, half, n_sym);
+                }
+                self.llrs_from_freq(&freq, bits_per_subcarrier)
+            })
+            .collect()
+    }
+
+    /// Innovation-gated LMMSE blend of the per-symbol pilot `h_raw = freq[t][p]`
+    /// with its centered triangular time-average `h_smooth` (sonde-vb9, Codex
+    /// round 3). The blend weight separates "noisy but STATIC" (→ smooth, the
+    /// low-SNR coding-gain win) from "the channel is MOVING" (→ trust raw, no
+    /// fading smear):
+    ///
+    /// ```text
+    /// smear = max(|h_raw − h_smooth|² − var(h_raw − h_smooth | noise), 0)
+    /// β     = clamp((var_raw − cov) / (var_diff + smear), 0, 1)
+    /// h_used = h_raw + β·(h_smooth − h_raw)
+    /// ```
+    ///
+    /// `smear` is the part of the raw-vs-smoothed disagreement NOT explained by
+    /// thermal noise — i.e. real channel motion. Static + noisy ⇒ `smear≈0`,
+    /// `β→1` (full smoothing); fading ⇒ `smear` large, `β→0` (raw per-symbol, the
+    /// original demod, so high-SNR Watterson is untouched). Using `var`/`smear`
+    /// (not `|h_smooth|²/n0`) avoids the trap that coherent smoothing ATTENUATES
+    /// `h_smooth` under fading and would otherwise smooth hardest exactly when it
+    /// must not.
+    #[allow(clippy::too_many_arguments)]
+    fn blend_pilot(
+        &self,
+        freqs: &[Vec<Complex<f32>>],
+        n0: &[f32],
+        t: usize,
+        pbin: usize,
+        half: isize,
+        n_sym: usize,
+    ) -> Complex<f32> {
+        let mut h_sum = Complex::new(0.0, 0.0);
+        let mut wsum = 0.0_f32;
+        let mut var_smooth_num = 0.0_f32; // Σ wᵢ²·n0ᵢ  (before /wsum²)
+        let mut center_w = 0.0_f32;
+        for (k, &w) in PILOT_TIME_SMOOTH_KERNEL.iter().enumerate() {
+            let tt = t as isize + k as isize - half;
+            if tt >= 0 && (tt as usize) < n_sym {
+                let tt = tt as usize;
+                h_sum += freqs[tt][pbin] * w;
+                wsum += w;
+                var_smooth_num += w * w * n0[tt];
+                if (k as isize) == half {
+                    center_w = w;
+                }
+            }
+        }
+        let h_raw = freqs[t][pbin];
+        if wsum <= center_w {
+            return h_raw; // only the center tap in range — nothing to average
+        }
+        let h_smooth = h_sum / wsum;
+        let a_center = center_w / wsum; // normalized center weight
+        let var_raw = n0[t];
+        let var_smooth = var_smooth_num / (wsum * wsum);
+        let cov = a_center * var_raw; // shared center-tap noise
+        let var_diff = (var_raw + var_smooth - 2.0 * cov).max(0.0);
+        let innovation = (h_raw - h_smooth).norm_sqr();
+        let smear = (innovation - var_diff).max(0.0);
+        let beta = ((var_raw - cov) / (var_diff + smear + 1e-20)).clamp(0.0, 1.0);
+        h_raw + (h_smooth - h_raw) * beta
+    }
+
+    /// CP-strip → forward FFT → unitary scale: one symbol's time samples to its
+    /// frequency bins. `samples.len()` must equal `fft_size + cp_len`.
+    fn symbol_fft(&self, samples: &[f32]) -> Vec<Complex<f32>> {
         let p = self.params;
         let expected = p.fft_size() + p.cp_len();
         assert_eq!(samples.len(), expected, "OFDM RX symbol length mismatch");
-
-        // Drop CP, promote to complex baseband for FFT.
-        let body: Vec<Complex<f32>> = samples[p.cp_len()..]
+        let mut freq: Vec<Complex<f32>> = samples[p.cp_len()..]
             .iter()
             .map(|s| Complex::new(*s, 0.0))
             .collect();
         let mut planner = FftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(p.fft_size());
-        let mut freq = body;
         fft.process(&mut freq);
         let scale = 1.0 / (p.fft_size() as f32).sqrt();
         for c in freq.iter_mut() {
             *c *= scale;
         }
+        freq
+    }
 
+    /// Per-bit LLRs across the data sub-carriers from an already-FFT'd symbol
+    /// `freq`. The pilot bins in `freq` are the channel-estimation reference, so
+    /// a caller that has time-smoothed them ([`Self::demodulate_frame`]) gets a
+    /// correspondingly less-noisy channel estimate for free.
+    fn llrs_from_freq(&self, freq: &[Complex<f32>], bits_per_subcarrier: &[u8]) -> Vec<f32> {
+        let p = self.params;
         // Estimate the per-bin complex channel from the pilots (with edge
         // extrapolation). We do NOT zero-force: ZF normalizes every bin to the
         // constellation scale and so discards the per-subcarrier reliability
         // |h|² that the soft decoder needs to ride out a frequency-selective
         // null. Instead we feed (y, h) straight to the channel-aware LLR.
         let eq = OfdmEqualizer::new(p.pilot_indices().to_vec(), p.fft_size());
-        let chan_est = eq.estimate_channel(&freq);
+        let chan_est = eq.estimate_channel(freq);
 
-        // Per-bin effective noise `n0_eff[k] = n0_thermal + var(e)` (replaces the
-        // legacy hardcoded n0=0.1, which only decoded above ~Eb/N0 25 dB). The
-        // thermal term tracks the real operating SNR (the low-SNR win); the
-        // channel-estimate-error term keeps nulled sub-carriers near-erasures at
-        // high SNR (see `effective_noise_per_bin`). The fixed override (gate
-        // control / diagnostics) uses a flat n0, reproducing the legacy demod.
+        // Per-bin effective noise `n0_eff[k] = n0_thermal + var(e)`. The thermal
+        // term tracks the real operating SNR; the channel-estimate-error term
+        // keeps nulled sub-carriers near-erasures at high SNR (see
+        // `effective_noise_per_bin`). The fixed override reproduces the legacy
+        // flat-n0 demod for gate control / diagnostics.
         let n0_eff: Vec<f32> = match self.n0_override {
             Some(n0) => vec![n0; freq.len()],
             None => {
-                let n0_thermal = estimate_noise_variance(&freq, p);
-                effective_noise_per_bin(&freq, p, n0_thermal)
+                let n0_thermal = estimate_noise_variance(freq, p);
+                effective_noise_per_bin(freq, p, n0_thermal)
             }
         };
 

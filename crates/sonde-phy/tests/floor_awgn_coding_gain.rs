@@ -21,6 +21,34 @@ use rand_chacha::ChaCha8Rng;
 use sonde_fec::codec::FloorRate14Codec;
 use sonde_phy::robustness_floor::wideband_lowdensity::WidebandLowDensityFloor;
 
+/// Regression guard for the sonde-vb9 fix (NOT ignored — runs in CI). Through
+/// the production `receive_multi` path over flat AWGN, the rate-1/4 coded floor
+/// must decode at an operating Eb/N0 where the per-symbol-pilot demod could not
+/// (it needed ~12 dB; the time-smoothed estimate decodes by ~6 dB). Asserting at
+/// 8 dB with a comfortable margin locks the ~4–6 dB recovery without flaking.
+#[test]
+fn coded_decodes_over_awgn_at_operating_point() {
+    let payload_bytes = 58usize; // exactly one FloorRate14 block (480 info bits)
+    let info_bits = payload_bytes * 8;
+    let frames = 12usize;
+    let ebn0_db = 8.0_f32;
+    let mut rng = ChaCha8Rng::seed_from_u64(0x00B9_0000_0008_u64);
+    let coded = WidebandLowDensityFloor::with_fec(Box::new(FloorRate14Codec::new()));
+    let ok = (0..frames)
+        .filter(|_| {
+            let payload: Vec<u8> = (0..payload_bytes).map(|_| rng.gen()).collect();
+            let tx = coded.transmit_multi(&payload).unwrap();
+            let rx = add_awgn(&tx, info_bits, ebn0_db, &mut rng);
+            matches!(coded.receive_multi(&rx), Ok(p) if p == payload)
+        })
+        .count();
+    assert!(
+        ok >= 10,
+        "rate-1/4 coded floor decoded only {ok}/{frames} at Eb/N0={ebn0_db} dB over flat AWGN \
+         — the sonde-vb9 pilot-smoothing recovery regressed (pre-fix this point was ~0)"
+    );
+}
+
 fn gaussian(rng: &mut ChaCha8Rng) -> f32 {
     let u1: f32 = rng.gen_range(1e-9_f32..1.0);
     let u2: f32 = rng.gen_range(0.0_f32..1.0);

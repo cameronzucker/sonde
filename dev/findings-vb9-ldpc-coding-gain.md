@@ -1,7 +1,7 @@
 # sonde-vb9 investigation: the "LDPC coding gain" bug is a PHY channel-estimation bug
 
 **Agent:** bison-slate-gorge · **Date:** 2026-06-14 · **Status:** root cause
-confirmed + fix design Codex-converged; fix NOT yet implemented.
+confirmed, fix implemented + verified (see "FIX IMPLEMENTED" below).
 
 ## TL;DR
 
@@ -88,3 +88,37 @@ PHY overhead + margin), NOT the codec-only 3 dB.
   stated coded operating point should be ~5.5–6 dB, not 3 dB.
 - The fix touches the demod the Watterson fading gate rides — regression-test the
   fading gate (the smoother must not smear ≤1 Hz Doppler).
+
+## FIX IMPLEMENTED (bison-slate-gorge, Codex round 3)
+
+Frame-level pilot channel estimation with an **innovation-gated LMMSE time
+blend** (`OfdmReceiver::demodulate_frame` + `blend_pilot`, `receive_multi` calls
+it per coded block). Each pilot bin blends the noisy per-symbol observation
+`h_raw` with its centered triangular time-average `h_smooth`:
+
+```text
+smear = max(|h_raw − h_smooth|² − var(h_raw − h_smooth | noise), 0)
+β     = clamp((var_raw − cov) / (var_diff + smear), 0, 1)
+h_used = h_raw + β·(h_smooth − h_raw)
+```
+
+`smear` (innovation beyond what thermal noise explains) = real channel motion.
+Static+noisy ⇒ β→1 (full smoothing, the low-SNR coding-gain win); moving ⇒ β→0
+(raw per-symbol, so high-SNR fading is untouched). A naive `|h_smooth|²/n0` SNR
+weight was rejected — coherent smoothing attenuates `h_smooth` under fading and
+would smooth hardest exactly when it must not (Codex round 3).
+
+### Verified
+- **Flat AWGN (production `receive_multi`):** coded threshold ~12 dB → **~6 dB**;
+  coded FER 0 @8 dB where uncoded FER is still 1.0. Regression guard
+  `coded_decodes_over_awgn_at_operating_point` (CI, 4 s) locks ≥10/12 @8 dB.
+- **Watterson fading (`noise_estimate_gate` @25 dB):** estimated-n0 **16/16**
+  (no regression; a fixed-strength smoother had crashed it to 3/16), still beats
+  fixed-0.1 (13/16) by the required ≥3 margin.
+- Full workspace `build/test/clippy(-D warnings)/fmt` green.
+
+### Deliberately NOT done
+- Did **not** re-point the `noise_estimate_gate` 25 dB operating point — it now
+  guards exactly this high-SNR fading regression (Codex). A separate low-Eb/N0
+  coded-gain gate (chosen from the Watterson curve, not the flat-AWGN 6 dB) is
+  follow-up for Step 3 / `sonde-xhw.4`.

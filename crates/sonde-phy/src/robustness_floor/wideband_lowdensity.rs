@@ -208,13 +208,39 @@ impl WidebandLowDensityFloor {
         tx.modulate_one_symbol(&sym_bits, &bits_per_sc)
     }
 
-    /// Demodulate one OFDM symbol to soft LLRs (one per data
-    /// sub-carrier; positive ⇒ bit 0). LLRs are NOT hard-decided here —
-    /// the soft values flow straight to `FecCodec::decode_soft`.
-    fn demodulate_coded_symbol(&self, samples: &[f32]) -> Vec<f32> {
+    /// Demodulate the `spb` OFDM symbols of one coded block (starting at sample
+    /// `base`) to per-symbol soft LLRs, TIME-SMOOTHING the pilot channel estimate
+    /// across just those symbols ([`OfdmReceiver::demodulate_frame`]). LLRs are
+    /// NOT hard-decided here — the soft values flow straight to
+    /// `FecCodec::decode_soft`.
+    ///
+    /// Frame-level (not per-symbol) demod is the fix for sonde-vb9: the floor's
+    /// channel is slowly varying, so averaging each pilot across neighbouring
+    /// symbols recovers the ~4 dB the independent per-symbol estimate threw away
+    /// at the coded path's low per-symbol SNR. Smoothing is scoped to the BLOCK's
+    /// own symbols (not the whole capture) so trailing non-signal symbols — the
+    /// key-up tail / appended silence past the frame — can never bleed a noise-
+    /// only pilot into a real symbol's estimate.
+    ///
+    /// Returns `FrameDetect` if the block's symbols run past `samples`.
+    fn demodulate_block_symbols(
+        &self,
+        samples: &[f32],
+        base: usize,
+        spb: usize,
+    ) -> Result<Vec<Vec<f32>>, PhyError> {
+        let sym = self.symbol_size_samples();
+        let mut slices: Vec<&[f32]> = Vec::with_capacity(spb);
+        for s in 0..spb {
+            let start = base + s * sym;
+            if start + sym > samples.len() {
+                return Err(PhyError::FrameDetect("coded block truncated".into()));
+            }
+            slices.push(&samples[start..start + sym]);
+        }
         let bits_per_sc = self.bits_per_subcarrier();
         let rx = OfdmReceiver::with_n0_override(&self.params, self.n0_override);
-        rx.demodulate_one_symbol(samples, &bits_per_sc)
+        Ok(rx.demodulate_frame(&slices, &bits_per_sc))
     }
 
     /// Modulate one OFDM symbol carrying `payload` through the coded
@@ -326,15 +352,15 @@ impl WidebandLowDensityFloor {
                 spb
             )));
         }
+        // Per block: time-smooth the pilot channel estimate across the block's
+        // own symbols (sonde-vb9), then assemble + decode. Scoping the smoothing
+        // to the block keeps trailing non-signal symbols out of the average.
         let decode_block = |blk: usize| -> Result<Vec<u8>, PhyError> {
             let base = blk * spb * sym;
+            let per_sym = self.demodulate_block_symbols(samples, base, spb)?;
             let mut llrs = Vec::with_capacity(spb * dps);
-            for s in 0..spb {
-                let start = base + s * sym;
-                if start + sym > samples.len() {
-                    return Err(PhyError::FrameDetect("coded block truncated".into()));
-                }
-                llrs.extend_from_slice(&self.demodulate_coded_symbol(&samples[start..start + sym]));
+            for sym_llrs in &per_sym {
+                llrs.extend_from_slice(sym_llrs);
             }
             llrs.truncate(block_coded);
             self.fec
