@@ -354,6 +354,74 @@ body {
 .console__stream::-webkit-scrollbar { width: 8px; }
 .console__stream::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 8px; }
 
+/* ── Frame decode log (ARDOP per-frame results) ─────────────────────────── */
+.flip #frame-log-stat { color: var(--teal); font-weight: 600; }
+.flog { background: var(--panel-1); display: flex; flex-direction: column; flex: 1; min-width: 0; }
+.flog__bar {
+  font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.05em;
+  color: var(--muted); padding: 11px 16px; border-bottom: 1px solid var(--line);
+}
+.flog__stream {
+  font-family: var(--font-mono); font-size: 12.5px; line-height: 1.6;
+  padding: 8px 16px; height: 230px; overflow-y: auto;
+}
+.flog__row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 4px 0; border-bottom: 1px dashed var(--line);
+}
+.flog__row--fail { opacity: 0.85; }
+.flog__idx { color: var(--faint); min-width: 34px; }
+.flog__pill { font-weight: 600; font-size: 11px; padding: 2px 8px; border-radius: 4px; letter-spacing: 0.08em; }
+.flog__pill--pass { color: var(--green-ok); background: rgba(68,209,141,0.13); }
+.flog__pill--fail { color: var(--red); background: rgba(255,93,93,0.16); }
+.flog__meta { color: var(--muted); }
+.flog__meta--lost { color: var(--red); font-style: italic; }
+.flog__stream::-webkit-scrollbar { width: 8px; }
+.flog__stream::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 8px; }
+
+/* ── Run-session button (primary action in the control panel) ───────────── */
+.ctl__note { font-size: 11.5px; line-height: 1.5; color: var(--faint); margin: 9px 2px 0; }
+.runbtn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 10px;
+  width: 100%; margin-top: 14px;
+  font-family: var(--font-display); font-weight: 600; font-size: 14px;
+  padding: 13px 22px; border-radius: var(--radius-s); cursor: pointer;
+  color: #05201d; border: 0;
+  background: linear-gradient(180deg, var(--teal), var(--teal-deep));
+  box-shadow: 0 0 18px rgba(47, 212, 196, 0.3);
+  transition: transform 0.12s, box-shadow 0.16s, opacity 0.16s;
+}
+.runbtn:hover { transform: translateY(-1px); box-shadow: 0 0 26px rgba(47, 212, 196, 0.45); }
+.runbtn:active { transform: translateY(0); }
+.runbtn:disabled {
+  opacity: 0.6; cursor: progress; transform: none; box-shadow: none;
+  background: linear-gradient(180deg, #1c2a39, #16212f); color: var(--muted);
+}
+.runbtn__glyph { font-size: 15px; }
+
+/* ── Connection / ARQ log (connected-mode protocol timeline) ─────────────── */
+.flip #session-progress { color: var(--teal); font-weight: 600; }
+.slog__row {
+  display: flex; align-items: center; gap: 11px;
+  padding: 4px 0; border-bottom: 1px dashed var(--line);
+}
+.slog__row--fail { opacity: 0.9; }
+.slog__pill {
+  font-family: var(--font-mono); font-weight: 600; font-size: 10.5px;
+  padding: 2px 7px; border-radius: 4px; letter-spacing: 0.08em;
+  min-width: 42px; text-align: center; flex: none;
+}
+.slog__pill--call { color: var(--ink); background: rgba(150,178,208,0.14); }
+.slog__pill--link { color: var(--muted); background: rgba(150,178,208,0.10); }
+.slog__pill--conn { color: var(--green-ok); background: rgba(68,209,141,0.14); }
+.slog__pill--rate { color: var(--amber); background: rgba(255,157,66,0.15); }
+.slog__pill--arq  { color: var(--teal); background: rgba(47,212,196,0.14); }
+.slog__pill--ok   { color: var(--green-ok); background: rgba(68,209,141,0.18); }
+.slog__pill--fail { color: var(--red); background: rgba(255,93,93,0.16); }
+.slog__pill--info { color: var(--faint); background: rgba(150,178,208,0.07); }
+.slog__text { color: var(--muted); flex: 1; min-width: 0; }
+.slog__meta { color: var(--faint); font-family: var(--font-mono); font-size: 11.5px; white-space: nowrap; }
+
 /* ── Transport (contained bar, real height — not a skinny strip) ───────── */
 .panel--transport {
   flex-direction: row; align-items: center; gap: 20px;
@@ -469,4 +537,102 @@ body {
   .panel--transport { flex-wrap: wrap; }
   .transport__track { order: 3; flex-basis: 100%; }
   .masthead { padding-bottom: 16px; }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   COCKPIT — live, compact, single-screen-ish layout (sonde-imh.2)
+   Goal: the interactive parts fit a laptop viewport WITHOUT clipping. The trick
+   is NOT a rigid 100vh box with overflow:hidden (that clips pane contents) — it's
+   sizing each pane's BODY with viewport-relative clamps so the contents actually
+   shrink to fit. Nothing is ever clipped; on a short viewport it scrolls a little.
+   ═══════════════════════════════════════════════════════════════════════════ */
+.cockpit {
+  position: relative; z-index: 1; box-sizing: border-box;
+  height: 100vh; max-width: 1720px; margin: 0 auto;
+  display: flex; flex-direction: column; gap: 9px;
+  padding: 9px 16px;
+}
+
+/* Thin live status strip (replaces the bulky STATUS pane). */
+.statusbar {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 10px;
+  padding: 5px 13px; border: 1px solid var(--line); border-radius: var(--radius-s);
+  background: rgba(47, 212, 196, 0.05); min-width: 0;
+}
+.statusbar__tag { font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.2em; color: var(--teal); flex: 0 0 auto; }
+.statusbar .adaptation__text { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ── Topbar ── */
+.topbar { display: flex; align-items: center; gap: 10px 20px; flex-wrap: wrap; padding: 0; }
+.topbar .wordmark { gap: 10px; }
+.topbar .wordmark__sub { font-size: 8.5px; }
+.topbar .chip { margin-left: 4px; font-size: 9.5px; padding: 5px 9px; }
+.topbar__levers { display: flex; align-items: flex-end; gap: 16px; flex: 1 1 440px; flex-wrap: wrap; }
+.topbar__actions { display: flex; align-items: center; gap: 10px; }
+.lever { display: flex; flex-direction: column; gap: 5px; }
+.lever--snr { min-width: 180px; flex: 1 1 200px; }
+.lever__label {
+  font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--muted);
+  display: flex; justify-content: space-between; gap: 10px; align-items: baseline;
+}
+.lever__val { color: var(--teal); font-weight: 600; font-size: 12px; }
+.topbar .slider { margin: 0; }
+.topbar .segmented { padding: 3px; gap: 3px; }
+.topbar .seg { padding: 5px 8px; font-size: 11px; }
+/* Fixed width + nowrap so the label swap on click can't widen the button and
+   reflow (wrap) the topbar — that was doubling the header height. */
+.runbtn { margin: 0; min-width: 12rem; padding: 10px 20px; justify-content: center; white-space: nowrap; }
+
+/* ── Main fills the rest of the viewport; both columns stretch to its height ── */
+.cockpit__main { flex: 1; min-height: 0; display: grid; grid-template-columns: 1.62fr 1fr; gap: 10px; }
+.cockpit__left  { display: flex; flex-direction: column; gap: 10px; min-width: 0; min-height: 0; }
+.cockpit__right { display: flex; flex-direction: column; gap: 10px; min-width: 0; min-height: 0; }
+.cockpit .panel { margin: 0; animation: none; min-height: 0; }
+
+/* LEFT: waterfall (grows) + ARQ log (grows under it, scrolls) fill the column. */
+.cockpit__left .panel--hero { flex: 1.5 1 0; min-height: 0; }
+.cockpit__left .panel--console { flex: 1 1 0; min-height: 0; }
+/* RIGHT: telemetry natural height; recon fills the rest. */
+.cockpit__right .panel--stats { flex: 0 0 auto; }
+.cockpit__right .panel--recon { flex: 1 1 0; min-height: 0; }
+
+/* Compact pane chrome. */
+.cockpit .panel__head { padding: 8px 13px; flex: 0 0 auto; }
+.cockpit .panel__title { font-size: 12.5px; gap: 9px; }
+.cockpit .panel__title .idx { padding: 1px 5px; font-size: 10px; }
+.cockpit .panel__hint { font-size: 10px; }
+
+/* Hero waterfall fills its panel (the canvas resizes via ResizeObserver). */
+.cockpit .panel--hero .stage { flex: 1; height: auto; min-height: 0; margin: 9px; }
+
+/* Telemetry: compact stat cells. */
+.cockpit .stats { gap: 1px; }
+.cockpit .stat { padding: 8px 11px; }
+.cockpit .stat__k { font-size: 9.5px; }
+.cockpit .stat__v { font-size: 15px; }
+.cockpit .stat__sub { font-size: 10px; }
+
+/* Connection/ARQ log fills its panel + scrolls internally. */
+.cockpit .panel--console .flog { flex: 1; min-height: 0; }
+.cockpit .panel--console .flog__stream { flex: 1; height: auto; min-height: 0; padding: 6px 14px; font-size: 12px; }
+
+/* Recon fills its panel; the canvas scales to fit, centered, aspect preserved. */
+.cockpit .recon { flex: 1; min-height: 0; padding: 10px 14px; align-items: center; justify-content: center; gap: 8px; }
+.cockpit #recon-image { width: auto; height: auto; max-width: 100%; max-height: 100%; }
+
+/* ── Below the fold: framing + credits (scroll down) ── */
+.belowfold {
+  position: relative; z-index: 1; max-width: 1100px; margin: 0 auto;
+  padding: 26px 18px 60px; display: flex; flex-direction: column; gap: 20px;
+}
+.belowfold .honesty, .belowfold .explainer, .belowfold .colophon { margin: 0; }
+
+/* ── Narrow / short screens: drop the fixed height, stack, give min sizes. ── */
+@media (max-width: 1024px) {
+  .cockpit { height: auto; }
+  .cockpit__main { grid-template-columns: 1fr; }
+  .cockpit__left .panel--hero { min-height: 320px; }
+  .cockpit__left .panel--console { min-height: 220px; }
+  .cockpit__right .panel--recon { min-height: 220px; }
 }

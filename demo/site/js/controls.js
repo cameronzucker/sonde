@@ -1,38 +1,27 @@
-// controls.js — lever DOM (SNR / condition / Auto-Manual / mode picker) → state (ES module).
-// Owns all lever interaction + the live SNR readout; emits a debounced onChange so the
-// host re-runs the link. Does NOT own the transport (play/scrub/speed) — main.js wires that.
+// controls.js — lever DOM for the connected-mode ARDOP demo (ES module).
+//
+// Connected ARDOP negotiates + adapts the DATA mode itself, so the operator no
+// longer picks it. The real operator levers are: the channel (SNR + condition) and
+// the ARQ BANDWIDTH CEILING (the widest mode ardopcf is allowed to negotiate). A
+// connected session is ~30–60 s of real airtime, so we do NOT auto-run on every
+// slider tick — the operator dials the levers, then presses "Run connected session".
 
-const DEBOUNCE_MS = 150;
+const ARQBW = ["200MAX", "500MAX", "1000MAX", "2000MAX"];
 
 /**
- * createControls(modes, onChange)
- *   modes    — array of ModeInfo from engine.listModes() (used to populate the picker).
- *   onChange — called (debounced) with getState() whenever a lever changes.
- * Returns { getState }.
+ * createControls(onRun)
+ *   onRun — called with getState() when the operator starts a session.
+ * Returns { getState, setRunning(bool) }.
  */
-export function createControls(modes, onChange) {
+export function createControls(onRun) {
   const snrSlider = document.getElementById("snr-slider");
   const snrReadout = document.getElementById("snr-readout");
   const conditionGroup = document.getElementById("condition-group");
-  const modeToggle = document.getElementById("mode-toggle");
-  const modePicker = document.getElementById("mode-picker");
+  const bwGroup = document.getElementById("bw-group");
+  const runBtn = document.getElementById("run-btn");
 
   const conditionButtons = Array.from(conditionGroup.querySelectorAll("[data-condition]"));
-  const toggleButtons = Array.from(modeToggle.querySelectorAll("[data-mode-sel]"));
-
-  // ── Populate the manual mode picker from the catalogue ────────────────────
-  // Implemented modes are selectable; unimplemented ones are disabled + "pending".
-  modePicker.innerHTML = "";
-  (modes || []).forEach((m) => {
-    const opt = document.createElement("option");
-    opt.value = m.id;
-    opt.textContent = m.implemented ? m.id : `${m.id} — pending`;
-    opt.disabled = !m.implemented;
-    modePicker.appendChild(opt);
-  });
-  // Default the picker to the first implemented mode.
-  const firstImpl = (modes || []).find((m) => m.implemented);
-  if (firstImpl) modePicker.value = firstImpl.id;
+  const bwButtons = Array.from(bwGroup.querySelectorAll("[data-arqbw]"));
 
   // ── Live SNR readout ──────────────────────────────────────────────────────
   function paintSnr() {
@@ -40,58 +29,44 @@ export function createControls(modes, onChange) {
   }
   paintSnr();
 
-  // ── Debounced change emission ─────────────────────────────────────────────
-  let debounceTimer = null;
-  function emitChange() {
-    if (debounceTimer) clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => onChange(getState()), DEBOUNCE_MS);
-  }
-
-  // ── State accessor ────────────────────────────────────────────────────────
+  // ── State accessors ───────────────────────────────────────────────────────
   function activeCondition() {
     const btn = conditionButtons.find((b) => b.getAttribute("aria-pressed") === "true");
     return btn ? btn.dataset.condition : "none";
   }
-  function isAuto() {
-    const active = toggleButtons.find((b) => b.classList.contains("is-active"));
-    return !active || active.dataset.modeSel === "auto";
+  function activeArqbw() {
+    const btn = bwButtons.find((b) => b.getAttribute("aria-pressed") === "true");
+    return btn ? btn.dataset.arqbw : "2000MAX";
   }
   function getState() {
-    const auto = isAuto();
     return {
       snrDb: Number(snrSlider.value),
       condition: activeCondition(),
-      auto,
-      mode: auto ? null : (modePicker.value || null),
+      arqbw: activeArqbw(),
     };
   }
 
-  // ── Wiring ────────────────────────────────────────────────────────────────
-  snrSlider.addEventListener("input", () => { paintSnr(); emitChange(); });
-
-  conditionButtons.forEach((btn) => {
-    btn.addEventListener("click", () => {
-      conditionButtons.forEach((b) => b.setAttribute("aria-pressed", String(b === btn)));
-      emitChange();
-    });
-  });
-
-  toggleButtons.forEach((btn) => {
-    btn.addEventListener("click", () => {
-      toggleButtons.forEach((b) => {
-        const on = b === btn;
-        b.classList.toggle("is-active", on);
-        b.setAttribute("aria-pressed", String(on));
+  // ── Segmented-group selection helper ──────────────────────────────────────
+  function wireSegmented(buttons) {
+    buttons.forEach((btn) => {
+      btn.addEventListener("click", () => {
+        buttons.forEach((b) => b.setAttribute("aria-pressed", String(b === btn)));
       });
-      modePicker.disabled = isAuto();
-      emitChange();
     });
-  });
+  }
+  wireSegmented(conditionButtons);
+  wireSegmented(bwButtons);
 
-  modePicker.addEventListener("change", emitChange);
+  snrSlider.addEventListener("input", paintSnr);
+  runBtn.addEventListener("click", () => onRun(getState()));
 
-  // Initial picker enabled-state matches the toggle.
-  modePicker.disabled = isAuto();
+  // ── Run-button busy state (disabled + relabelled while a session streams) ──
+  function setRunning(running) {
+    runBtn.disabled = running;
+    runBtn.setAttribute("aria-busy", String(running));
+    const txt = runBtn.querySelector(".runbtn__txt");
+    if (txt) txt.textContent = running ? "Connected" : "Connect";
+  }
 
-  return { getState };
+  return { getState, setRunning };
 }

@@ -6,3 +6,8 @@ node_modules/
 test-results/
 playwright-report/
 .last-run.json
+
+# Python bytecode + ardopcf debug logs (sonde-imh.1)
+ardop/__pycache__/
+__pycache__/
+ARDOPDebug*.log
