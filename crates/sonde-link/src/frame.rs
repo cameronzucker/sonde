@@ -67,6 +67,15 @@ pub const FLAG_END_OF_OVER: u8 = 0x01;
 /// reassembles the in-order run of DATA frames ending here into one message.
 pub const FLAG_END_OF_MSG: u8 = 0x02;
 
+/// FLAGS bits 2–4: `rx_rung` — the sender's *recommended* ladder rung for the
+/// peer's transmissions (link mode-adaptation feedback). The receiver of an over
+/// is the only party that observed how well it decoded, so it advertises the rung
+/// the peer should not exceed. 3 bits hold the 5-rung ladder (0..=BASE). Packed
+/// into spare FLAGS bits (zero added header bytes — airtime). Bits 5–7 reserved
+/// (must be 0). See `docs/superpowers/specs/2026-06-15-downshift-control-loop-design.md`.
+const FLAG_RX_RUNG_SHIFT: u8 = 2;
+const FLAG_RX_RUNG_MASK: u8 = 0b0001_1100;
+
 const CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
 
 /// Link frame type.
@@ -303,6 +312,21 @@ impl LinkFrame {
     pub fn with_mode(mut self, mode: u8) -> Self {
         self.mode = mode;
         self
+    }
+
+    /// Stamp the receiver-feedback `rx_rung` (the rung this station recommends the
+    /// peer use) into FLAGS bits 2–4, preserving the END tokens (bits 0–1) and the
+    /// reserved bits (5–7). Values are masked to 3 bits.
+    pub fn with_rx_rung(mut self, rung: u8) -> Self {
+        self.flags =
+            (self.flags & !FLAG_RX_RUNG_MASK) | ((rung << FLAG_RX_RUNG_SHIFT) & FLAG_RX_RUNG_MASK);
+        self
+    }
+
+    /// The receiver-feedback `rx_rung` carried in FLAGS bits 2–4 (0..=7; the link
+    /// layer clamps it to the ladder).
+    pub fn rx_rung(&self) -> u8 {
+        (self.flags & FLAG_RX_RUNG_MASK) >> FLAG_RX_RUNG_SHIFT
     }
 
     /// Serialize to wire bytes (header + payload region + CRC32). Enforces the
@@ -723,6 +747,29 @@ mod tests {
             f.encode(),
             Err(FrameError::PayloadTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn rx_rung_packs_into_flags_without_disturbing_end_tokens() {
+        // rx_rung coexists with both END flags and survives a wire round-trip.
+        let f = LinkFrame::data(1, 1, b"x".to_vec())
+            .end_of_over()
+            .end_of_msg()
+            .with_rx_rung(4);
+        assert_eq!(f.rx_rung(), 4);
+        assert!(f.is_end_of_over());
+        assert!(f.is_end_of_msg());
+        let g = LinkFrame::decode(&f.encode().unwrap()).unwrap();
+        assert_eq!(g.rx_rung(), 4);
+        assert!(g.is_end_of_over());
+        assert!(g.is_end_of_msg());
+        // Default is 0 when not stamped.
+        assert_eq!(LinkFrame::data(1, 1, vec![]).rx_rung(), 0);
+        // Restamping replaces only the rx_rung bits, leaving the END tokens.
+        let h = f.with_rx_rung(1);
+        assert_eq!(h.rx_rung(), 1);
+        assert!(h.is_end_of_over());
+        assert!(h.is_end_of_msg());
     }
 
     #[test]

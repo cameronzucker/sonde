@@ -47,6 +47,15 @@ const DEAD_OVERS_TOLERATED: u32 = 6;
 /// dying). Must be `< DEAD_OVERS_TOLERATED` so BASE gets a fresh death budget.
 const DOWNSHIFT_TO_BASE_OVERS: u32 = 3;
 
+/// Recent per-over decode outcomes the link tracks to drive the graceful downshift
+/// control loop (Fork B). The window is its OWN clean/missed outcomes, not the
+/// PHY's cumulative counters (the sans-IO connection never sees a failed decode).
+const QUALITY_WINDOW: usize = 4;
+/// Consecutive faster-permitting feedbacks (on active DATA/ACK overs) required
+/// before the floor holder probes one rung up. Upshift is non-catastrophic, so it
+/// is hysteretic — a brief good patch never speeds the mode up (no thrash).
+const UPSHIFT_HYSTERESIS: u8 = 3;
+
 /// Connection lifecycle state (design §4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnState {
@@ -122,6 +131,13 @@ pub struct Connection {
     /// Current link mode / ladder-rung id (stamped on every outgoing frame; the
     /// ARQ window + strategy follow it). Starts at `DEFAULT_RUNG`.
     current_rung: u8,
+    /// Recent per-over decode outcomes (`true` = decoded the peer's over to its
+    /// end, `false` = missed/turn-recovery). Drives `recommended_rung`. Cleared on
+    /// every rung change so stale evidence cannot justify an immediate re-climb.
+    quality: VecDeque<bool>,
+    /// Consecutive faster-permitting feedbacks seen while the floor holder; gates
+    /// the hysteretic upshift probe.
+    upshift_streak: u8,
     /// Window the connection was constructed with — restored on session reset.
     initial_window: u32,
     silent_overs: u32,
@@ -177,6 +193,8 @@ impl Connection {
             owe_ack: false,
             sack_enabled: true,
             current_rung: DEFAULT_RUNG,
+            quality: VecDeque::new(),
+            upshift_streak: 0,
             initial_window: window,
             silent_overs: 0,
             conn_retries: 0,
@@ -224,7 +242,9 @@ impl Connection {
     /// cadence itself cannot live here — only the frame primitive does). The peer
     /// is always known mid-session, so this is only valid while `Connected`.
     pub fn make_id_frame(&self) -> LinkFrame {
-        LinkFrame::id_frame(self.station_id(), self.conn_id).with_mode(self.current_rung)
+        LinkFrame::id_frame(self.station_id(), self.conn_id)
+            .with_mode(self.current_rung)
+            .with_rx_rung(self.recommended_rung())
     }
 
     /// Begin connecting (initiator). No-op unless `Closed`.
@@ -315,6 +335,11 @@ impl Connection {
                 Floor::Listening if self.awaiting_reply => {
                     // We sent data and expected a reply that did not arrive.
                     self.silent_overs += 1;
+                    // A missed reply is a miss in our recent-quality window (we
+                    // failed to decode the peer's over). It also closes the Idle-
+                    // floor blind spot: data lost with no decodable reply yields no
+                    // feedback, so the floor holder must downshift on its own.
+                    self.record_outcome(false);
                     if self.current_rung != BASE_RUNG
                         && self.silent_overs >= DOWNSHIFT_TO_BASE_OVERS
                     {
@@ -330,7 +355,13 @@ impl Connection {
                     } else if self.silent_overs > DEAD_OVERS_TOLERATED {
                         self.close(Some(HostEvent::PeerLost));
                     } else {
-                        // Re-take the floor to retransmit the unacked window.
+                        // Graceful self-downshift one step on a missed reply (§2.4),
+                        // independent of any feedback; sustained misses still cascade
+                        // to the P1 BASE-fallback above. Then re-take the floor to
+                        // retransmit the unacked window.
+                        if self.current_rung != BASE_RUNG {
+                            self.apply_rung(self.current_rung + 1);
+                        }
                         self.floor = Floor::Sending;
                         self.deadline = None;
                     }
@@ -412,14 +443,75 @@ impl Connection {
         self.send.reconfigure(r.window.window);
         self.recv.reconfigure(r.window.window);
         self.sack_enabled = matches!(r.strategy, ArqStrategy::SelectiveRepeat);
+        // Any rung change invalidates the recent-quality evidence and the upshift
+        // streak: stale clean samples from a faster rung must not justify an
+        // immediate re-climb (anti-sawtooth), and a fall to BASE then requires a
+        // fresh full-clean dwell before probing up (the BASE cooldown).
+        self.note_rung_change();
+    }
+
+    /// Clear the recent-quality window + upshift streak (on every rung change).
+    fn note_rung_change(&mut self) {
+        self.quality.clear();
+        self.upshift_streak = 0;
     }
 
     /// Follow a peer frame's advertised mode (the mode-id confirmation path): if
     /// the peer is transmitting at a different rung, adopt it so our replies go
-    /// out at the same mode and the two ends converge.
+    /// out at the same mode and the two ends converge. Used only by the *follower*
+    /// (the listener), never the floor-holding decider (see the role-gate in the
+    /// inbound handlers).
     fn follow_mode(&mut self, peer_mode: u8) {
         if peer_mode != self.current_rung {
             self.apply_rung(peer_mode);
+        }
+    }
+
+    /// Record a decoded peer over-end (`clean`) or a missed reply (`!clean`) into
+    /// the bounded recent-quality window.
+    fn record_outcome(&mut self, clean: bool) {
+        if self.quality.len() == QUALITY_WINDOW {
+            self.quality.pop_front();
+        }
+        self.quality.push_back(clean);
+    }
+
+    /// The ladder rung this station recommends the PEER use, from its recent-
+    /// quality window (advertised as `rx_rung` on outgoing frames). A partial or
+    /// empty window ⇒ no opinion (`current_rung`, the bootstrapping/cooldown case).
+    /// A full clean window ⇒ permit one faster (probe). Any recent miss ⇒ a more-
+    /// robust rung scaled by miss count (toward `BASE_RUNG`).
+    fn recommended_rung(&self) -> u8 {
+        if self.quality.len() < QUALITY_WINDOW {
+            return self.current_rung;
+        }
+        let misses = self.quality.iter().filter(|&&clean| !clean).count() as u8;
+        if misses == 0 {
+            self.current_rung.saturating_sub(1)
+        } else {
+            self.current_rung.saturating_add(misses).min(BASE_RUNG)
+        }
+    }
+
+    /// Act on the peer's `rx_rung` feedback while we are the floor-holding decider
+    /// (architecture C). Downshift is receiver-AUTHORITATIVE and immediate; upshift
+    /// is sender-gated (hysteretic, one rung, only on `counts_for_upshift` active
+    /// DATA/ACK overs — keepalive/ID give liveness but cannot fake upshift
+    /// confidence).
+    fn apply_peer_feedback(&mut self, peer_rx_rung: u8, counts_for_upshift: bool) {
+        let target = peer_rx_rung.min(BASE_RUNG);
+        if target > self.current_rung {
+            // Receiver says it cannot decode us well — obey immediately.
+            self.apply_rung(target); // clears the streak + window
+        } else if counts_for_upshift && target < self.current_rung {
+            // Peer permits faster — probe one rung up only after sustained permits.
+            self.upshift_streak = self.upshift_streak.saturating_add(1);
+            if self.upshift_streak >= UPSHIFT_HYSTERESIS {
+                self.apply_rung(self.current_rung - 1); // clears the streak + window
+            }
+        } else if counts_for_upshift {
+            // Peer recommends our current rung (not faster) — not sustained-faster.
+            self.upshift_streak = 0;
         }
     }
 
@@ -450,6 +542,8 @@ impl Connection {
         self.send.reconfigure(self.initial_window);
         self.recv.reconfigure(self.initial_window);
         self.sack_enabled = true;
+        self.quality.clear();
+        self.upshift_streak = 0;
         self.msg_end_seqs.clear();
         self.floor = Floor::Listening;
         self.awaiting_reply = false;
@@ -506,6 +600,7 @@ impl Connection {
             LinkFrame::control(frame_type, self.conn_id, seq)
         };
         f.with_mode(self.current_rung)
+            .with_rx_rung(self.recommended_rung())
     }
 
     fn make_data(&self, seq: u32, payload: Vec<u8>) -> LinkFrame {
@@ -516,12 +611,13 @@ impl Connection {
         if self.msg_end_seqs.contains(&seq) {
             f = f.end_of_msg();
         }
-        f
+        f.with_rx_rung(self.recommended_rung())
     }
 
     fn make_ack(&self) -> LinkFrame {
         LinkFrame::ack(self.conn_id, self.recv.ack_through(), self.sack_to_send())
             .with_mode(self.current_rung)
+            .with_rx_rung(self.recommended_rung())
     }
 
     /// The SACK bitmap to advertise: the live receive-buffer bitmap under
@@ -660,9 +756,25 @@ impl Connection {
             return;
         }
         self.silent_overs = 0;
-        self.follow_mode(frame.mode);
+        // ID gives liveness; a downshift command on it is still honored, but it
+        // never advances the upshift streak (not an active DATA/ACK over).
+        self.adapt_on_inbound(frame, false);
         if frame.is_end_of_over() {
             self.on_over_end();
+        }
+    }
+
+    /// Apply link-adaptation on an inbound frame, role-gated by floor position
+    /// (architecture C). If we are the floor-holding **decider** (we sent an over
+    /// and are awaiting its reply), act on the peer's `rx_rung` feedback. Otherwise
+    /// we are the **follower** (the peer holds the floor): adopt its announced
+    /// `MODE` so our replies match. `counts_for_upshift` is set only for active
+    /// DATA/ACK overs.
+    fn adapt_on_inbound(&mut self, frame: &LinkFrame, counts_for_upshift: bool) {
+        if self.awaiting_reply {
+            self.apply_peer_feedback(frame.rx_rung(), counts_for_upshift);
+        } else {
+            self.follow_mode(frame.mode);
         }
     }
 
@@ -679,7 +791,7 @@ impl Connection {
 
     fn on_data(&mut self, frame: LinkFrame) {
         self.silent_overs = 0;
-        self.follow_mode(frame.mode);
+        self.adapt_on_inbound(&frame, true);
         self.send.on_ack(frame.ack_through, frame.sack); // piggybacked ack
         let end_of_over = frame.is_end_of_over();
         let end_of_msg = frame.is_end_of_msg();
@@ -697,7 +809,7 @@ impl Connection {
 
     fn on_ack(&mut self, frame: &LinkFrame) {
         self.silent_overs = 0;
-        self.follow_mode(frame.mode);
+        self.adapt_on_inbound(frame, true);
         self.send.on_ack(frame.ack_through, frame.sack);
         if frame.is_end_of_over() {
             self.on_over_end();
@@ -706,7 +818,9 @@ impl Connection {
 
     fn on_keepalive(&mut self, frame: &LinkFrame) {
         self.silent_overs = 0;
-        self.follow_mode(frame.mode);
+        // A keepalive gives liveness + an honored downshift command, but never
+        // advances the upshift streak (not an active DATA/ACK over).
+        self.adapt_on_inbound(frame, false);
         // A keepalive may carry the floor token (an idle holder relinquishing).
         if frame.is_end_of_over() {
             self.on_over_end();
@@ -719,6 +833,9 @@ impl Connection {
     /// something to say. This is symmetric: neither station hogs an idle floor.
     fn on_over_end(&mut self) {
         self.silent_overs = 0;
+        // We decoded the peer's over to its end — a clean outcome for the recent-
+        // quality window (drives the rung we recommend the peer).
+        self.record_outcome(true);
         if self.want_floor() {
             self.floor = Floor::Sending;
         } else {
@@ -1287,5 +1404,144 @@ mod tests {
             vec![b"CLEAN".to_vec()],
             "no stale reassembly bleed-through"
         );
+    }
+
+    // ---- mid-session downshift control loop (sonde-ruu, Fork B, architecture C) --
+
+    #[test]
+    fn recommended_rung_has_no_opinion_until_the_window_is_full() {
+        let mut c = init(); // current_rung = DEFAULT_RUNG
+        c.record_outcome(true);
+        c.record_outcome(true);
+        assert_eq!(
+            c.recommended_rung(),
+            DEFAULT_RUNG,
+            "a partial window must not move the rung (bootstrapping)"
+        );
+    }
+
+    #[test]
+    fn recommended_rung_permits_faster_only_on_a_full_clean_window() {
+        let mut c = init();
+        for _ in 0..QUALITY_WINDOW {
+            c.record_outcome(true);
+        }
+        assert_eq!(
+            c.recommended_rung(),
+            DEFAULT_RUNG - 1,
+            "a full clean window permits one faster"
+        );
+    }
+
+    #[test]
+    fn recommended_rung_recommends_more_robust_scaled_by_misses() {
+        let mut c = init();
+        for _ in 0..QUALITY_WINDOW {
+            c.record_outcome(false); // all misses
+        }
+        assert_eq!(
+            c.recommended_rung(),
+            BASE_RUNG,
+            "a full window of misses recommends the robust floor"
+        );
+    }
+
+    #[test]
+    fn downshift_is_immediate_and_receiver_authoritative() {
+        let mut c = init(); // rung 1
+        c.apply_peer_feedback(BASE_RUNG, true);
+        assert_eq!(
+            c.current_rung(),
+            BASE_RUNG,
+            "a more-robust command is obeyed at once"
+        );
+    }
+
+    #[test]
+    fn upshift_requires_sustained_hysteresis_then_steps_one_rung() {
+        let mut c = init();
+        c.apply_rung(2); // sit mid-ladder
+        for _ in 0..UPSHIFT_HYSTERESIS - 1 {
+            c.apply_peer_feedback(0, true); // peer permits faster
+            assert_eq!(
+                c.current_rung(),
+                2,
+                "no upshift before the hysteresis count"
+            );
+        }
+        c.apply_peer_feedback(0, true);
+        assert_eq!(c.current_rung(), 1, "exactly one rung up after hysteresis");
+    }
+
+    #[test]
+    fn keepalive_feedback_never_advances_an_upshift() {
+        let mut c = init();
+        c.apply_rung(2);
+        for _ in 0..UPSHIFT_HYSTERESIS + 2 {
+            c.apply_peer_feedback(0, false); // not an active DATA/ACK over
+        }
+        assert_eq!(
+            c.current_rung(),
+            2,
+            "liveness feedback must not fake upshift confidence"
+        );
+    }
+
+    #[test]
+    fn a_rung_change_clears_stale_clean_evidence_no_sawtooth() {
+        let mut c = init();
+        for _ in 0..QUALITY_WINDOW {
+            c.record_outcome(true); // would otherwise permit faster
+        }
+        c.apply_rung(3); // any rung change clears the window + streak
+        assert_eq!(
+            c.recommended_rung(),
+            3,
+            "post-change the window is empty ⇒ no opinion (anti-sawtooth / BASE cooldown)"
+        );
+    }
+
+    #[test]
+    fn gate_a_sustained_fade_downshifts_then_clears_and_delivers() {
+        // A fade (lost overs) must downshift the rung WITHOUT dropping the link,
+        // and once it clears the message still delivers byte-exact.
+        let mut p = Pair::new();
+        p.a.connect(Duration::ZERO);
+        p.run(20);
+        let start = p.a.current_rung();
+        p.a.send(b"x".to_vec()); // single-frame message ⇒ a clean whole-over drop
+        let mut steps = 0;
+        while p.a.current_rung() == start && steps < 30 {
+            p.step_drop(Some(0)); // drop A's whole over
+            steps += 1;
+        }
+        assert!(
+            p.a.current_rung() > start,
+            "a sustained fade must downshift the rung"
+        );
+        assert_ne!(
+            p.a.state(),
+            ConnState::Closed,
+            "graceful downshift, not a link drop"
+        );
+        p.run(160); // channel clears
+        assert_eq!(
+            p.b_messages(),
+            vec![b"x".to_vec()],
+            "delivers after the fade"
+        );
+    }
+
+    #[test]
+    fn gate_d_delivery_is_byte_exact_across_a_rung_change() {
+        // A mid-session rung change (window + strategy reconfigured in place) must
+        // preserve the continuous ARQ seq stream — the whole message still arrives.
+        let mut p = Pair::new();
+        p.a.connect(Duration::ZERO);
+        p.run(20);
+        p.a.send(b"0123456789".to_vec()); // 3 fragments at mtu 4
+        p.a.apply_rung(BASE_RUNG); // force a downshift to window-1 WholeMessage
+        p.run(200);
+        assert_eq!(p.b_messages(), vec![b"0123456789".to_vec()]);
     }
 }
