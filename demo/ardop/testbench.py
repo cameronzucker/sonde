@@ -8,8 +8,9 @@ ARDOP protocol (handshake + negotiated data mode + ARQ), not the one-way PHY dem
 Topology (two snd-aloop cards, bidirectional-per-card):
     Station A  <-> card aldA dev0          Station B  <-> card aldB dev0
     bridge uses aldA dev1 / aldB dev1
-    A->B:  arecord aldA,1 | channel_filter | aplay aldB,1
-    B->A:  arecord aldB,1 | channel_filter | aplay aldA,1
+    A->B:  arecord aldA,1 | hf-channel-pcm | aplay aldB,1
+    B->A:  arecord aldB,1 | hf-channel-pcm | aplay aldA,1
+    (hf-channel-pcm = the real ITU-R F.520 Watterson channel binary from hf-channel-sim)
 
 Prereq: snd-aloop loaded as two cards (the runner does this):
     sudo modprobe -r snd-aloop; sudo modprobe snd-aloop enable=1,1 \
@@ -35,7 +36,11 @@ import time
 
 ARDOPCF = os.environ.get("ARDOPCF", os.path.expanduser("~/Code/ardopcf-spike/build/linux/ardopcf"))
 HERE = os.path.dirname(os.path.abspath(__file__))
-FILTER = os.path.join(HERE, "channel_filter.py")
+# Real ITU-R F.520 channel: the hf-channel-sim streaming binary (Watterson multipath
+# + fixed-floor AWGN). Built with `cargo build --release -p hf-channel-sim`. Override
+# with $HF_CHANNEL_PCM. (Supersedes the AWGN-only channel_filter.py stand-in.)
+CHANNEL_BIN = os.environ.get(
+    "HF_CHANNEL_PCM", os.path.normpath(os.path.join(HERE, "../../target/release/hf-channel-pcm")))
 PAYLOAD = os.path.join(HERE, "../site/assets/payload.bin")
 RATE = 12000  # Hz, the loopback + on-air sample rate
 
@@ -203,12 +208,12 @@ CONDITIONS = {"none", "good", "moderate", "poor", "flutter"}
 
 
 def launch_bridge(src_card, dst_card, snr, condition, seed, tap=None):
-    """arecord src dev1 | channel_filter | aplay dst dev1, one direction.
+    """arecord src dev1 | hf-channel-pcm | aplay dst dev1, one direction.
 
     Built as chained Popens (NO shell) so the SNR/condition values — which come
     from the UI via the backend — can't be shell-injected. `tap`, when set, asks
-    channel_filter to also write the impaired on-air PCM to that file (used for the
-    data direction only, to feed the live waterfall)."""
+    hf-channel-pcm to also write the impaired on-air PCM to that file (per direction,
+    to feed that station's live waterfall)."""
     if condition not in CONDITIONS:
         raise ValueError(f"bad condition {condition!r}")
     snr = float(snr)
@@ -222,7 +227,7 @@ def launch_bridge(src_card, dst_card, snr, condition, seed, tap=None):
     rec = subprocess.Popen(
         ["arecord", "-t", "raw", "-f", "S16_LE", "-r", str(RATE), "-c1", *lowlat,
          "-D", f"plughw:CARD={src_card},DEV=1"], stdout=subprocess.PIPE, stderr=dn)
-    flt_cmd = ["python3", "-u", FILTER, "--snr", str(snr),
+    flt_cmd = [CHANNEL_BIN, "--snr-db", str(snr), "--sample-rate", str(RATE),
                "--condition", condition, "--seed", str(seed)]
     if tap:
         flt_cmd += ["--tap", tap]
@@ -261,7 +266,7 @@ class SessionParams:
 
     def __init__(self, snr=20.0, condition="none", seed=1, arqbw="2000MAX",
                  call_a="N0AAA", call_b="N0BBB", timeout=60.0, payload=PAYLOAD,
-                 data_timeout=90.0, tap=None):
+                 data_timeout=90.0, tap=None, tap_rev=None):
         self.snr = float(snr)
         self.condition = condition
         self.seed = int(seed)
@@ -271,7 +276,8 @@ class SessionParams:
         self.timeout = float(timeout)
         self.payload = payload
         self.data_timeout = float(data_timeout)
-        self.tap = tap  # file path for the data-direction on-air PCM, or None
+        self.tap = tap          # A->B (data) on-air PCM tap path, or None
+        self.tap_rev = tap_rev  # B->A (acks) on-air PCM tap path, or None
 
 
 # Allowlist of ARQBW values ardopcf accepts (operator-facing bandwidth ceiling).
@@ -298,6 +304,11 @@ def run_session(params, emit, should_abort=None):
               "modprobe from the handoff before starting a session."})
         emit({"t": "done"})
         return 4
+    if not os.path.exists(CHANNEL_BIN):
+        emit({"t": "error", "msg": f"channel binary not built ({CHANNEL_BIN}) — run "
+              "`cargo build --release -p hf-channel-sim`."})
+        emit({"t": "done"})
+        return 4
 
     procs, files, hosts, dataconns = [], [], [], []
     # Truncate the tap up front so a fresh session's waterfall never shows stale air.
@@ -314,9 +325,10 @@ def run_session(params, emit, should_abort=None):
             return 4
 
         emit({"t": "phase", "phase": "bridge", "msg": "channel bridges up (both directions)"})
-        # Tap the data direction (A->B) for the waterfall; B->A is ACKs only.
+        # Tap both directions: A->B (data) and B->A (acks), each to its own file,
+        # so the frontend can show a waterfall per station (half-duplex turn-taking).
         procs += launch_bridge("aldA", "aldB", params.snr, params.condition, params.seed, tap=params.tap)
-        procs += launch_bridge("aldB", "aldA", params.snr, params.condition, params.seed + 1)
+        procs += launch_bridge("aldB", "aldA", params.snr, params.condition, params.seed + 1, tap=params.tap_rev)
         time.sleep(1.0)
 
         on_line = lambda name, line: emit({"t": "host", "station": name, "line": line})

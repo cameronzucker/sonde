@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>HF Data Modem — Live ARDOP Connected-Mode Demo</title>
-  <meta name="description" content="Watch two real ARDOP modems connect over a simulated HF channel — live: real CONNECT handshake, bandwidth negotiation, and adaptive-rate ARQ delivering an EmComm SITREP image, with the on-air signal streamed live to a 3D waterfall." />
+  <meta name="description" content="Watch two real ARDOP modems connect over a real ITU-R F.520 Watterson HF channel — live: real CONNECT handshake, bandwidth negotiation, and adaptive-rate ARQ delivering an EmComm SITREP message (text + photo), with the on-air signal streamed live to a 3D waterfall." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Chivo:ital,wght@0,300;0,400;0,500;0,700;0,900;1,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -34,7 +34,7 @@
           <strong>SONDE</strong>
           <span class="wordmark__sub">HF DATA MODEM</span>
         </span>
-        <span class="chip chip--live"><span class="chip__dot"></span>2 REAL ARDOP MODEMS · SIM CHANNEL · NOT ON-AIR</span>
+        <span class="chip chip--live"><span class="chip__dot"></span>2 REAL ARDOP MODEMS · WATTERSON CHANNEL · NOT ON-AIR</span>
       </div>
 
       <div class="topbar__levers">
@@ -86,15 +86,40 @@
       <section class="cockpit__left">
         <div class="panel panel--hero" aria-labelledby="hero-label">
           <div class="panel__head">
-            <h2 class="panel__title" id="hero-label"><span class="idx">01</span> Live Spectral Waterfall</h2>
-            <span class="panel__hint">the on-air signal, streamed live · drag to orbit</span>
+            <h2 class="panel__title" id="hero-label"><span class="idx">01</span> Live Spectral Waterfalls</h2>
+            <span class="panel__hint">both on-air directions · drag to orbit</span>
           </div>
-          <div class="stage" id="waterfall-mount" role="img" aria-label="Live 3D spectrogram of the on-air signal">
-            <span class="reg reg--tl" aria-hidden="true"></span>
-            <span class="reg reg--tr" aria-hidden="true"></span>
-            <span class="reg reg--bl" aria-hidden="true"></span>
-            <span class="reg reg--br" aria-hidden="true"></span>
-            <div class="stage__boot" id="stage-boot">press Connect — the live spectrum streams in as the modems transmit…</div>
+          <div class="stage-pair">
+            <div class="stage-wrap">
+              <span class="stage-tag stage-tag--data">A → B · DATA</span>
+              <div class="stage" id="waterfall-fwd" role="img" aria-label="Live 3D spectrogram of the data sender, station A to B">
+                <span class="reg reg--tl" aria-hidden="true"></span>
+                <span class="reg reg--tr" aria-hidden="true"></span>
+                <span class="reg reg--bl" aria-hidden="true"></span>
+                <span class="reg reg--br" aria-hidden="true"></span>
+                <div class="stage__boot">press Connect…</div>
+              </div>
+              <div class="vu" id="vu-fwd" aria-label="Station A on-air audio level">
+                <span class="vu__lbl">A</span>
+                <div class="vu__track"><div class="vu__scale" aria-hidden="true"></div><div class="vu__fill"></div><div class="vu__peak"></div></div>
+                <span class="vu__read">S—</span>
+              </div>
+            </div>
+            <div class="stage-wrap">
+              <span class="stage-tag stage-tag--ack">B → A · ACK / NAK</span>
+              <div class="stage" id="waterfall-rev" role="img" aria-label="Live 3D spectrogram of the receiver acknowledgements, station B to A">
+                <span class="reg reg--tl" aria-hidden="true"></span>
+                <span class="reg reg--tr" aria-hidden="true"></span>
+                <span class="reg reg--bl" aria-hidden="true"></span>
+                <span class="reg reg--br" aria-hidden="true"></span>
+                <div class="stage__boot">press Connect…</div>
+              </div>
+              <div class="vu" id="vu-rev" aria-label="Station B on-air audio level">
+                <span class="vu__lbl">B</span>
+                <div class="vu__track"><div class="vu__scale" aria-hidden="true"></div><div class="vu__fill"></div><div class="vu__peak"></div></div>
+                <span class="vu__read">S—</span>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -142,14 +167,29 @@
           </div>
         </section>
 
-        <!-- RECON IMAGE -->
-        <section class="panel panel--recon" aria-labelledby="recon-label">
+        <!-- DELIVERED MESSAGE (text + image attachment, à la Winlink) -->
+        <section class="panel panel--message" aria-labelledby="msg-label">
           <div class="panel__head">
-            <h2 class="panel__title" id="recon-label"><span class="idx">04</span> Recon Attachment</h2>
-            <span class="panel__hint">ARQ-delivered</span>
+            <h2 class="panel__title" id="msg-label"><span class="idx">04</span> Delivered Message</h2>
+            <span class="panel__hint">text + attachment · ARQ-delivered</span>
           </div>
-          <div class="recon">
-            <canvas id="recon-image" width="320" height="240" aria-label="Reconnaissance photo delivered over the ARQ link"></canvas>
+          <div class="message" id="message-mount" aria-label="The message delivered over the link"></div>
+        </section>
+
+        <!-- CONSTELLATION — honest stub: ARDOP doesn't expose demod symbols. -->
+        <section class="panel panel--constellation" aria-labelledby="const-label">
+          <div class="panel__head">
+            <h2 class="panel__title" id="const-label"><span class="idx">05</span> Constellation</h2>
+            <span class="panel__hint">Sonde-side</span>
+          </div>
+          <div class="const-stub">
+            <div class="const-stub__plane" aria-hidden="true">
+              <span class="const-stub__axis const-stub__axis--x"></span>
+              <span class="const-stub__axis const-stub__axis--y"></span>
+            </div>
+            <p class="const-stub__note">An I/Q symbol constellation arrives with the
+              <strong>Sonde</strong> comparison — Sonde's own receiver exposes its demodulated
+              symbols. ARDOP is a black box and doesn't, so there's nothing honest to plot here yet.</p>
           </div>
         </section>
       </aside>
@@ -161,15 +201,18 @@
     <div class="honesty" role="note">
       <span class="honesty__mark" aria-hidden="true">▲</span>
       <p>
-        <strong>Two real modems · a live connection · simulated channel · not on-air.</strong>
+        <strong>Two real modems · a live connection · a real Watterson channel · not on-air.</strong>
         Each session stands up <strong>two real ARDOP</strong> stations (ardopcf) and runs an actual
         <strong>connection</strong> between them — CONNECT handshake, bandwidth negotiation, and
-        <strong>adaptive-rate ARQ</strong> — with their audio bridged through a synthetic HF channel on
-        the backend and streamed to your browser live. No radio is keyed. ARDOP has a link layer, so
-        lost blocks are <em>retransmitted</em>: at a workable SNR the image arrives <strong>intact</strong>,
-        the modems <strong>adapt the rate down</strong> as conditions worsen, and below the cliff the
-        <strong>connection never closes</strong>. ARDOP is a known-good external baseline — the bar Sonde
-        is being built to meet — and is never reimplemented here.
+        <strong>adaptive-rate ARQ</strong> — with their audio bridged through the project's
+        <strong>hf-channel-sim</strong> (a real <strong>ITU-R&nbsp;F.520 Watterson</strong> ionospheric
+        model: multipath fading + Doppler at the Good/Moderate/Poor/Flutter presets) and streamed to your
+        browser live. No radio is keyed. ARDOP has a link layer, so lost blocks are <em>retransmitted</em>:
+        at a workable SNR the image arrives <strong>intact</strong>, the modems <strong>adapt the rate
+        down</strong> as the channel worsens, and below the cliff the <strong>connection never closes</strong>.
+        ARDOP is a known-good external baseline — the bar Sonde is being built to meet — and is never
+        reimplemented here. <em>(SNR is referenced to a fixed TX level over the full audio band, not yet
+        calibrated to a standard 2.4&nbsp;kHz noise bandwidth, so treat the dB as relative.)</em>
       </p>
     </div>
 
@@ -180,11 +223,13 @@
           <em>bandwidth ceiling</em> (the widest mode allowed), and press <em>Connect</em>. A session is real
           airtime — it plays out live over ~30–60 s.</li>
         <li><strong>Two real ARDOP stations connect.</strong> The backend runs a real CONNECT handshake,
-          negotiates a bandwidth, and transfers a ~3&nbsp;KB image over <strong>adaptive-rate ARQ</strong> —
-          their audio bridged through a synthetic HF channel. Real modulation, real FEC, real retransmission.</li>
+          negotiates a bandwidth, and transfers a small EmComm <strong>message</strong> (a SITREP text + a photo
+          attachment, ~3&nbsp;KB) over <strong>adaptive-rate ARQ</strong> — their audio bridged through a real
+          ITU-R F.520 Watterson HF channel (hf-channel-sim). Real modulation, real fading, real FEC, real
+          retransmission. (Compose your own with <code>demo/ardop/make_payload.py</code>.)</li>
         <li><strong>Watch + hear it live.</strong> The on-air signal streams to the waterfall (and your
           speakers) as it transmits; the connection/ARQ log streams the handshake, the negotiated mode, and
-          every rate change; the recon photo lands intact — slower as the rate drops, and not at all once the
+          every rate change; the message lands intact — slower as the rate drops, and not at all once the
           SNR falls below the connect cliff.</li>
       </ol>
     </section>

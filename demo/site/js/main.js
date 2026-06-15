@@ -9,9 +9,10 @@
 import { initSession, runSession, hexToBytes, offsets } from "./session-engine.js";
 import { createWaterfall } from "./waterfall.js";
 import { createSessionLog } from "./session-log.js";
-import { createImageReveal } from "./image-reveal.js";
+import { createMessageView } from "./message.js";
 import { createControls } from "./controls.js";
 import { createLiveAudio } from "./live-audio.js";
+import { createSMeter } from "./s-meter.js";
 
 // ── DOM handles ─────────────────────────────────────────────────────────────
 const el = (id) => document.getElementById(id);
@@ -26,8 +27,8 @@ const muteBtn = el("mute-btn");
 const muteGlyph = el("mute-glyph");
 
 // ── Module instances + run state ─────────────────────────────────────────────
-let waterfall, imageReveal, sessionLog, controls, liveAudio;
-let imageRange = [0, 0];
+let waterfallFwd, waterfallRev, meterFwd, meterRev, messageView, sessionLog, controls, liveAudio;
+let manifest = null;   // payload.offsets.json: the message parts (for the receiving view)
 let seed = 1;
 let session = null;   // current EventSource controller ({close})
 
@@ -43,11 +44,6 @@ function fmtThroughput(bps) {
 function setStatus(text) {
   const t = adaptation.querySelector(".adaptation__text");
   if (t) t.textContent = text;
-}
-
-function imageFieldRange(off) {
-  const f = off?.fields?.find((x) => x.label === "image");
-  return f ? [f.start, f.end] : [0, 0];
 }
 
 function clearTelemetry() {
@@ -68,10 +64,13 @@ function runConnectedSession(state) {
 
   controls.setRunning(true);
   sessionLog.reset();
-  waterfall.reset();
+  waterfallFwd.reset();
+  waterfallRev.reset();
+  meterFwd.reset();
+  meterRev.reset();
   clearTelemetry();
   statSnr.textContent = `${state.snrDb} dB`;
-  imageReveal.showFailed("CONNECTING…", `${state.condition} · ${state.arqbw.replace("MAX", " Hz max")}`);
+  messageView.placeholder("CONNECTING…", `${state.condition} · ${state.arqbw.replace("MAX", " Hz max")}`);
   setStatus(`Dialing ${state.arqbw.replace("MAX", " Hz max")} at ${state.snrDb} dB / ${state.condition}…`);
   sessionLog.event("call", `ARQ CONNECT — SNR ${state.snrDb} dB · ${state.condition}`, state.arqbw);
 
@@ -80,20 +79,20 @@ function runConnectedSession(state) {
   session = runSession({ ...state, seed: mySeed }, {
     onPhase: (ev) => setStatus(ev.msg),
     onStation: (ev) => sessionLog.event("info", `${ev.station} = ${ev.call} (${ev.role})`),
-    onAudio: (ev) => liveAudio.enqueue(ev.samples, ev.rate),   // LIVE on-air audio → waterfall
+    onAudio: (ev) => liveAudio.enqueue(ev.samples, ev.rate, ev.dir),  // per-direction → its waterfall
     onConnected: (ev) => {
       statBw.textContent = ev.bandwidth ? `${ev.bandwidth} Hz` : "—";
       sessionLog.event("conn", `CONNECTED — ${ev.call_a} ⇄ ${ev.call_b}`,
         ev.bandwidth ? `${ev.bandwidth} Hz` : "");
-      setStatus(`Connected · negotiated ${ev.bandwidth || "?"} Hz — transferring image over ARQ…`);
+      setStatus(`Connected · negotiated ${ev.bandwidth || "?"} Hz — transferring the message over ARQ…`);
     },
     onDataStart: (ev) => {
-      sessionLog.event("arq", "image handed to the ARQ buffer", `${ev.bytes} B`);
-      imageReveal.showFailed("RECEIVING…", `0 / ${ev.bytes} B`);
+      sessionLog.event("arq", "message handed to the ARQ buffer", `${ev.bytes} B`);
+      messageView.receiving(0, ev.bytes, manifest);
     },
     onProgress: (ev) => {
       sessionLog.setProgress(ev.received, ev.total);
-      if (ev.received < ev.total) imageReveal.showFailed("RECEIVING…", `${ev.received} / ${ev.total} B`);
+      if (ev.received < ev.total) messageView.receiving(ev.received, ev.total, manifest);
     },
     onMode: (ev) => {
       ev.modes.slice(lastModes.length).forEach((m) =>
@@ -105,7 +104,7 @@ function runConnectedSession(state) {
     onDelivered: (ev) => {
       sessionLog.setProgress(ev.received, ev.total);
       sessionLog.event(ev.intact ? "ok" : "fail",
-        ev.intact ? "image delivered intact" : "transfer incomplete",
+        ev.intact ? "message delivered intact" : "transfer incomplete",
         `${ev.received}/${ev.total} B`);
     },
     onResult: (ev) => finishSession(ev),
@@ -129,16 +128,15 @@ function finishSession(ev) {
 
   if (ev.outcome === "fail") {
     setStatus("CONNECT FAILED — the link can't close at this SNR; nothing was delivered.");
-    imageReveal.showFailed("CONNECT FAILED", "link could not close");
+    messageView.placeholder("CONNECT FAILED", "link could not close");
     statThroughput.textContent = "—";
     return;
   }
   const bps = ev.duration_s > 0 ? (ev.received * 8) / ev.duration_s : 0;
   statThroughput.textContent = fmtThroughput(bps);
-  const bytes = hexToBytes(ev.image_hex);
-  const fraction = ev.total > 0 ? ev.received / ev.total : 0;
-  if (bytes.length) imageReveal.render(bytes, imageRange, fraction);
-  else imageReveal.showFailed();
+  const bytes = hexToBytes(ev.image_hex); // the delivered payload (the SNDM message container)
+  if (bytes.length) messageView.render(bytes);
+  else messageView.placeholder("NOTHING DELIVERED", "");
   setStatus(ev.outcome === "pass"
     ? `Delivered intact in ${ev.duration_s.toFixed(1)} s.`
     : `Partial: ${ev.received}/${ev.total} B before the link dropped.`);
@@ -165,15 +163,24 @@ async function loadCredit() {
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 async function boot() {
   await initSession();
-  imageRange = imageFieldRange(offsets());
+  manifest = offsets();
 
   liveAudio = createLiveAudio();
-  waterfall = createWaterfall(el("waterfall-mount"), {
-    getAnalyser: () => liveAudio.getAnalyser(),
-    isPlaying: () => liveAudio.isPlaying(),
+  // Two waterfalls: A->B (data sender) and B->A (receiver's ACK/NAK bursts), each
+  // tapping its own direction's analyser so the half-duplex turn-taking is visible.
+  waterfallFwd = createWaterfall(el("waterfall-fwd"), {
+    getAnalyser: () => liveAudio.getAnalyser("fwd"),
+    isPlaying: () => liveAudio.isPlaying("fwd"),
   });
+  waterfallRev = createWaterfall(el("waterfall-rev"), {
+    getAnalyser: () => liveAudio.getAnalyser("rev"),
+    isPlaying: () => liveAudio.isPlaying("rev"),
+  });
+  // Per-station S-meters off the same per-direction analysers (real on-air level).
+  meterFwd = createSMeter(el("vu-fwd"), { getAnalyser: () => liveAudio.getAnalyser("fwd") });
+  meterRev = createSMeter(el("vu-rev"), { getAnalyser: () => liveAudio.getAnalyser("rev") });
   sessionLog = createSessionLog(el("session-log-stream"), el("session-progress"));
-  imageReveal = createImageReveal(el("recon-image"));
+  messageView = createMessageView(el("message-mount"));
   controls = createControls(runConnectedSession);
 
   wireMute();
