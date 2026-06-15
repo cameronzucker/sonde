@@ -13,6 +13,7 @@ use sonde_fec::codes::{BlockN, WifiLdpcRate};
 use sonde_phy::error::PhyError;
 use sonde_phy::modes::ModeFamily;
 use sonde_phy::ofdm_main::ofdm_params::{OfdmModeName, OfdmParams};
+use sonde_phy::robustness_floor::narrow_fsk::{NarrowFskFloor, NfskDecode};
 use sonde_phy::robustness_floor::wideband_lowdensity::{
     SyncDecodeOutcome, WidebandLowDensityFloor,
 };
@@ -248,9 +249,78 @@ impl Waveform for OfdmMainWaveform {
     }
 }
 
+/// Narrow-FSK deep-floor waveform `floor-nfsk` (RobustnessFloor family): a
+/// noncoherent 8-FSK mode for crowded/narrow band slots — the most robust rung,
+/// below the wide-band floor (sonde-99l.4). Self-synchronises on the shared
+/// Schmidl-Cox preamble and recovers a length-delimited, CRC-verified frame.
+/// Physics-gated over AWGN in `sonde-phy/tests/nfsk_floor_gate.rs`. Reports no
+/// `SNR_2500` yet (no OFDM pilots; a narrowband estimator is a follow-up) — the
+/// link still gets honest FER from its overs.
+pub struct NfskWaveform {
+    inner: NarrowFskFloor,
+}
+
+impl NfskWaveform {
+    /// Construct the narrow-FSK deep-floor waveform.
+    pub fn new() -> Self {
+        Self {
+            inner: NarrowFskFloor::new(),
+        }
+    }
+}
+
+impl Default for NfskWaveform {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Waveform for NfskWaveform {
+    fn encode(&self, payload: &[u8]) -> Result<Vec<f32>, PhyError> {
+        self.inner.transmit_with_preamble(payload)
+    }
+
+    fn decode_scan(&self, samples: &[f32]) -> DecodeScan {
+        match self.inner.receive_scan(samples) {
+            NfskDecode::Frame(payload) => DecodeScan::Frame(DecodedFrame {
+                payload,
+                family: ModeFamily::RobustnessFloor,
+                snr_2500_db: None, // no narrowband SNR_2500 estimator yet
+            }),
+            NfskDecode::Detected => DecodeScan::Detected { snr_2500_db: None },
+            NfskDecode::NoSignal => DecodeScan::NoSignal,
+        }
+    }
+
+    fn family(&self) -> ModeFamily {
+        ModeFamily::RobustnessFloor
+    }
+
+    fn mode_name(&self) -> Option<&'static str> {
+        Some("floor-nfsk")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nfsk_waveform_round_trips_a_payload() {
+        let wf = NfskWaveform::new();
+        let payload = b"crowded band";
+        let samples = wf.encode(payload).expect("encode");
+        let mut captured = vec![0.0f32; 600];
+        captured.extend_from_slice(&samples);
+        match wf.decode_scan(&captured) {
+            DecodeScan::Frame(frame) => {
+                assert_eq!(frame.payload, payload);
+                assert_eq!(frame.family, ModeFamily::RobustnessFloor);
+            }
+            other => panic!("expected an nFSK frame, got {other:?}"),
+        }
+        assert_eq!(wf.mode_name(), Some("floor-nfsk"));
+    }
 
     #[test]
     fn ofdm_main_waveform_round_trips_a_payload() {
