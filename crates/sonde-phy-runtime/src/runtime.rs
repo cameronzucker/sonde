@@ -305,7 +305,17 @@ impl<R: Radio> Worker<R> {
         // put the wrong mode on the air). A dropped over surfaces as a missed over
         // (the link's turn-recovery / P1 BASE-fallback handles it). The link only
         // requests registered modes (ladder-from-registry, sonde-lcw.1).
-        let mode = self.modes.resolve(job.hint, None);
+        // Feed the MEASURED channel SNR into mode resolution so `MainAuto` actually
+        // adapts to the link instead of defaulting to a fixed 15 dB (sonde-b60.8).
+        // `None` (no recent measurement) ⇒ resolve falls back to its default. Other
+        // hints (Floor / pinned) ignore the SNR, so this is harmless for them.
+        let measured_snr = self
+            .quality
+            .lock()
+            .ok()
+            .map(|q| q.report().aggregate_snr_db())
+            .filter(|s| s.is_finite());
+        let mode = self.modes.resolve(job.hint, measured_snr);
         let chosen = self
             .waveforms
             .iter()
