@@ -40,6 +40,14 @@ Tuxlink is the client; no link code in tuxlink. Generic over `P: PhyTransport`
 
 ## 3. Frame format (#5)
 
+> **AMENDED (2026-06-15, sonde-sbt) — see canonical
+> [`2026-06-15-frame-conn-id-addressing-design.md`](2026-06-15-frame-conn-id-addressing-design.md).**
+> The per-frame `SRC`/`DST` callsigns below were **removed** (wasteful + not a
+> Part-97 convention). `VER` is now `2`; the header is **22 bytes**
+> (`LINK_OVERHEAD` 26); the data plane is addressed by `CONN_ID`; callsigns ride
+> only on the ID-bearing frames (`CONN`/`CONN_ACK`/`DISC`/`DISC_ACK`/`ID`). The
+> layout below is retained for history.
+
 Big-endian, variable-length, one frame = one PHY `send_frame`. Exact-length, CRC-first parse.
 
 ```
@@ -201,8 +209,12 @@ Results are reported as "link-correct over channel model {params}", never as HF 
 dev-dep `sonde-phy-runtime`, `sonde-fec`.
 
 ## 10. RADIO-1 / Part 97
-No real radio keyed; all tests are in-memory doubles. Station ID validated + in every frame; the MAC
-is the enforcement point. On-air smoke is operator-run, post PHY-physics gates.
+No real radio keyed; all tests are in-memory doubles. Station ID is validated and
+carried per Part-97 §97.119 cadence — at the **start** (`CONN`/`CONN_ACK`),
+**end** (`DISC`/`DISC_ACK`), and **≤ every 10 minutes** (periodic `ID`, enforced
+in real time by the `Driver`) — **not** in every frame (amended 2026-06-15,
+sonde-sbt; see [`2026-06-15-frame-conn-id-addressing-design.md`](2026-06-15-frame-conn-id-addressing-design.md)).
+On-air smoke is operator-run, post PHY-physics gates.
 
 ## 11. Scope honesty
 This push lands: the design (Codex-converged SM), frame codec, connection state machine,
