@@ -95,6 +95,12 @@ pub enum SyncDecodeOutcome {
     DetectedDecodeFailed {
         /// Sample index where the preamble was detected.
         start_sample: usize,
+        /// Channel SNR referenced to 2500 Hz, dB, measured from the (failed)
+        /// frame's body symbols. `Some` even though the decode failed — a
+        /// detected-but-failed over carries a real channel measurement (Codex
+        /// review H1, survivorship bias); `None` only when no body followed the
+        /// preamble.
+        snr_2500_db: Option<f32>,
     },
     /// Clean decode: preamble acquired at `start_sample`, payload recovered.
     Frame {
@@ -102,6 +108,9 @@ pub enum SyncDecodeOutcome {
         start_sample: usize,
         /// FEC-corrected payload bytes.
         payload: Vec<u8>,
+        /// Channel SNR referenced to 2500 Hz, dB, measured from the frame body
+        /// (estimator-domain; see [`crate::ofdm_main::receiver::OfdmReceiver::estimate_snr_2500_db`]).
+        snr_2500_db: Option<f32>,
     },
 }
 
@@ -478,21 +487,48 @@ impl WidebandLowDensityFloor {
     pub fn receive_multi_with_sync_scan(&self, samples: &[f32]) -> SyncDecodeOutcome {
         match self.locate_synced_body(samples) {
             SyncLocate::NoPreamble => SyncDecodeOutcome::NoSignal,
-            SyncLocate::NoBody { start_sample } => {
-                SyncDecodeOutcome::DetectedDecodeFailed { start_sample }
-            }
+            SyncLocate::NoBody { start_sample } => SyncDecodeOutcome::DetectedDecodeFailed {
+                start_sample,
+                snr_2500_db: None,
+            },
             SyncLocate::Body {
                 start_sample,
                 corrected,
                 body_start,
-            } => match self.receive_multi(&corrected[body_start..]) {
-                Ok(payload) => SyncDecodeOutcome::Frame {
-                    start_sample,
-                    payload,
-                },
-                Err(_) => SyncDecodeOutcome::DetectedDecodeFailed { start_sample },
-            },
+            } => {
+                let body = &corrected[body_start..];
+                // Measure SNR from the body symbols BEFORE attempting the decode,
+                // so a detected-but-failed over still carries a channel reading
+                // (Codex review H1 — decode-only SNR is survivorship-biased high).
+                let snr_2500_db = self.estimate_body_snr(body);
+                match self.receive_multi(body) {
+                    Ok(payload) => SyncDecodeOutcome::Frame {
+                        start_sample,
+                        payload,
+                        snr_2500_db,
+                    },
+                    Err(_) => SyncDecodeOutcome::DetectedDecodeFailed {
+                        start_sample,
+                        snr_2500_db,
+                    },
+                }
+            }
         }
+    }
+
+    /// Channel SNR (dB, 2500 Hz reference) of a derotated frame `body`, measured
+    /// across its OFDM symbols with the production estimator. `None` when the body
+    /// holds less than one full symbol. Uses the same `n0_override` posture as the
+    /// demod so a diagnostic fixed-`n0` arm does not silently change the report.
+    fn estimate_body_snr(&self, body: &[f32]) -> Option<f32> {
+        let sym = self.symbol_size_samples();
+        if body.len() < sym {
+            return None;
+        }
+        let n = body.len() / sym;
+        let slices: Vec<&[f32]> = (0..n).map(|i| &body[i * sym..(i + 1) * sym]).collect();
+        let rx = OfdmReceiver::with_n0_override(&self.params, self.n0_override);
+        Some(rx.estimate_snr_2500_db(&slices).snr_2500_db)
     }
 
     /// Locate the preamble, derotate by the estimated CFO, and slice out the
@@ -972,6 +1008,7 @@ mod tests {
             SyncDecodeOutcome::Frame {
                 start_sample,
                 payload: got,
+                ..
             } => {
                 assert_eq!(start_sample, 0, "clean capture aligns at sample 0");
                 assert_eq!(got, payload);

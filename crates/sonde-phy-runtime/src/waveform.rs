@@ -23,10 +23,11 @@ pub struct DecodedFrame {
     pub payload: Vec<u8>,
     /// Mode family the frame was demodulated under.
     pub family: ModeFamily,
-    /// Aggregate frame SNR in dB, when the waveform measures one. `None` until
-    /// the floor exposes its sub-carrier SNR estimator (tracked by the same
-    /// follow-up that lands `doppler_spread_hz`, per `phy_api`).
-    pub frame_snr_db: Option<f32>,
+    /// Channel SNR referenced to a 2500 Hz noise bandwidth, in dB — the
+    /// link-facing adaptation reference (see
+    /// `docs/superpowers/specs/2026-06-15-phy-mode-adaptation-quality-design.md`).
+    /// `None` when the waveform did not measure one.
+    pub snr_2500_db: Option<f32>,
 }
 
 /// Outcome of [`Waveform::decode_scan`] on one RX window.
@@ -42,8 +43,14 @@ pub enum DecodeScan {
     NoSignal,
     /// A frame was detected (sync/preamble acquired) but it failed to decode
     /// (FEC reject or truncated body). No payload is produced, but the runtime
-    /// counts it as a frame error.
-    Detected,
+    /// counts it as a frame error — and still carries the channel SNR measured
+    /// from the failed over (`snr_2500_db`, dB, 2500 Hz reference; `None` when no
+    /// body followed the preamble). Reporting SNR on failures too avoids the
+    /// survivorship bias of measuring only clean decodes (Codex review H1).
+    Detected {
+        /// Channel SNR (dB, 2500 Hz reference) of the detected-but-failed over.
+        snr_2500_db: Option<f32>,
+    },
     /// A frame decoded cleanly.
     Frame(DecodedFrame),
 }
@@ -101,12 +108,18 @@ impl Waveform for FloorWaveform {
 
     fn decode_scan(&self, samples: &[f32]) -> DecodeScan {
         match self.inner.receive_multi_with_sync_scan(samples) {
-            SyncDecodeOutcome::Frame { payload, .. } => DecodeScan::Frame(DecodedFrame {
+            SyncDecodeOutcome::Frame {
+                payload,
+                snr_2500_db,
+                ..
+            } => DecodeScan::Frame(DecodedFrame {
                 payload,
                 family: ModeFamily::RobustnessFloor,
-                frame_snr_db: None,
+                snr_2500_db,
             }),
-            SyncDecodeOutcome::DetectedDecodeFailed { .. } => DecodeScan::Detected,
+            SyncDecodeOutcome::DetectedDecodeFailed { snr_2500_db, .. } => {
+                DecodeScan::Detected { snr_2500_db }
+            }
             SyncDecodeOutcome::NoSignal => DecodeScan::NoSignal,
         }
     }

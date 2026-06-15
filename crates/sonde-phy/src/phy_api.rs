@@ -94,8 +94,18 @@ impl ChannelQualityReport {
             current_bit_loading: None,
         }
     }
-    /// Aggregate SNR averaged across recent frames, in dB.
+    /// Channel SNR referenced to a **2500 Hz noise bandwidth** (the SSB channel),
+    /// in dB — the link adaptation ladder's reference (`SNR_2500`). The PHY reports
+    /// the RAW per-over value (the link owns any smoothing); `NaN` means "no recent
+    /// measurement". This is a mode-comparable *channel* number, deliberately NOT
+    /// Eb/N0 (which normalizes out data rate and cannot order a mode ladder). See
+    /// `docs/superpowers/specs/2026-06-15-phy-mode-adaptation-quality-design.md`.
     pub fn aggregate_snr_db(&self) -> f32 {
+        self.aggregate_snr_db
+    }
+    /// Channel SNR referenced to 2500 Hz, in dB — clearer-named alias of
+    /// [`Self::aggregate_snr_db`].
+    pub fn snr_2500_db(&self) -> f32 {
         self.aggregate_snr_db
     }
     /// Per-sub-carrier SNR in dB, most recent OFDM frame.
@@ -109,6 +119,13 @@ impl ChannelQualityReport {
         } else {
             self.recent_frames_failed as f32 / self.recent_frames_total as f32
         }
+    }
+    /// Number of RECEIVED overs in the recent window the FER/SNR were computed
+    /// over — the link's FER-credibility gate (`fer_samples`) needs this (it only
+    /// trusts FER once the count clears `FER_MIN_SAMPLES`). Bounded + recent, not
+    /// a lifetime total.
+    pub fn recent_frames_total(&self) -> u32 {
+        self.recent_frames_total
     }
     /// Current per-sub-carrier bit-loading bitmap, if a bit-loader is active.
     pub fn current_bit_loading(&self) -> Option<&[u8]> {

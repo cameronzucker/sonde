@@ -2,11 +2,34 @@
 //! pilot-aided equalization → per-bit LLR computation across data
 //! sub-carriers.
 
+use crate::audio_io::SAMPLE_RATE_HZ;
 use crate::constellations::{Constellation, Mapper};
 use crate::ofdm_main::equalizer::OfdmEqualizer;
 use crate::ofdm_main::ofdm_params::OfdmParams;
 use num_complex::Complex;
 use rustfft::FftPlanner;
+
+/// Reference noise bandwidth (the SSB channel) for the link-facing SNR report,
+/// in Hz. See `docs/superpowers/specs/2026-06-15-phy-mode-adaptation-quality-design.md`.
+pub const SNR_REFERENCE_BANDWIDTH_HZ: f32 = 2500.0;
+/// Conservative SNR (dB) reported when the signal is unmeasurable (pilot power at
+/// or below the noise floor). Never an optimistic clamp — a deep fade reports
+/// "very bad", which makes the link downshift (Codex review C2).
+pub const SNR_FLOOR_DB: f32 = -30.0;
+/// Upper clamp (dB) on the reported channel SNR.
+pub const SNR_CEIL_DB: f32 = 40.0;
+
+/// Channel-SNR estimate referenced to a [`SNR_REFERENCE_BANDWIDTH_HZ`] noise
+/// bandwidth — the reference the link's adaptation ladder consumes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SnrEstimate {
+    /// Channel SNR in dB referenced to a 2500 Hz noise bandwidth.
+    pub snr_2500_db: f32,
+    /// `false` when the pilot-derived signal power fell at or below the estimated
+    /// noise floor (deep fade / no real signal). `snr_2500_db` is then the
+    /// conservative [`SNR_FLOOR_DB`], never an optimistic value.
+    pub valid: bool,
+}
 
 /// Numerator of the noise-scaled soft-LLR clamp: the clamp magnitude is
 /// `LLR_CLAMP_NUM / n0`. Bounds the damage a wrong-SIGN LLR (from
@@ -221,6 +244,77 @@ impl<'a> OfdmReceiver<'a> {
     /// transmitter side.
     pub fn demodulate_one_symbol(&self, samples: &[f32], bits_per_subcarrier: &[u8]) -> Vec<f32> {
         self.llrs_from_freq(&self.symbol_fft(samples), bits_per_subcarrier)
+    }
+
+    /// Estimate the per-over channel SNR referenced to a 2500 Hz noise bandwidth
+    /// from the frame's CONSECUTIVE OFDM `symbols`, using the SAME empty-bin /
+    /// pilot machinery the demod uses (an "estimator-domain" measurement — Codex
+    /// review C5: the link's per-mode thresholds are calibrated with this same
+    /// estimator). Each `symbols[i]` must be `fft_size + cp_len` samples; short
+    /// or mismatched symbols are skipped.
+    ///
+    /// Method (design 2026-06-15-phy-mode-adaptation-quality-design.md §2.4, C2):
+    /// - `N0` = mean empty-bin thermal noise variance per FFT bin
+    ///   ([`estimate_noise_variance`]), averaged over the frame's symbols.
+    /// - `S_bin` = mean pilot power `mean|freq[pilot]|²` **minus** `N0` — the
+    ///   PRE-equalization, pilot-derived signal power per occupied bin (never the
+    ///   post-EQ power, which hides fades). The BPSK floor drives pilots and data
+    ///   at equal power, so this is the per-occupied-bin signal power.
+    /// - Per-bin SNR `= S_bin / N0`; rescaled to the 2500 Hz reference by the
+    ///   mode's occupied bandwidth `W_occ = N_occ · (fs / fft_size)`:
+    ///   `SNR_2500_dB = 10log10(S_bin/N0) + 10log10(W_occ / 2500)`.
+    ///   The bandwidth term is why a narrower mode reports a lower `SNR_2500` for
+    ///   the same per-tone SNR — exactly what makes the link ladder monotonic.
+    ///
+    /// `S_bin ≤ 0` (pilot power at/below the noise floor) yields the conservative
+    /// [`SNR_FLOOR_DB`] with `valid = false` — never optimism.
+    pub fn estimate_snr_2500_db(&self, symbols: &[&[f32]]) -> SnrEstimate {
+        let p = self.params;
+        let pilots = p.pilot_indices();
+        let sym_len = p.fft_size() + p.cp_len();
+        let invalid = SnrEstimate {
+            snr_2500_db: SNR_FLOOR_DB,
+            valid: false,
+        };
+        if pilots.is_empty() {
+            return invalid;
+        }
+        let mut n0_sum = 0.0_f32;
+        let mut pilot_pow_sum = 0.0_f32;
+        let mut count = 0_u32;
+        for s in symbols {
+            if s.len() != sym_len {
+                continue;
+            }
+            let freq = self.symbol_fft(s);
+            let n0 = estimate_noise_variance(&freq, p);
+            let pilot_pow: f32 =
+                pilots.iter().map(|&b| freq[b].norm_sqr()).sum::<f32>() / pilots.len() as f32;
+            n0_sum += n0;
+            pilot_pow_sum += pilot_pow;
+            count += 1;
+        }
+        if count == 0 {
+            return invalid;
+        }
+        let n0 = (n0_sum / count as f32).max(1e-12);
+        let pilot_pow = pilot_pow_sum / count as f32;
+        let s_bin = pilot_pow - n0; // pre-EQ signal power per occupied bin
+        let valid = s_bin > 0.0;
+        // Floor the ratio so log10 stays finite even when S_bin ≤ 0; the result is
+        // then forced to SNR_FLOOR_DB anyway (conservative, never optimistic).
+        let snr_bin = s_bin.max(n0 * 1e-3) / n0;
+        let bin_width = SAMPLE_RATE_HZ as f32 / p.fft_size() as f32;
+        let w_occ = p.subcarrier_indices().len() as f32 * bin_width;
+        let snr_db = 10.0 * snr_bin.log10() + 10.0 * (w_occ / SNR_REFERENCE_BANDWIDTH_HZ).log10();
+        if valid {
+            SnrEstimate {
+                snr_2500_db: snr_db.clamp(SNR_FLOOR_DB, SNR_CEIL_DB),
+                valid: true,
+            }
+        } else {
+            invalid
+        }
     }
 
     /// Demodulate a whole frame of CONSECUTIVE OFDM symbols, time-smoothing the

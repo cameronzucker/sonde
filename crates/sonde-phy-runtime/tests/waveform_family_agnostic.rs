@@ -32,7 +32,7 @@ impl Waveform for ByteEchoWaveform {
             DecodeScan::Frame(DecodedFrame {
                 payload: bytes,
                 family: ModeFamily::OfdmMain,
-                frame_snr_db: Some(42.0),
+                snr_2500_db: Some(42.0),
             })
         }
     }
