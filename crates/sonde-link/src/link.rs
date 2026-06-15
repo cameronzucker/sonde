@@ -12,7 +12,6 @@
 
 use std::time::Duration;
 
-use sonde_phy::modes::ModeHint;
 use sonde_phy::phy_api::PhyTransport;
 
 use crate::conn::{ConnState, Connection, HostEvent};
@@ -23,13 +22,15 @@ use crate::host::HostCommand;
 pub struct Link<P: PhyTransport> {
     conn: Connection,
     phy: P,
-    hint: ModeHint,
 }
 
 impl<P: PhyTransport> Link<P> {
-    /// Wrap a connection and a PHY/transport with the mode hint to transmit under.
-    pub fn new(phy: P, conn: Connection, hint: ModeHint) -> Self {
-        Self { conn, phy, hint }
+    /// Wrap a connection and a PHY/transport. Frames are transmitted at the
+    /// connection's *current* mode ([`Connection::current_hint`]) — like the
+    /// [`Driver`](crate::Driver) — so a mid-session mode change takes effect on the
+    /// wire automatically (when the PHY exposes >1 waveform; see sonde-99l).
+    pub fn new(phy: P, conn: Connection) -> Self {
+        Self { conn, phy }
     }
 
     /// Begin connecting (initiator).
@@ -65,19 +66,34 @@ impl<P: PhyTransport> Link<P> {
     /// Pump one iteration at logical time `now`: ingest inbound frames, fire
     /// timers, flush this over's outbound frames, and return any host events.
     pub fn poll(&mut self, now: Duration) -> Vec<HostEvent> {
-        // Ingest: decode each received frame; a failed decode (corruption the
-        // CRC catches, or a collided fragment) is dropped, never delivered.
+        // Ingest into a batch first so the channel measurement is fed BEFORE the SM
+        // reacts (fresh worse-direction-wins). A failed decode (corruption the CRC
+        // catches, or a collided fragment) is dropped, never delivered.
+        let mut inbound = Vec::new();
         while let Some(rx) = self.phy.poll_rx() {
             if let Ok(frame) = LinkFrame::decode(rx.payload()) {
-                self.conn.handle_frame(frame, now);
+                inbound.push(frame);
             }
+        }
+        // Feed the measurement only on an actual decode (no stale re-apply).
+        if !inbound.is_empty() {
+            let q = self.phy.channel_quality();
+            self.conn.observe_quality(
+                q.aggregate_snr_db(),
+                q.frame_error_rate(),
+                q.recent_frames_total(),
+            );
+        }
+        for frame in inbound {
+            self.conn.handle_frame(frame, now);
         }
         // Advance timers (turn-recovery, retransmit, keepalive, death).
         self.conn.handle_timeout(now);
-        // Flush the current over to the wire.
+        // Flush the current over at the connection's CURRENT mode, so a mid-session
+        // rung change reaches the wire (matches the Driver).
         while let Some(frame) = self.conn.poll_transmit(now) {
             if let Ok(bytes) = frame.encode() {
-                let _ = self.phy.send_frame(&bytes, self.hint);
+                let _ = self.phy.send_frame(&bytes, self.conn.current_hint());
             }
         }
         // Drain host events.

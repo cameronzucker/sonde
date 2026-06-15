@@ -62,10 +62,18 @@ struct Rung {
     snr_floor_db: f32,
     over_airtime_ms: u64,
     per_over_mtu: usize,
+    /// Waveform-family id (0 = OFDM, 1 = floor, 2 = deep-floor). A measured SNR is
+    /// only predictive *within* a family — a clean floor decode does not prove a
+    /// wide-OFDM decode — so mid-session *upshift* may not skip a family
+    /// ([`adapt_rung`]); downshift (safety) may cross families freely. See the
+    /// symmetric-SNR adaptation design F1.
+    family: u8,
 }
 
 /// dB of effective-SNR penalty at FER = 1.0 (a fully-failing channel reads as
-/// ~40 dB worse than its raw SNR, forcing a descent down the ladder).
+/// ~40 dB worse than its raw SNR, forcing a descent down the ladder). Used by the
+/// **connect-time** [`route`]/[`recommended_rung`] selection only — the
+/// mid-session [`adapt_rung`] uses FER as a confidence gate instead (design F4).
 const FER_PENALTY_DB: f32 = 40.0;
 
 /// The ladder, fastest/most-fragile first → slowest/most-robust last.
@@ -78,6 +86,7 @@ fn ladder() -> [Rung; 5] {
             snr_floor_db: 18.0,
             over_airtime_ms: 300,
             per_over_mtu: 1024,
+            family: 0, // OFDM
         },
         Rung {
             mode: ModeHint::MainAuto,
@@ -86,6 +95,7 @@ fn ladder() -> [Rung; 5] {
             snr_floor_db: 8.0,
             over_airtime_ms: 500,
             per_over_mtu: 512,
+            family: 0, // OFDM
         },
         Rung {
             mode: ModeHint::MainAuto,
@@ -94,6 +104,7 @@ fn ladder() -> [Rung; 5] {
             snr_floor_db: 0.0,
             over_airtime_ms: 800,
             per_over_mtu: 256,
+            family: 0, // OFDM
         },
         Rung {
             mode: ModeHint::Floor,
@@ -102,6 +113,7 @@ fn ladder() -> [Rung; 5] {
             snr_floor_db: -12.0,
             over_airtime_ms: 3_000,
             per_over_mtu: 64,
+            family: 1, // floor
         },
         Rung {
             mode: ModeHint::FloorCrowdedBand,
@@ -110,6 +122,7 @@ fn ladder() -> [Rung; 5] {
             snr_floor_db: f32::NEG_INFINITY, // the bottom rung always qualifies
             over_airtime_ms: 30_000,
             per_over_mtu: 16,
+            family: 2, // deep-floor
         },
     ]
 }
@@ -122,6 +135,17 @@ pub const BASE_RUNG: u8 = NUM_RUNGS - 1;
 /// Index of the ladder rung used when no channel measurement exists yet
 /// (missing SNR ⇒ the mid OFDM rung, per design §6 / the PHY's `MainAuto`).
 pub const DEFAULT_RUNG: u8 = 1;
+
+/// SNR margin (dB) required *above* a faster rung's floor before upshifting onto it
+/// — the dead-band that stops flapping at a rung boundary (adaptation design F2).
+pub const ADAPT_UPSHIFT_MARGIN_DB: f32 = 3.0;
+/// Minimum FER sample count before FER is credible enough to gate a shift (F4).
+const FER_MIN_SAMPLES: u32 = 4;
+/// Upshift only when the (credible) FER is at or below this — actual decode success
+/// confirms the climb, regardless of how good the SNR looks (F4).
+const FER_UPSHIFT_MAX: f32 = 0.05;
+/// A credible FER at or above this forces a downshift on its own (F4).
+const FER_DOWNSHIFT_MIN: f32 = 0.20;
 
 /// Build a [`Route`] from a ladder rung, optionally capping the window to the
 /// frames a payload actually needs.
@@ -182,6 +206,76 @@ pub fn recommended_rung(quality: &ChannelQualityReport) -> u8 {
             .unwrap_or(rungs.len() - 1),
     };
     idx as u8
+}
+
+/// The waveform family of a ladder rung (0 = OFDM, 1 = floor, 2 = deep-floor).
+/// The link resets its SNR estimate when this changes (SNR is mode-conditioned).
+pub fn family_of(id: u8) -> u8 {
+    let rungs = ladder();
+    rungs[(id as usize).min(rungs.len() - 1)].family
+}
+
+/// The most-robust (highest-id) rung in the given waveform `family`.
+fn most_robust_in_family(rungs: &[Rung], family: u8) -> u8 {
+    rungs
+        .iter()
+        .rposition(|r| r.family == family)
+        .unwrap_or(rungs.len() - 1) as u8
+}
+
+/// Mid-session rung adaptation from a channel **measurement** (symmetric-SNR
+/// adaptation design). The receiver calls this to choose the rung it recommends the
+/// peer use; the sender obeys it (worse-direction-wins). This is distinct from the
+/// connect-time [`route`]/[`recommended_rung`] (which fold FER into an SNR penalty);
+/// here FER is a **confidence gate**, not a penalty (design F4).
+///
+/// - **Downshift** on `snr_raw` (no smoothing lag): the most-robust rung the raw
+///   SNR actually supports — authoritative, may jump several rungs and cross
+///   families (more-robust is always safe). A credibly-high FER also forces a step.
+/// - **Upshift** only when `snr_smoothed` clears a faster rung's floor **+
+///   [`ADAPT_UPSHIFT_MARGIN_DB`]** *and* FER is credibly low, capped to **one
+///   waveform-family step** per call (a clean decode on the current mode does not
+///   prove a different waveform decodes).
+/// - **Else** hold (inside the dead-band, or no credible measurement).
+pub fn adapt_rung(current: u8, snr_raw: f32, snr_smoothed: f32, fer: f32, fer_samples: u32) -> u8 {
+    let rungs = ladder();
+    let cur = (current as usize).min(rungs.len() - 1) as u8;
+
+    // Downshift: the fastest rung the RAW SNR supports; if that is more robust than
+    // where we are, drop straight to it (multi-step, cross-family allowed).
+    if snr_raw.is_finite() {
+        let supported = rungs
+            .iter()
+            .position(|r| snr_raw >= r.snr_floor_db)
+            .unwrap_or(rungs.len() - 1) as u8;
+        if supported > cur {
+            return supported;
+        }
+    }
+    // FER-driven downshift: credibly failing ⇒ one rung more robust.
+    if fer_samples >= FER_MIN_SAMPLES && fer >= FER_DOWNSHIFT_MIN && cur < BASE_RUNG {
+        return cur + 1;
+    }
+    // Upshift: smoothed SNR clears (faster floor + margin) AND FER is credibly low.
+    if snr_smoothed.is_finite() && fer_samples >= FER_MIN_SAMPLES && fer <= FER_UPSHIFT_MAX {
+        if let Some(up) = rungs
+            .iter()
+            .position(|r| snr_smoothed >= r.snr_floor_db + ADAPT_UPSHIFT_MARGIN_DB)
+        {
+            let up = up as u8;
+            if up < cur {
+                let cur_fam = rungs[cur as usize].family;
+                let up_fam = rungs[up as usize].family;
+                if up_fam == cur_fam {
+                    return up; // free within a family
+                }
+                // Crossing up a family: land at the most-robust rung of the family
+                // one step faster — never skip past it in a single decision.
+                return most_robust_in_family(&rungs, cur_fam - 1).max(up);
+            }
+        }
+    }
+    cur
 }
 
 #[cfg(test)]
@@ -284,5 +378,57 @@ mod tests {
             recommended_rung(&quality(25.0, 100, 0)) < recommended_rung(&quality(-25.0, 100, 0))
         );
         assert_eq!(recommended_rung(&quality(-25.0, 100, 0)), BASE_RUNG);
+    }
+
+    // ---- adapt_rung: measurement-based, symmetric, FER-gated (sonde-qnq) --------
+
+    #[test]
+    fn adapt_downshifts_to_the_rung_raw_snr_supports_multistep_and_crossfamily() {
+        // From rung 1, a collapse to -15 dB supports only BASE → jump straight there.
+        assert_eq!(adapt_rung(1, -15.0, -15.0, 0.0, 10), BASE_RUNG);
+        // A sag to 5 dB supports rung 2 (floor 0 dB) → 1 → 2.
+        assert_eq!(adapt_rung(1, 5.0, 5.0, 0.0, 10), 2);
+    }
+
+    #[test]
+    fn adapt_fer_forces_a_downshift_even_at_good_snr_but_only_when_credible() {
+        // Raw SNR fine for rung 1, but credibly-high FER → step down one.
+        assert_eq!(adapt_rung(1, 20.0, 20.0, 0.5, 8), 2);
+        // Same FER with too few samples ⇒ not credible ⇒ no FER-driven shift.
+        assert_eq!(adapt_rung(1, 20.0, 20.0, 0.5, 1), 1);
+    }
+
+    #[test]
+    fn adapt_upshift_needs_the_margin_above_the_floor() {
+        // 20 dB clears rung 1 (8+3) but NOT rung 0 (18+3=21) → hold at rung 1.
+        assert_eq!(adapt_rung(1, 20.0, 20.0, 0.0, 8), 1);
+        // 25 dB clears rung 0's floor+margin → climb to 0 (free within OFDM family).
+        assert_eq!(adapt_rung(1, 25.0, 25.0, 0.0, 8), 0);
+    }
+
+    #[test]
+    fn adapt_upshift_is_gated_by_credible_low_fer() {
+        // Great SNR but credibly-high FER → FER-downshift wins, never an upshift.
+        assert_eq!(adapt_rung(2, 25.0, 25.0, 0.30, 8), 3);
+        // Great SNR, low FER, but too few samples → hold (not yet credible to climb).
+        assert_eq!(adapt_rung(2, 25.0, 25.0, 0.0, 1), 2);
+    }
+
+    #[test]
+    fn adapt_upshift_across_a_family_is_capped_to_one_step() {
+        // At rung 3 (floor family) a great channel only steps into the OFDM family
+        // at its most-robust rung (2) — it does not leap to rung 0.
+        assert_eq!(adapt_rung(3, 25.0, 25.0, 0.0, 8), 2);
+        // The next decision then climbs freely within OFDM.
+        assert_eq!(adapt_rung(2, 25.0, 25.0, 0.0, 8), 0);
+    }
+
+    #[test]
+    fn adapt_holds_in_the_dead_band_and_without_a_measurement() {
+        // 12 dB at rung 1: supports rung 1, and 12 < rung-1-floor+margin for going
+        // faster ⇒ neither up nor down ⇒ hold (the dead-band).
+        assert_eq!(adapt_rung(1, 12.0, 12.0, 0.0, 8), 1);
+        // No measurement (NaN SNR, no samples) ⇒ hold the current rung.
+        assert_eq!(adapt_rung(1, f32::NAN, f32::NAN, 0.0, 0), 1);
     }
 }
