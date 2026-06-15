@@ -44,7 +44,7 @@ fn fer(snr_db: f64, n: u64) -> f64 {
         let mut captured = vec![0.0f32; 600];
         captured.extend_from_slice(&add_awgn_at_snr(&sig, snr_db, &mut rng));
         match wf.receive_scan(&captured) {
-            NfskDecode::Frame(got) if got == pl => {}
+            NfskDecode::Frame { payload, .. } if payload == pl => {}
             _ => fails += 1,
         }
     }
@@ -68,15 +68,55 @@ fn nfsk_self_syncs_and_decodes_over_awgn_with_a_knee() {
     );
 }
 
-/// A clean capture round-trips byte-exact (length + CRC framing works).
+/// A clean capture round-trips byte-exact AND reports a finite narrowband SNR
+/// (length + CRC framing works; the SNR estimator is wired — no more `None`).
 #[test]
-fn nfsk_clean_capture_round_trips_byte_exact() {
+fn nfsk_clean_capture_round_trips_byte_exact_with_snr() {
     let wf = NarrowFskFloor::new();
     let pl = b"deep floor".to_vec();
     let sig = wf.transmit_with_preamble(&pl).unwrap();
     let mut captured = vec![0.0f32; 600];
     captured.extend_from_slice(&sig);
-    assert_eq!(wf.receive_scan(&captured), NfskDecode::Frame(pl));
+    match wf.receive_scan(&captured) {
+        NfskDecode::Frame {
+            payload,
+            snr_2500_db,
+        } => {
+            assert_eq!(payload, pl);
+            assert!(
+                snr_2500_db.is_some_and(|s| s.is_finite()),
+                "nFSK reports a finite SNR_2500, not None"
+            );
+        }
+        other => panic!("expected a clean nFSK frame, got {other:?}"),
+    }
+}
+
+/// Reported nFSK SNR rises as the channel improves (the estimate tracks the
+/// channel, not a constant).
+#[test]
+fn nfsk_reported_snr_rises_with_channel() {
+    let wf = NarrowFskFloor::new();
+    let mut rng = ChaCha8Rng::seed_from_u64(0xBEEF);
+    let snr_at = |db: f64, rng: &mut ChaCha8Rng| -> f32 {
+        let pl = payload(1, 12);
+        let sig = wf.transmit_with_preamble(&pl).unwrap();
+        let mut cap = vec![0.0f32; 600];
+        cap.extend_from_slice(&add_awgn_at_snr(&sig, db, rng));
+        match wf.receive_scan(&cap) {
+            NfskDecode::Frame { snr_2500_db, .. } | NfskDecode::Detected { snr_2500_db } => {
+                snr_2500_db.unwrap_or(f32::NAN)
+            }
+            NfskDecode::NoSignal => f32::NAN,
+        }
+    };
+    // Anchors both above the preamble-detection knee so an SNR is reported at each.
+    let lo = snr_at(6.0, &mut rng);
+    let hi = snr_at(20.0, &mut rng);
+    assert!(
+        hi > lo + 3.0,
+        "reported nFSK SNR must rise with channel SNR: {lo:.1} @6 vs {hi:.1} @20"
+    );
 }
 
 /// Pure noise reads as NoSignal, never a spurious frame (FER honesty).
