@@ -18,6 +18,21 @@ use sonde_phy::robustness_floor::wideband_lowdensity::{
     SyncDecodeOutcome, WidebandLowDensityFloor,
 };
 
+/// The standard Sonde waveform registry — the full adaptation ladder, fastest
+/// rung first (RX try-order): `ofdm-wide` → `ofdm-mid` → `ofdm-narrow` →
+/// `floor-wblo` → `floor-nfsk`. Hand this to [`crate::SondePhy::with_waveforms`]
+/// for a runtime that auto-detects + per-mode-routes the whole ladder. All five
+/// are hardware-free (the radio is the only hardware seam).
+pub fn standard_waveforms() -> Vec<Box<dyn Waveform>> {
+    vec![
+        Box::new(OfdmMainWaveform::wide()),
+        Box::new(OfdmMainWaveform::mid()),
+        Box::new(OfdmMainWaveform::narrow()),
+        Box::new(FloorWaveform::new()),
+        Box::new(NfskWaveform::new()),
+    ]
+}
+
 /// One successfully demodulated frame.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedFrame {
