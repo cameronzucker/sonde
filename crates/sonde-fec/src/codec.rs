@@ -135,6 +135,28 @@ impl FloorRate14Codec {
     pub fn parity_check_matrix(&self) -> &ParityCheckMatrix {
         &self.h
     }
+
+    /// DIAGNOSTIC (sonde-xhw.4 Gate B): decode to info-payload bits IGNORING the
+    /// CRC gate — returns the SPA's hard decisions even when the frame would fail
+    /// CRC. Lets a coding-gain measurement compute a true post-FEC BER, since the
+    /// production [`FecCodec::decode_soft`] returns `Err` with NO bits on CRC
+    /// failure (all-or-nothing). NOT for production receive — a real receiver
+    /// must honor the CRC; this exists only so a gate can plot coded BER vs
+    /// uncoded BER on a shared axis.
+    pub fn decode_soft_payload_unchecked(&self, llr: &[f32]) -> Vec<u8> {
+        assert_eq!(
+            llr.len(),
+            self.n,
+            "decode_soft_payload_unchecked: llr.len() {} != n {}",
+            llr.len(),
+            self.n
+        );
+        let perm = deinterleave_index_perm(self.n, INTERLEAVER_ROWS);
+        let deint_llrs: Vec<f32> = (0..self.n).map(|i| llr[perm[i]]).collect();
+        let outcome = self.decoder.decode(&deint_llrs, MAX_ITERS_OFDM);
+        let info_plus_crc: BitVec<u8> = outcome.decoded[..self.ldpc_k].iter().copied().collect();
+        bitvec_to_bytes(&info_plus_crc[..self.payload_bits()])
+    }
 }
 
 impl Default for FloorRate14Codec {
