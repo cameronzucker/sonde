@@ -619,6 +619,40 @@ body {
 .stage-tag--data { color: var(--teal); }
 .stage-tag--ack { color: var(--amber); }
 
+/* Per-station V/U meter, overlaid at the bottom of each waterfall. */
+.vu {
+  position: absolute; left: 8px; right: 8px; bottom: 8px; z-index: 3;
+  display: flex; align-items: center; gap: 7px; pointer-events: none;
+  font-family: var(--font-mono);
+}
+.vu__lbl { font-size: 9px; color: var(--muted); flex: none; min-width: 8px; text-align: center; }
+.vu__track {
+  position: relative; flex: 1; height: 7px; border-radius: 4px; overflow: hidden;
+  background: rgba(0, 0, 0, 0.55); border: 1px solid var(--line);
+}
+.vu__fill {
+  position: absolute; left: 0; top: 0; bottom: 0; width: 0%;
+  background: linear-gradient(90deg, var(--green-ok), var(--yellow) 72%, var(--red));
+  transition: width 0.05s linear;
+}
+.vu__peak {
+  position: absolute; top: -1px; bottom: -1px; left: 0%; width: 2px;
+  background: var(--ink); box-shadow: 0 0 4px rgba(255, 255, 255, 0.6);
+}
+.vu__db { font-size: 9px; color: var(--faint); flex: none; min-width: 34px; text-align: right; }
+
+/* Constellation — honest stub (Sonde-side; ARDOP doesn't expose demod symbols). */
+.cockpit__right .panel--constellation { flex: 0 0 auto; }
+.const-stub { padding: 10px 14px 14px; display: flex; align-items: center; gap: 13px; }
+.const-stub__plane {
+  position: relative; width: 78px; height: 78px; flex: none; opacity: 0.7;
+  border: 1px solid var(--line); border-radius: 6px; background: rgba(0, 0, 0, 0.3);
+}
+.const-stub__axis { position: absolute; background: var(--line-strong); }
+.const-stub__axis--x { left: 8%; right: 8%; top: 50%; height: 1px; }
+.const-stub__axis--y { top: 8%; bottom: 8%; left: 50%; width: 1px; }
+.const-stub__note { margin: 0; font-size: 11px; line-height: 1.5; color: var(--faint); }
+
 /* Telemetry: compact stat cells. */
 .cockpit .stats { gap: 1px; }
 .cockpit .stat { padding: 8px 11px; }

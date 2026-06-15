@@ -99,6 +99,11 @@
                 <span class="reg reg--br" aria-hidden="true"></span>
                 <div class="stage__boot">press Connect…</div>
               </div>
+              <div class="vu" id="vu-fwd" aria-label="Station A on-air audio level">
+                <span class="vu__lbl">A</span>
+                <div class="vu__track"><div class="vu__fill"></div><div class="vu__peak"></div></div>
+                <span class="vu__db">—</span>
+              </div>
             </div>
             <div class="stage-wrap">
               <span class="stage-tag stage-tag--ack">B → A · ACK / NAK</span>
@@ -108,6 +113,11 @@
                 <span class="reg reg--bl" aria-hidden="true"></span>
                 <span class="reg reg--br" aria-hidden="true"></span>
                 <div class="stage__boot">press Connect…</div>
+              </div>
+              <div class="vu" id="vu-rev" aria-label="Station B on-air audio level">
+                <span class="vu__lbl">B</span>
+                <div class="vu__track"><div class="vu__fill"></div><div class="vu__peak"></div></div>
+                <span class="vu__db">—</span>
               </div>
             </div>
           </div>
@@ -165,6 +175,23 @@
           </div>
           <div class="recon">
             <canvas id="recon-image" width="320" height="240" aria-label="Reconnaissance photo delivered over the ARQ link"></canvas>
+          </div>
+        </section>
+
+        <!-- CONSTELLATION — honest stub: ARDOP doesn't expose demod symbols. -->
+        <section class="panel panel--constellation" aria-labelledby="const-label">
+          <div class="panel__head">
+            <h2 class="panel__title" id="const-label"><span class="idx">05</span> Constellation</h2>
+            <span class="panel__hint">Sonde-side</span>
+          </div>
+          <div class="const-stub">
+            <div class="const-stub__plane" aria-hidden="true">
+              <span class="const-stub__axis const-stub__axis--x"></span>
+              <span class="const-stub__axis const-stub__axis--y"></span>
+            </div>
+            <p class="const-stub__note">An I/Q symbol constellation arrives with the
+              <strong>Sonde</strong> comparison — Sonde's own receiver exposes its demodulated
+              symbols. ARDOP is a black box and doesn't, so there's nothing honest to plot here yet.</p>
           </div>
         </section>
       </aside>

@@ -12,6 +12,7 @@ import { createSessionLog } from "./session-log.js";
 import { createImageReveal } from "./image-reveal.js";
 import { createControls } from "./controls.js";
 import { createLiveAudio } from "./live-audio.js";
+import { createMeter } from "./vu-meter.js";
 
 // ── DOM handles ─────────────────────────────────────────────────────────────
 const el = (id) => document.getElementById(id);
@@ -26,7 +27,7 @@ const muteBtn = el("mute-btn");
 const muteGlyph = el("mute-glyph");
 
 // ── Module instances + run state ─────────────────────────────────────────────
-let waterfallFwd, waterfallRev, imageReveal, sessionLog, controls, liveAudio;
+let waterfallFwd, waterfallRev, meterFwd, meterRev, imageReveal, sessionLog, controls, liveAudio;
 let imageRange = [0, 0];
 let seed = 1;
 let session = null;   // current EventSource controller ({close})
@@ -70,6 +71,8 @@ function runConnectedSession(state) {
   sessionLog.reset();
   waterfallFwd.reset();
   waterfallRev.reset();
+  meterFwd.reset();
+  meterRev.reset();
   clearTelemetry();
   statSnr.textContent = `${state.snrDb} dB`;
   imageReveal.showFailed("CONNECTING…", `${state.condition} · ${state.arqbw.replace("MAX", " Hz max")}`);
@@ -179,6 +182,9 @@ async function boot() {
     getAnalyser: () => liveAudio.getAnalyser("rev"),
     isPlaying: () => liveAudio.isPlaying("rev"),
   });
+  // Per-station V/U meters off the same per-direction analysers (real on-air level).
+  meterFwd = createMeter(el("vu-fwd"), { getAnalyser: () => liveAudio.getAnalyser("fwd") });
+  meterRev = createMeter(el("vu-rev"), { getAnalyser: () => liveAudio.getAnalyser("rev") });
   sessionLog = createSessionLog(el("session-log-stream"), el("session-progress"));
   imageReveal = createImageReveal(el("recon-image"));
   controls = createControls(runConnectedSession);
