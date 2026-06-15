@@ -62,11 +62,11 @@ def _stream_tap_audio(taps, emit, stop, rate=SESSION_RATE, chunk=_AUDIO_CHUNK_BY
     """Tail each on-air tap file and emit per-direction base64 PCM `audio` events LIVE.
 
     `taps` is [(dir, path), ...] — e.g. ("fwd", A->B data) and ("rev", B->A acks).
-    Each direction's `channel_filter --tap` appends its impaired on-air PCM (what that
+    Each direction's `hf-channel-pcm --tap` appends its impaired on-air PCM (what that
     station's listener hears), flushing every block. We tail each independently and
     tag every chunk with its direction, so the frontend can drive a separate waterfall
     for each station — you see the data sender and the receiver's ACK/NAK bursts
-    alternating (half-duplex). Never touches the proven arecord|channel_filter|aplay
+    alternating (half-duplex). Never touches the proven arecord|hf-channel-pcm|aplay
     OS pipes, so it can't perturb ARDOP's handshake timing."""
     for _ in range(200):  # wait up to ~4 s for the writers to create the files
         if all(os.path.exists(p) for _d, p in taps) or stop.is_set():

@@ -8,8 +8,9 @@ ARDOP protocol (handshake + negotiated data mode + ARQ), not the one-way PHY dem
 Topology (two snd-aloop cards, bidirectional-per-card):
     Station A  <-> card aldA dev0          Station B  <-> card aldB dev0
     bridge uses aldA dev1 / aldB dev1
-    A->B:  arecord aldA,1 | channel_filter | aplay aldB,1
-    B->A:  arecord aldB,1 | channel_filter | aplay aldA,1
+    A->B:  arecord aldA,1 | hf-channel-pcm | aplay aldB,1
+    B->A:  arecord aldB,1 | hf-channel-pcm | aplay aldA,1
+    (hf-channel-pcm = the real ITU-R F.520 Watterson channel binary from hf-channel-sim)
 
 Prereq: snd-aloop loaded as two cards (the runner does this):
     sudo modprobe -r snd-aloop; sudo modprobe snd-aloop enable=1,1 \
@@ -35,7 +36,11 @@ import time
 
 ARDOPCF = os.environ.get("ARDOPCF", os.path.expanduser("~/Code/ardopcf-spike/build/linux/ardopcf"))
 HERE = os.path.dirname(os.path.abspath(__file__))
-FILTER = os.path.join(HERE, "channel_filter.py")
+# Real ITU-R F.520 channel: the hf-channel-sim streaming binary (Watterson multipath
+# + fixed-floor AWGN). Built with `cargo build --release -p hf-channel-sim`. Override
+# with $HF_CHANNEL_PCM. (Supersedes the AWGN-only channel_filter.py stand-in.)
+CHANNEL_BIN = os.environ.get(
+    "HF_CHANNEL_PCM", os.path.normpath(os.path.join(HERE, "../../target/release/hf-channel-pcm")))
 PAYLOAD = os.path.join(HERE, "../site/assets/payload.bin")
 RATE = 12000  # Hz, the loopback + on-air sample rate
 
@@ -203,12 +208,12 @@ CONDITIONS = {"none", "good", "moderate", "poor", "flutter"}
 
 
 def launch_bridge(src_card, dst_card, snr, condition, seed, tap=None):
-    """arecord src dev1 | channel_filter | aplay dst dev1, one direction.
+    """arecord src dev1 | hf-channel-pcm | aplay dst dev1, one direction.
 
     Built as chained Popens (NO shell) so the SNR/condition values — which come
     from the UI via the backend — can't be shell-injected. `tap`, when set, asks
-    channel_filter to also write the impaired on-air PCM to that file (used for the
-    data direction only, to feed the live waterfall)."""
+    hf-channel-pcm to also write the impaired on-air PCM to that file (per direction,
+    to feed that station's live waterfall)."""
     if condition not in CONDITIONS:
         raise ValueError(f"bad condition {condition!r}")
     snr = float(snr)
@@ -222,7 +227,7 @@ def launch_bridge(src_card, dst_card, snr, condition, seed, tap=None):
     rec = subprocess.Popen(
         ["arecord", "-t", "raw", "-f", "S16_LE", "-r", str(RATE), "-c1", *lowlat,
          "-D", f"plughw:CARD={src_card},DEV=1"], stdout=subprocess.PIPE, stderr=dn)
-    flt_cmd = ["python3", "-u", FILTER, "--snr", str(snr),
+    flt_cmd = [CHANNEL_BIN, "--snr-db", str(snr), "--sample-rate", str(RATE),
                "--condition", condition, "--seed", str(seed)]
     if tap:
         flt_cmd += ["--tap", tap]
@@ -297,6 +302,11 @@ def run_session(params, emit, should_abort=None):
     if not aloop_ready():
         emit({"t": "error", "msg": "snd-aloop cards (aldA/aldB) not loaded — run the "
               "modprobe from the handoff before starting a session."})
+        emit({"t": "done"})
+        return 4
+    if not os.path.exists(CHANNEL_BIN):
+        emit({"t": "error", "msg": f"channel binary not built ({CHANNEL_BIN}) — run "
+              "`cargo build --release -p hf-channel-sim`."})
         emit({"t": "done"})
         return 4
 

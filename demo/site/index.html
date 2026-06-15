@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>HF Data Modem — Live ARDOP Connected-Mode Demo</title>
-  <meta name="description" content="Watch two real ARDOP modems connect over a simulated HF channel — live: real CONNECT handshake, bandwidth negotiation, and adaptive-rate ARQ delivering an EmComm SITREP image, with the on-air signal streamed live to a 3D waterfall." />
+  <meta name="description" content="Watch two real ARDOP modems connect over a real ITU-R F.520 Watterson HF channel — live: real CONNECT handshake, bandwidth negotiation, and adaptive-rate ARQ delivering an EmComm SITREP image, with the on-air signal streamed live to a 3D waterfall." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Chivo:ital,wght@0,300;0,400;0,500;0,700;0,900;1,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -34,7 +34,7 @@
           <strong>SONDE</strong>
           <span class="wordmark__sub">HF DATA MODEM</span>
         </span>
-        <span class="chip chip--live"><span class="chip__dot"></span>2 REAL ARDOP MODEMS · SIM CHANNEL · NOT ON-AIR</span>
+        <span class="chip chip--live"><span class="chip__dot"></span>2 REAL ARDOP MODEMS · WATTERSON CHANNEL · NOT ON-AIR</span>
       </div>
 
       <div class="topbar__levers">
@@ -176,15 +176,18 @@
     <div class="honesty" role="note">
       <span class="honesty__mark" aria-hidden="true">▲</span>
       <p>
-        <strong>Two real modems · a live connection · simulated channel · not on-air.</strong>
+        <strong>Two real modems · a live connection · a real Watterson channel · not on-air.</strong>
         Each session stands up <strong>two real ARDOP</strong> stations (ardopcf) and runs an actual
         <strong>connection</strong> between them — CONNECT handshake, bandwidth negotiation, and
-        <strong>adaptive-rate ARQ</strong> — with their audio bridged through a synthetic HF channel on
-        the backend and streamed to your browser live. No radio is keyed. ARDOP has a link layer, so
-        lost blocks are <em>retransmitted</em>: at a workable SNR the image arrives <strong>intact</strong>,
-        the modems <strong>adapt the rate down</strong> as conditions worsen, and below the cliff the
-        <strong>connection never closes</strong>. ARDOP is a known-good external baseline — the bar Sonde
-        is being built to meet — and is never reimplemented here.
+        <strong>adaptive-rate ARQ</strong> — with their audio bridged through the project's
+        <strong>hf-channel-sim</strong> (a real <strong>ITU-R&nbsp;F.520 Watterson</strong> ionospheric
+        model: multipath fading + Doppler at the Good/Moderate/Poor/Flutter presets) and streamed to your
+        browser live. No radio is keyed. ARDOP has a link layer, so lost blocks are <em>retransmitted</em>:
+        at a workable SNR the image arrives <strong>intact</strong>, the modems <strong>adapt the rate
+        down</strong> as the channel worsens, and below the cliff the <strong>connection never closes</strong>.
+        ARDOP is a known-good external baseline — the bar Sonde is being built to meet — and is never
+        reimplemented here. <em>(SNR is referenced to a fixed TX level over the full audio band, not yet
+        calibrated to a standard 2.4&nbsp;kHz noise bandwidth, so treat the dB as relative.)</em>
       </p>
     </div>
 
@@ -196,7 +199,8 @@
           airtime — it plays out live over ~30–60 s.</li>
         <li><strong>Two real ARDOP stations connect.</strong> The backend runs a real CONNECT handshake,
           negotiates a bandwidth, and transfers a ~3&nbsp;KB image over <strong>adaptive-rate ARQ</strong> —
-          their audio bridged through a synthetic HF channel. Real modulation, real FEC, real retransmission.</li>
+          their audio bridged through a real ITU-R F.520 Watterson HF channel (hf-channel-sim). Real
+          modulation, real fading, real FEC, real retransmission.</li>
         <li><strong>Watch + hear it live.</strong> The on-air signal streams to the waterfall (and your
           speakers) as it transmits; the connection/ARQ log streams the handshake, the negotiated mode, and
           every rate change; the recon photo lands intact — slower as the rate drops, and not at all once the
