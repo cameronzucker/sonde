@@ -58,46 +58,57 @@ _SESSION_ABORT = threading.Event()
 _AUDIO_CHUNK_BYTES = 2880
 
 
-def _stream_tap_audio(tap_path, emit, stop, rate=SESSION_RATE, chunk=_AUDIO_CHUNK_BYTES):
-    """Tail the growing on-air tap file and emit base64 PCM `audio` events LIVE.
+def _stream_tap_audio(taps, emit, stop, rate=SESSION_RATE, chunk=_AUDIO_CHUNK_BYTES):
+    """Tail each on-air tap file and emit per-direction base64 PCM `audio` events LIVE.
 
-    The bridge's `channel_filter --tap` appends the impaired on-air PCM (what the RX
-    hears) to `tap_path`, flushing every block. We tail that file and forward the new
-    bytes to the browser as the session transmits, so the waterfall + sound are live.
-    This never touches the proven arecord|channel_filter|aplay OS pipe, so it can't
-    perturb ARDOP's half-duplex handshake timing."""
-    for _ in range(200):  # wait up to ~4 s for the writer to create the file
-        if os.path.exists(tap_path) or stop.is_set():
+    `taps` is [(dir, path), ...] — e.g. ("fwd", A->B data) and ("rev", B->A acks).
+    Each direction's `channel_filter --tap` appends its impaired on-air PCM (what that
+    station's listener hears), flushing every block. We tail each independently and
+    tag every chunk with its direction, so the frontend can drive a separate waterfall
+    for each station — you see the data sender and the receiver's ACK/NAK bursts
+    alternating (half-duplex). Never touches the proven arecord|channel_filter|aplay
+    OS pipes, so it can't perturb ARDOP's handshake timing."""
+    for _ in range(200):  # wait up to ~4 s for the writers to create the files
+        if all(os.path.exists(p) for _d, p in taps) or stop.is_set():
             break
         time.sleep(0.02)
-    try:
-        f = open(tap_path, "rb")
-    except OSError:
+    chans = []
+    for d, path in taps:
+        try:
+            chans.append({"dir": d, "f": open(path, "rb"), "buf": bytearray()})
+        except OSError:
+            pass
+    if not chans:
         return
-    buf = bytearray()
     empties_after_stop = 0
     try:
         while True:
-            data = f.read(65536)
-            if data:
-                buf += data
-                empties_after_stop = 0
-                while len(buf) >= chunk:
-                    emit({"t": "audio", "rate": rate,
-                          "pcm": base64.b64encode(bytes(buf[:chunk])).decode("ascii")})
-                    del buf[:chunk]
-            else:
+            got_any = False
+            for c in chans:
+                data = c["f"].read(65536)
+                if data:
+                    c["buf"] += data
+                    got_any = True
+                    while len(c["buf"]) >= chunk:
+                        emit({"t": "audio", "dir": c["dir"], "rate": rate,
+                              "pcm": base64.b64encode(bytes(c["buf"][:chunk])).decode("ascii")})
+                        del c["buf"][:chunk]
+            if not got_any:
                 if stop.is_set():
                     empties_after_stop += 1
                     if empties_after_stop >= 3:  # drained ~75 ms past teardown
-                        n = len(buf) & ~1  # keep int16 alignment
-                        if n:
-                            emit({"t": "audio", "rate": rate,
-                                  "pcm": base64.b64encode(bytes(buf[:n])).decode("ascii")})
+                        for c in chans:
+                            n = len(c["buf"]) & ~1  # int16 align
+                            if n:
+                                emit({"t": "audio", "dir": c["dir"], "rate": rate,
+                                      "pcm": base64.b64encode(bytes(c["buf"][:n])).decode("ascii")})
                         break
                 time.sleep(0.025)
+            else:
+                empties_after_stop = 0
     finally:
-        f.close()
+        for c in chans:
+            c["f"].close()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -157,13 +168,19 @@ class Handler(BaseHTTPRequestHandler):
         _SESSION_ABORT.set()
         with _SESSION_LOCK:
             _SESSION_ABORT.clear()
-            tap = os.path.join(_AUDIO_DIR, "session_air.raw")
-            open(tap, "wb").close()  # fresh tap; the tailer reads from byte 0
+            # Tap BOTH directions: A->B (data) and B->A (acks), mixed into one
+            # on-air stream so the receiver's ACK/NAK bursts are heard + seen too.
+            tap_fwd = os.path.join(_AUDIO_DIR, "air_fwd.raw")
+            tap_rev = os.path.join(_AUDIO_DIR, "air_rev.raw")
+            for p in (tap_fwd, tap_rev):
+                open(p, "wb").close()  # fresh; the tailer reads from byte 0
             params = SessionParams(
-                snr=snr, condition=condition, seed=seed, arqbw=arqbw, tap=tap)
+                snr=snr, condition=condition, seed=seed, arqbw=arqbw,
+                tap=tap_fwd, tap_rev=tap_rev)
             stop = threading.Event()
             tailer = threading.Thread(
-                target=_stream_tap_audio, args=(tap, emit, stop), daemon=True)
+                target=_stream_tap_audio,
+                args=([("fwd", tap_fwd), ("rev", tap_rev)], emit, stop), daemon=True)
             tailer.start()
             try:
                 run_session(params, emit,

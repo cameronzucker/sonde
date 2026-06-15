@@ -261,7 +261,7 @@ class SessionParams:
 
     def __init__(self, snr=20.0, condition="none", seed=1, arqbw="2000MAX",
                  call_a="N0AAA", call_b="N0BBB", timeout=60.0, payload=PAYLOAD,
-                 data_timeout=90.0, tap=None):
+                 data_timeout=90.0, tap=None, tap_rev=None):
         self.snr = float(snr)
         self.condition = condition
         self.seed = int(seed)
@@ -271,7 +271,8 @@ class SessionParams:
         self.timeout = float(timeout)
         self.payload = payload
         self.data_timeout = float(data_timeout)
-        self.tap = tap  # file path for the data-direction on-air PCM, or None
+        self.tap = tap          # A->B (data) on-air PCM tap path, or None
+        self.tap_rev = tap_rev  # B->A (acks) on-air PCM tap path, or None
 
 
 # Allowlist of ARQBW values ardopcf accepts (operator-facing bandwidth ceiling).
@@ -314,9 +315,10 @@ def run_session(params, emit, should_abort=None):
             return 4
 
         emit({"t": "phase", "phase": "bridge", "msg": "channel bridges up (both directions)"})
-        # Tap the data direction (A->B) for the waterfall; B->A is ACKs only.
+        # Tap both directions: A->B (data) and B->A (acks), each to its own file,
+        # so the frontend can show a waterfall per station (half-duplex turn-taking).
         procs += launch_bridge("aldA", "aldB", params.snr, params.condition, params.seed, tap=params.tap)
-        procs += launch_bridge("aldB", "aldA", params.snr, params.condition, params.seed + 1)
+        procs += launch_bridge("aldB", "aldA", params.snr, params.condition, params.seed + 1, tap=params.tap_rev)
         time.sleep(1.0)
 
         on_line = lambda name, line: emit({"t": "host", "station": name, "line": line})
