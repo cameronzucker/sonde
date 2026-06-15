@@ -105,7 +105,7 @@ pub struct Connection {
     /// Whether `remote` is learned-from-CONN (acceptor) vs configured (initiator).
     remote_is_learned: bool,
     profile: ModeProfile,
-    conn_id: u16,
+    conn_id: u32,
 
     state: ConnState,
     floor: Floor,
@@ -151,7 +151,7 @@ impl Connection {
     pub fn initiator(
         local: Callsign,
         remote: Callsign,
-        conn_id: u16,
+        conn_id: u32,
         profile: ModeProfile,
         window: u32,
     ) -> Self {
@@ -170,7 +170,7 @@ impl Connection {
         local: Callsign,
         remote: Option<Callsign>,
         remote_is_learned: bool,
-        conn_id: u16,
+        conn_id: u32,
         profile: ModeProfile,
         window: u32,
     ) -> Self {
@@ -678,7 +678,7 @@ impl Connection {
         self.outbox.extend(built);
     }
 
-    fn accept_connection_as_acceptor(&mut self, conn_id: u16, seq: u32, now: Duration) {
+    fn accept_connection_as_acceptor(&mut self, conn_id: u32, seq: u32, now: Duration) {
         self.conn_id = conn_id;
         self.state = ConnState::Connected;
         // The initiator owns the first floor; listen for it, but fall back to
@@ -698,6 +698,10 @@ impl Connection {
             Some(id) if id.dst == self.local => id.src.clone(),
             _ => return,
         };
+        // The reserved (zero) conn_id is never a live session — reject (sonde-44n).
+        if frame.conn_id == crate::frame::CONN_ID_RESERVED {
+            return;
+        }
         match self.state {
             ConnState::Closed => {
                 if self.remote_is_learned {
@@ -710,12 +714,27 @@ impl Connection {
                 self.accept_connection_as_acceptor(frame.conn_id, frame.seq, now);
             }
             ConnState::Connected => {
-                // Idempotent CONN replay for THIS session, from our peer: peer
-                // didn't hear our CONN_ACK — resend it. A different conn_id is a
-                // stale/half-open peer (R6 follow-up): drop, do not regress.
-                if frame.conn_id == self.conn_id && self.remote.as_ref() == Some(&peer) {
-                    let ack = self.make_control(FrameType::ConnAck, frame.seq);
-                    self.outbox.push_back(ack);
+                // Only a CONN from our current peer is relevant while connected (a
+                // third station's CONN is ignored — we hold the single half-duplex
+                // session).
+                if self.remote.as_ref() == Some(&peer) {
+                    if frame.conn_id == self.conn_id {
+                        // Idempotent CONN replay for THIS session: the peer didn't
+                        // hear our CONN_ACK — resend it, without resetting.
+                        let ack = self.make_control(FrameType::ConnAck, frame.seq);
+                        self.outbox.push_back(ack);
+                    } else {
+                        // Fresh CONN from our peer with a NEW conn_id: the peer
+                        // rebooted or lost our DISC (half-open). Accept it as a
+                        // reconnect — flush the stale session and re-accept — rather
+                        // than dropping it and wedging forever (there is no idle
+                        // keepalive yet) (sonde-ajn / B6). `reset_session` clears the
+                        // old ARQ/reassembly + (for a learner) the learned peer, so
+                        // re-establish `remote` before accepting.
+                        self.reset_session();
+                        self.remote = Some(peer);
+                        self.accept_connection_as_acceptor(frame.conn_id, frame.seq, now);
+                    }
                 }
             }
             ConnState::Connecting => {
@@ -876,7 +895,7 @@ mod tests {
     }
 
     /// A CONN from `K1ABC` to `W2XYZ` (the standard peer pair in these tests).
-    fn conn_from_k1abc(conn_id: u16, seq: u32) -> LinkFrame {
+    fn conn_from_k1abc(conn_id: u32, seq: u32) -> LinkFrame {
         LinkFrame::id_control(
             FrameType::Conn,
             StationId::new(call("K1ABC"), call("W2XYZ")),
@@ -1183,6 +1202,64 @@ mod tests {
         let id = ack.id.expect("CONN_ACK is ID-bearing");
         assert_eq!(id.src.as_str(), "W2XYZ", "we identify as ourselves");
         assert_eq!(id.dst.as_str(), "K1ABC", "addressed to the learned caller");
+    }
+
+    #[test]
+    fn connected_peer_reconnect_with_new_conn_id_is_accepted() {
+        // sonde-ajn (B6): peer reboots / lost our DISC and sends a fresh CONN with a
+        // NEW conn_id while we still think we're Connected. Accept it as a reconnect
+        // (flush old session, adopt the new conn_id, CONN_ACK) — never wedge forever.
+        let mut b = acc();
+        b.handle_frame(conn_from_k1abc(0x1111, FIRST_SEQ), Duration::ZERO);
+        assert_eq!(b.state, ConnState::Connected);
+        let _ = b.poll_transmit(Duration::ZERO); // drain the first CONN_ACK
+                                                 // Peer reboots: fresh CONN, different conn_id, same station.
+        b.handle_frame(conn_from_k1abc(0x2222, FIRST_SEQ), Duration::ZERO);
+        assert_eq!(
+            b.state,
+            ConnState::Connected,
+            "still connected after reconnect"
+        );
+        assert_eq!(b.conn_id, 0x2222, "adopted the reconnect's new conn_id");
+        let ack = b
+            .poll_transmit(Duration::ZERO)
+            .expect("CONN_ACK for the reconnect");
+        assert_eq!(ack.frame_type, FrameType::ConnAck);
+        assert_eq!(ack.conn_id, 0x2222, "CONN_ACK carries the new conn_id");
+    }
+
+    #[test]
+    fn connected_replay_of_same_conn_id_just_resends_conn_ack() {
+        // The idempotent path must still hold: a CONN replay with the SAME conn_id
+        // (peer didn't hear our CONN_ACK) resends CONN_ACK without resetting.
+        let mut b = acc();
+        b.handle_frame(conn_from_k1abc(0x1111, FIRST_SEQ), Duration::ZERO);
+        let _ = b.poll_transmit(Duration::ZERO);
+        b.handle_frame(conn_from_k1abc(0x1111, FIRST_SEQ), Duration::ZERO);
+        assert_eq!(b.conn_id, 0x1111, "conn_id unchanged on idempotent replay");
+        let ack = b.poll_transmit(Duration::ZERO).expect("CONN_ACK resent");
+        assert_eq!(ack.frame_type, FrameType::ConnAck);
+    }
+
+    #[test]
+    fn conn_bearing_the_reserved_zero_conn_id_is_rejected() {
+        // sonde-44n: conn_id 0 is reserved; a CONN proposing it is invalid and must
+        // not establish a session (an uninitialized/garbage frame or a peer that
+        // failed to pick a random nonzero id).
+        let mut b = acc();
+        b.handle_frame(
+            conn_from_k1abc(crate::frame::CONN_ID_RESERVED, FIRST_SEQ),
+            Duration::ZERO,
+        );
+        assert_eq!(
+            b.state,
+            ConnState::Closed,
+            "reserved conn_id must not connect"
+        );
+        assert!(
+            b.poll_transmit(Duration::ZERO).is_none(),
+            "no CONN_ACK for conn_id 0"
+        );
     }
 
     #[test]
