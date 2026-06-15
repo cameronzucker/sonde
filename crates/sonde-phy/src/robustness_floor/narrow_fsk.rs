@@ -32,10 +32,19 @@ pub enum NfskDecode {
     /// No preamble above the detector threshold — window held only noise.
     NoSignal,
     /// Preamble acquired but the framed payload failed its CRC (or was truncated)
-    /// — a genuine frame error.
-    Detected,
+    /// — a genuine frame error. Carries the narrowband channel SNR (dB, 2500 Hz
+    /// reference) measured from the (failed) over.
+    Detected {
+        /// Channel SNR (dB, 2500 Hz reference) of the detected-but-failed over.
+        snr_2500_db: Option<f32>,
+    },
     /// Clean decode: preamble acquired, length-delimited payload recovered + CRC OK.
-    Frame(Vec<u8>),
+    Frame {
+        /// Recovered payload bytes.
+        payload: Vec<u8>,
+        /// Channel SNR (dB, 2500 Hz reference) measured from the over.
+        snr_2500_db: Option<f32>,
+    },
 }
 
 /// CRC-32 (IEEE 802.3, reflected) over `bytes`. Inlined because `sonde-phy` cannot
@@ -220,12 +229,21 @@ impl NarrowFskFloor {
     /// Demodulate the `n_symbols` 8-FSK symbols starting at `base` to a byte stream
     /// (MSB-first, whole bytes only). Shared by [`Self::receive`] and
     /// [`Self::receive_scan`].
-    fn demod_bytes(&self, samples: &[f32], base: usize, n_symbols: usize) -> Vec<u8> {
+    fn demod_bytes(
+        &self,
+        samples: &[f32],
+        base: usize,
+        n_symbols: usize,
+    ) -> (Vec<u8>, Option<f32>) {
         let sps = self.samples_per_symbol();
         let mut planner = FftPlanner::<f32>::new();
         let fft_size = sps.next_power_of_two();
         let fft = planner.plan_fft_forward(fft_size);
         let mut bits = Vec::with_capacity(n_symbols * 3);
+        // Per-symbol noncoherent SNR: the chosen tone's power vs the mean power of
+        // the OTHER candidate tone bins (an in-band noise proxy at FFT resolution).
+        let mut snr_lin_sum = 0.0_f32;
+        let mut snr_count = 0u32;
         for s in 0..n_symbols {
             let start = base + s * sps;
             if start + sps > samples.len() {
@@ -238,28 +256,68 @@ impl NarrowFskFloor {
             buf.resize(fft_size, Complex::new(0.0, 0.0));
             fft.process(&mut buf);
             let mut best_tone = 0usize;
-            let mut best_mag = 0.0_f32;
+            let mut best_pow = 0.0_f32;
             for tone_idx in 0..M {
                 let f = self.tone_freq_hz(tone_idx);
                 let bin = (f * fft_size as f32 / SAMPLE_RATE_HZ as f32).round() as usize;
-                let m = buf[bin].norm();
-                if m > best_mag {
-                    best_mag = m;
+                let p = buf[bin].norm_sqr();
+                if p > best_pow {
+                    best_pow = p;
                     best_tone = tone_idx;
                 }
+            }
+            // Noise per bin from OUT-OF-BAND empty bins (median, robust) — NOT the
+            // adjacent tone bins, whose power tracks the strong tone's spectral
+            // leakage (∝ signal) and would saturate the SNR. Exclude the tone
+            // cluster ± guard, its real-FFT mirror, and DC/Nyquist.
+            let tone_lo = (self.tone_freq_hz(0) * fft_size as f32 / SAMPLE_RATE_HZ as f32) as usize;
+            let tone_hi = (self.tone_freq_hz(M - 1) * fft_size as f32 / SAMPLE_RATE_HZ as f32)
+                .ceil() as usize;
+            let guard = 8usize;
+            let nyq = fft_size / 2;
+            let mut noise: Vec<f32> = (0..fft_size)
+                .filter(|&k| {
+                    let in_band = k + guard >= tone_lo && k <= tone_hi + guard;
+                    let mirror =
+                        k + guard >= fft_size - tone_hi && k <= (fft_size - tone_lo) + guard;
+                    let edge = k <= guard || (k + guard >= nyq && k <= nyq + guard);
+                    !(in_band || mirror || edge)
+                })
+                .map(|k| buf[k].norm_sqr())
+                .collect();
+            let bin_width = SAMPLE_RATE_HZ as f32 / fft_size as f32;
+            if !noise.is_empty() {
+                let mid = noise.len() / 2;
+                noise.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+                // |bin|² is ~exponential (mean σ²); median = σ²·ln2 ⇒ debias by /ln2.
+                let noise_per_bin = (noise[mid] / std::f32::consts::LN_2).max(1e-20);
+                let sig = (best_pow - noise_per_bin).max(0.0);
+                // SNR referenced to 2500 Hz: white noise contributes
+                // `noise_per_bin · (2500/bin_width)` in the reference band, so
+                // `SNR_2500 = sig / (noise_per_bin · 2500/bin_width)`.
+                snr_lin_sum += (sig / noise_per_bin) * (bin_width / 2500.0);
+                snr_count += 1;
             }
             bits.push(((best_tone >> 2) & 1) as u8);
             bits.push(((best_tone >> 1) & 1) as u8);
             bits.push((best_tone & 1) as u8);
         }
-        bits.chunks(8)
+        let snr_2500_db = if snr_count > 0 {
+            let mean = (snr_lin_sum / snr_count as f32).max(1e-6);
+            Some((10.0 * mean.log10()).clamp(-30.0, 40.0))
+        } else {
+            None
+        };
+        let bytes = bits
+            .chunks(8)
             .filter(|c| c.len() == 8)
             .map(|c| {
                 c.iter()
                     .enumerate()
                     .fold(0u8, |b, (i, &bit)| b | (bit << (7 - i)))
             })
-            .collect()
+            .collect();
+        (bytes, snr_2500_db)
     }
 
     /// Locate the preamble in `samples` and demodulate the framed payload —
@@ -280,19 +338,19 @@ impl NarrowFskFloor {
         let _ = corr;
         let body_start = start + PREAMBLE_LEN;
         if body_start >= samples.len() {
-            return NfskDecode::Detected;
+            return NfskDecode::Detected { snr_2500_db: None };
         }
         let sps = self.samples_per_symbol();
         let avail_symbols = (samples.len() - body_start) / sps;
-        let bytes = self.demod_bytes(samples, body_start, avail_symbols);
+        let (bytes, snr_2500_db) = self.demod_bytes(samples, body_start, avail_symbols);
         // Need at least the 2-byte length header.
         if bytes.len() < 2 {
-            return NfskDecode::Detected;
+            return NfskDecode::Detected { snr_2500_db };
         }
         let len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
         let frame_len = 2 + len + 4;
         if bytes.len() < frame_len {
-            return NfskDecode::Detected;
+            return NfskDecode::Detected { snr_2500_db };
         }
         let crc_got = u32::from_be_bytes([
             bytes[2 + len],
@@ -301,9 +359,12 @@ impl NarrowFskFloor {
             bytes[2 + len + 3],
         ]);
         if crc32_ieee(&bytes[..2 + len]) != crc_got {
-            return NfskDecode::Detected;
+            return NfskDecode::Detected { snr_2500_db };
         }
-        NfskDecode::Frame(bytes[2..2 + len].to_vec())
+        NfskDecode::Frame {
+            payload: bytes[2..2 + len].to_vec(),
+            snr_2500_db,
+        }
     }
 }
 

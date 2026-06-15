@@ -268,9 +268,9 @@ impl Waveform for OfdmMainWaveform {
 /// noncoherent 8-FSK mode for crowded/narrow band slots — the most robust rung,
 /// below the wide-band floor (sonde-99l.4). Self-synchronises on the shared
 /// Schmidl-Cox preamble and recovers a length-delimited, CRC-verified frame.
-/// Physics-gated over AWGN in `sonde-phy/tests/nfsk_floor_gate.rs`. Reports no
-/// `SNR_2500` yet (no OFDM pilots; a narrowband estimator is a follow-up) — the
-/// link still gets honest FER from its overs.
+/// Physics-gated over AWGN in `sonde-phy/tests/nfsk_floor_gate.rs`. Reports a
+/// narrowband `SNR_2500` (best-tone vs off-tone power, referenced to 2500 Hz) —
+/// every mode now reports honest channel quality, not just the OFDM family.
 pub struct NfskWaveform {
     inner: NarrowFskFloor,
 }
@@ -297,12 +297,15 @@ impl Waveform for NfskWaveform {
 
     fn decode_scan(&self, samples: &[f32]) -> DecodeScan {
         match self.inner.receive_scan(samples) {
-            NfskDecode::Frame(payload) => DecodeScan::Frame(DecodedFrame {
+            NfskDecode::Frame {
+                payload,
+                snr_2500_db,
+            } => DecodeScan::Frame(DecodedFrame {
                 payload,
                 family: ModeFamily::RobustnessFloor,
-                snr_2500_db: None, // no narrowband SNR_2500 estimator yet
+                snr_2500_db,
             }),
-            NfskDecode::Detected => DecodeScan::Detected { snr_2500_db: None },
+            NfskDecode::Detected { snr_2500_db } => DecodeScan::Detected { snr_2500_db },
             NfskDecode::NoSignal => DecodeScan::NoSignal,
         }
     }

@@ -318,7 +318,7 @@ impl<'a> OfdmReceiver<'a> {
     }
 
     /// Demodulate a whole frame of CONSECUTIVE OFDM symbols, time-smoothing the
-    /// pilot channel observations across symbols before each symbol's
+    /// pilot channel observations before each symbol's
     /// equalization. Returns one LLR vector per input symbol, in order.
     ///
     /// Per-symbol pilot estimation is too noisy at the coded path's low
