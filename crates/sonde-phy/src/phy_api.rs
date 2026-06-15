@@ -110,6 +110,12 @@ impl ChannelQualityReport {
             self.recent_frames_failed as f32 / self.recent_frames_total as f32
         }
     }
+    /// Number of frames in the recent window backing [`Self::frame_error_rate`].
+    /// The link uses this as a credibility threshold: a FER measured over too few
+    /// frames must not gate a mode change (symmetric-SNR adaptation design F4).
+    pub fn recent_frames_total(&self) -> u32 {
+        self.recent_frames_total
+    }
     /// Current per-sub-carrier bit-loading bitmap, if a bit-loader is active.
     pub fn current_bit_loading(&self) -> Option<&[u8]> {
         self.current_bit_loading.as_deref()
