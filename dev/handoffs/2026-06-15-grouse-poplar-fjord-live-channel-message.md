@@ -2,7 +2,9 @@
 
 - **Agent:** grouse-poplar-fjord
 - **Date:** 2026-06-15
-- **Branch:** `sonde-imh.1/ardop-live-backend` → **PR #44** (open; all work pushed)
+- **Branch:** `sonde-imh.1/ardop-live-backend` → **PR #51** (open; all work pushed).
+  NOTE: PR #44 merged an EARLY state (two-waterfall work only); main is MISSING the
+  real-channel / S-meter / message-payload / example-fix work, which **PR #51** carries.
 - **Worktree:** `worktrees/sonde-imh.1-ardop-live-backend`
 - **Builds on:** `2026-06-14-grouse-poplar-fjord-ardop-connected-session.md`
 
@@ -70,7 +72,9 @@ Confirm: layout fits one screen (no clip), S-meters read sensibly, message rende
   are gitignored.
 
 ## What REMAINS
-1. **Operator verify + merge PR #44.** (`gh pr merge 44 --merge --delete-branch` after verify.)
+1. **Operator verify + merge PR #51** (NOT #44 — that already merged the early part).
+   Prefer `gh pr merge 51 --merge --delete-branch` (no-ff per ADR 0002, not squash —
+   #44 was squash-merged, which is why main got only a prefix).
 2. **Wire Sonde as a connected peer** — `sonde-sc0` (P1). Two SondePhy stations over snd-aloop
    bridged through hf-channel-pcm, each on sonde-link's real-time Driver. BLOCKER: the
    two-station-over-shared-medium path is the link agent's documented follow-up (needs a
