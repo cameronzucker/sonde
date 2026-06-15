@@ -47,14 +47,10 @@ const DEAD_OVERS_TOLERATED: u32 = 6;
 /// dying). Must be `< DEAD_OVERS_TOLERATED` so BASE gets a fresh death budget.
 const DOWNSHIFT_TO_BASE_OVERS: u32 = 3;
 
-/// Recent per-over decode outcomes the link tracks to drive the graceful downshift
-/// control loop (Fork B). The window is its OWN clean/missed outcomes, not the
-/// PHY's cumulative counters (the sans-IO connection never sees a failed decode).
-const QUALITY_WINDOW: usize = 4;
-/// Consecutive faster-permitting feedbacks (on active DATA/ACK overs) required
-/// before the floor holder probes one rung up. Upshift is non-catastrophic, so it
-/// is hysteretic — a brief good patch never speeds the mode up (no thrash).
-const UPSHIFT_HYSTERESIS: u8 = 3;
+/// EWMA weight for a *rising* SNR observation (symmetric-SNR adaptation design F3):
+/// a falling SNR is applied immediately (fast downshift), a rising SNR is smoothed
+/// at this weight (≈1–2 good overs to climb a rung — fast, not a permit crawl).
+const SNR_RISE_ALPHA: f32 = 0.5;
 
 /// Connection lifecycle state (design §4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,13 +127,17 @@ pub struct Connection {
     /// Current link mode / ladder-rung id (stamped on every outgoing frame; the
     /// ARQ window + strategy follow it). Starts at `DEFAULT_RUNG`.
     current_rung: u8,
-    /// Recent per-over decode outcomes (`true` = decoded the peer's over to its
-    /// end, `false` = missed/turn-recovery). Drives `recommended_rung`. Cleared on
-    /// every rung change so stale evidence cannot justify an immediate re-climb.
-    quality: VecDeque<bool>,
-    /// Consecutive faster-permitting feedbacks seen while the floor holder; gates
-    /// the hysteretic upshift probe.
-    upshift_streak: u8,
+    /// Latest raw per-over SNR (dB) measured on the peer's transmissions, `NaN`
+    /// until a measurement arrives. Drives **downshift** (no smoothing lag).
+    snr_raw: f32,
+    /// Asymmetrically-smoothed SNR (dB): falling applied immediately, rising via
+    /// [`SNR_RISE_ALPHA`] EWMA. Drives **upshift** (needs sustained good SNR).
+    snr_smoothed: f32,
+    /// Recent frame-error rate observed on the peer's transmissions, with its
+    /// sample count — the FER confidence gate for adaptation. Reset on rung change
+    /// (FER is mode-conditioned).
+    fer: f32,
+    fer_samples: u32,
     /// Window the connection was constructed with — restored on session reset.
     initial_window: u32,
     silent_overs: u32,
@@ -193,8 +193,10 @@ impl Connection {
             owe_ack: false,
             sack_enabled: true,
             current_rung: DEFAULT_RUNG,
-            quality: VecDeque::new(),
-            upshift_streak: 0,
+            snr_raw: f32::NAN,
+            snr_smoothed: f32::NAN,
+            fer: 0.0,
+            fer_samples: 0,
             initial_window: window,
             silent_overs: 0,
             conn_retries: 0,
@@ -333,13 +335,12 @@ impl Connection {
             }
             ConnState::Connected if due => match self.floor {
                 Floor::Listening if self.awaiting_reply => {
-                    // We sent data and expected a reply that did not arrive.
+                    // We sent data and expected a reply that did not arrive. A total
+                    // miss yields NO measurement (we decoded nothing), so the
+                    // measurement loop can't react — the floor holder downshifts on
+                    // its own (the Idle-floor blind spot), and sustained misses still
+                    // cascade to the P1 BASE-fallback below.
                     self.silent_overs += 1;
-                    // A missed reply is a miss in our recent-quality window (we
-                    // failed to decode the peer's over). It also closes the Idle-
-                    // floor blind spot: data lost with no decodable reply yields no
-                    // feedback, so the floor holder must downshift on its own.
-                    self.record_outcome(false);
                     if self.current_rung != BASE_RUNG
                         && self.silent_overs >= DOWNSHIFT_TO_BASE_OVERS
                     {
@@ -438,22 +439,22 @@ impl Connection {
         if id == self.current_rung {
             return;
         }
+        let old_family = mac::family_of(self.current_rung);
         self.current_rung = id;
         let r = mac::rung(id);
         self.send.reconfigure(r.window.window);
         self.recv.reconfigure(r.window.window);
         self.sack_enabled = matches!(r.strategy, ArqStrategy::SelectiveRepeat);
-        // Any rung change invalidates the recent-quality evidence and the upshift
-        // streak: stale clean samples from a faster rung must not justify an
-        // immediate re-climb (anti-sawtooth), and a fall to BASE then requires a
-        // fresh full-clean dwell before probing up (the BASE cooldown).
-        self.note_rung_change();
-    }
-
-    /// Clear the recent-quality window + upshift streak (on every rung change).
-    fn note_rung_change(&mut self) {
-        self.quality.clear();
-        self.upshift_streak = 0;
+        // FER is mode-conditioned ⇒ always reset on a rung change (design F6).
+        self.fer = 0.0;
+        self.fer_samples = 0;
+        // The reported usable SNR is only valid within a waveform family ⇒ reset
+        // the estimate when the family changes (design F6); keep it within a family
+        // (physical SNR is rung-independent).
+        if mac::family_of(id) != old_family {
+            self.snr_raw = f32::NAN;
+            self.snr_smoothed = f32::NAN;
+        }
     }
 
     /// Follow a peer frame's advertised mode (the mode-id confirmation path): if
@@ -467,52 +468,46 @@ impl Connection {
         }
     }
 
-    /// Record a decoded peer over-end (`clean`) or a missed reply (`!clean`) into
-    /// the bounded recent-quality window.
-    fn record_outcome(&mut self, clean: bool) {
-        if self.quality.len() == QUALITY_WINDOW {
-            self.quality.pop_front();
+    /// Feed a per-over channel measurement (the receiver's view of the peer's
+    /// transmissions). Called by the real-time `Driver`/`Link` from the PHY's
+    /// `channel_quality()`, and by the gates with synthetic values. Falling SNR is
+    /// applied immediately (fast downshift); rising SNR is EWMA-smoothed (design
+    /// F3). A non-finite SNR (no measurement) leaves the estimate unchanged.
+    pub fn observe_quality(&mut self, snr_db: f32, fer: f32, fer_samples: u32) {
+        self.fer = fer;
+        self.fer_samples = fer_samples;
+        if snr_db.is_finite() {
+            self.snr_raw = snr_db;
+            self.snr_smoothed = if !self.snr_smoothed.is_finite() || snr_db < self.snr_smoothed {
+                snr_db // first reading, or falling ⇒ apply at once
+            } else {
+                SNR_RISE_ALPHA * snr_db + (1.0 - SNR_RISE_ALPHA) * self.snr_smoothed
+            };
         }
-        self.quality.push_back(clean);
     }
 
-    /// The ladder rung this station recommends the PEER use, from its recent-
-    /// quality window (advertised as `rx_rung` on outgoing frames). A partial or
-    /// empty window ⇒ no opinion (`current_rung`, the bootstrapping/cooldown case).
-    /// A full clean window ⇒ permit one faster (probe). Any recent miss ⇒ a more-
-    /// robust rung scaled by miss count (toward `BASE_RUNG`).
+    /// The ladder rung this station recommends the PEER use (advertised as
+    /// `rx_rung`), from its smoothed channel measurement via the symmetric,
+    /// FER-gated [`mac::adapt_rung`]. No measurement ⇒ `current_rung` (no change).
     fn recommended_rung(&self) -> u8 {
-        if self.quality.len() < QUALITY_WINDOW {
-            return self.current_rung;
-        }
-        let misses = self.quality.iter().filter(|&&clean| !clean).count() as u8;
-        if misses == 0 {
-            self.current_rung.saturating_sub(1)
-        } else {
-            self.current_rung.saturating_add(misses).min(BASE_RUNG)
-        }
+        mac::adapt_rung(
+            self.current_rung,
+            self.snr_raw,
+            self.snr_smoothed,
+            self.fer,
+            self.fer_samples,
+        )
     }
 
-    /// Act on the peer's `rx_rung` feedback while we are the floor-holding decider
-    /// (architecture C). Downshift is receiver-AUTHORITATIVE and immediate; upshift
-    /// is sender-gated (hysteretic, one rung, only on `counts_for_upshift` active
-    /// DATA/ACK overs — keepalive/ID give liveness but cannot fake upshift
-    /// confidence).
-    fn apply_peer_feedback(&mut self, peer_rx_rung: u8, counts_for_upshift: bool) {
-        let target = peer_rx_rung.min(BASE_RUNG);
-        if target > self.current_rung {
-            // Receiver says it cannot decode us well — obey immediately.
-            self.apply_rung(target); // clears the streak + window
-        } else if counts_for_upshift && target < self.current_rung {
-            // Peer permits faster — probe one rung up only after sustained permits.
-            self.upshift_streak = self.upshift_streak.saturating_add(1);
-            if self.upshift_streak >= UPSHIFT_HYSTERESIS {
-                self.apply_rung(self.current_rung - 1); // clears the streak + window
-            }
-        } else if counts_for_upshift {
-            // Peer recommends our current rung (not faster) — not sustained-faster.
-            self.upshift_streak = 0;
-        }
+    /// Act on the peer's `rx_rung` feedback while we are the floor-holding decider.
+    /// The peer's recommendation is authoritative for *our* TX rung (it observed
+    /// our path), but the **worse direction wins** (design F5): take the more
+    /// robust of the peer's feedback and our own reverse-path recommendation, so a
+    /// good forward path cannot pull the shared rung up and break a bad reverse
+    /// path. Applied authoritatively in both directions — no probe, no streak.
+    fn apply_peer_feedback(&mut self, peer_rx_rung: u8) {
+        let target = peer_rx_rung.min(BASE_RUNG).max(self.recommended_rung());
+        self.apply_rung(target);
     }
 
     /// Transition to `Closed`, clearing all per-session ARQ/reassembly state so a
@@ -542,8 +537,10 @@ impl Connection {
         self.send.reconfigure(self.initial_window);
         self.recv.reconfigure(self.initial_window);
         self.sack_enabled = true;
-        self.quality.clear();
-        self.upshift_streak = 0;
+        self.snr_raw = f32::NAN;
+        self.snr_smoothed = f32::NAN;
+        self.fer = 0.0;
+        self.fer_samples = 0;
         self.msg_end_seqs.clear();
         self.floor = Floor::Listening;
         self.awaiting_reply = false;
@@ -725,6 +722,10 @@ impl Connection {
             self.silent_overs = 0;
             self.deadline = None;
             self.events.push_back(HostEvent::Connected);
+            // We are now the floor-holding decider for the first over: honor the
+            // acceptor's initial rung feedback so the first over starts at the right
+            // rung instead of blindly at DEFAULT_RUNG (worse-direction-wins).
+            self.apply_peer_feedback(frame.rx_rung());
         }
     }
 
@@ -756,23 +757,22 @@ impl Connection {
             return;
         }
         self.silent_overs = 0;
-        // ID gives liveness; a downshift command on it is still honored, but it
-        // never advances the upshift streak (not an active DATA/ACK over).
-        self.adapt_on_inbound(frame, false);
+        self.adapt_on_inbound(frame);
         if frame.is_end_of_over() {
             self.on_over_end();
         }
     }
 
-    /// Apply link-adaptation on an inbound frame, role-gated by floor position
-    /// (architecture C). If we are the floor-holding **decider** (we sent an over
-    /// and are awaiting its reply), act on the peer's `rx_rung` feedback. Otherwise
-    /// we are the **follower** (the peer holds the floor): adopt its announced
-    /// `MODE` so our replies match. `counts_for_upshift` is set only for active
-    /// DATA/ACK overs.
-    fn adapt_on_inbound(&mut self, frame: &LinkFrame, counts_for_upshift: bool) {
+    /// Apply link-adaptation on an inbound frame, role-gated by floor position.
+    /// If we are the floor-holding **decider** (we sent an over and are awaiting its
+    /// reply), act on the peer's `rx_rung` feedback (authoritative both directions,
+    /// worse-direction-wins). Otherwise we are the **follower** (the peer holds the
+    /// floor): adopt its announced `MODE` so our replies match and both ends stay on
+    /// one rung. The up/down asymmetry now lives in the measurement (raw vs smoothed
+    /// SNR + FER gate in [`mac::adapt_rung`]), not in any per-frame counter.
+    fn adapt_on_inbound(&mut self, frame: &LinkFrame) {
         if self.awaiting_reply {
-            self.apply_peer_feedback(frame.rx_rung(), counts_for_upshift);
+            self.apply_peer_feedback(frame.rx_rung());
         } else {
             self.follow_mode(frame.mode);
         }
@@ -791,7 +791,7 @@ impl Connection {
 
     fn on_data(&mut self, frame: LinkFrame) {
         self.silent_overs = 0;
-        self.adapt_on_inbound(&frame, true);
+        self.adapt_on_inbound(&frame);
         self.send.on_ack(frame.ack_through, frame.sack); // piggybacked ack
         let end_of_over = frame.is_end_of_over();
         let end_of_msg = frame.is_end_of_msg();
@@ -809,7 +809,7 @@ impl Connection {
 
     fn on_ack(&mut self, frame: &LinkFrame) {
         self.silent_overs = 0;
-        self.adapt_on_inbound(frame, true);
+        self.adapt_on_inbound(frame);
         self.send.on_ack(frame.ack_through, frame.sack);
         if frame.is_end_of_over() {
             self.on_over_end();
@@ -818,9 +818,7 @@ impl Connection {
 
     fn on_keepalive(&mut self, frame: &LinkFrame) {
         self.silent_overs = 0;
-        // A keepalive gives liveness + an honored downshift command, but never
-        // advances the upshift streak (not an active DATA/ACK over).
-        self.adapt_on_inbound(frame, false);
+        self.adapt_on_inbound(frame);
         // A keepalive may carry the floor token (an idle holder relinquishing).
         if frame.is_end_of_over() {
             self.on_over_end();
@@ -833,9 +831,6 @@ impl Connection {
     /// something to say. This is symmetric: neither station hogs an idle floor.
     fn on_over_end(&mut self) {
         self.silent_overs = 0;
-        // We decoded the peer's over to its end — a clean outcome for the recent-
-        // quality window (drives the rung we recommend the peer).
-        self.record_outcome(true);
         if self.want_floor() {
             self.floor = Floor::Sending;
         } else {
@@ -1406,99 +1401,101 @@ mod tests {
         );
     }
 
-    // ---- mid-session downshift control loop (sonde-ruu, Fork B, architecture C) --
+    // ---- measurement-based symmetric adaptation (sonde-qnq) ---------------------
 
     #[test]
-    fn recommended_rung_has_no_opinion_until_the_window_is_full() {
-        let mut c = init(); // current_rung = DEFAULT_RUNG
-        c.record_outcome(true);
-        c.record_outcome(true);
+    fn observe_quality_falls_immediately_and_rises_smoothly() {
+        let mut c = init();
+        c.observe_quality(20.0, 0.0, 10);
+        assert_eq!(c.snr_smoothed, 20.0, "first reading seeds the estimate");
+        c.observe_quality(0.0, 0.0, 10);
+        assert_eq!(c.snr_smoothed, 0.0, "a falling SNR is applied immediately");
+        c.observe_quality(10.0, 0.0, 10);
         assert_eq!(
-            c.recommended_rung(),
-            DEFAULT_RUNG,
-            "a partial window must not move the rung (bootstrapping)"
+            c.snr_smoothed, 5.0,
+            "a rising SNR is EWMA-smoothed (0.5·10+0.5·0)"
+        );
+        assert_eq!(
+            c.snr_raw, 10.0,
+            "raw tracks the latest reading (for downshift)"
         );
     }
 
     #[test]
-    fn recommended_rung_permits_faster_only_on_a_full_clean_window() {
-        let mut c = init();
-        for _ in 0..QUALITY_WINDOW {
-            c.record_outcome(true);
-        }
-        assert_eq!(
-            c.recommended_rung(),
-            DEFAULT_RUNG - 1,
-            "a full clean window permits one faster"
-        );
-    }
-
-    #[test]
-    fn recommended_rung_recommends_more_robust_scaled_by_misses() {
-        let mut c = init();
-        for _ in 0..QUALITY_WINDOW {
-            c.record_outcome(false); // all misses
-        }
+    fn recommended_rung_holds_without_measurement_and_drops_on_low_snr() {
+        let mut c = init(); // rung DEFAULT_RUNG
+        assert_eq!(c.recommended_rung(), DEFAULT_RUNG, "no measurement ⇒ hold");
+        c.observe_quality(-15.0, 0.0, 10);
         assert_eq!(
             c.recommended_rung(),
             BASE_RUNG,
-            "a full window of misses recommends the robust floor"
+            "a collapse ⇒ recommend the floor"
         );
     }
 
     #[test]
-    fn downshift_is_immediate_and_receiver_authoritative() {
+    fn recommended_rung_upshifts_on_credible_clean_high_snr() {
         let mut c = init(); // rung 1
-        c.apply_peer_feedback(BASE_RUNG, true);
+        c.observe_quality(25.0, 0.0, 10);
+        assert_eq!(c.recommended_rung(), 0, "clean high SNR ⇒ recommend faster");
+    }
+
+    #[test]
+    fn apply_peer_feedback_obeys_a_downshift_immediately() {
+        let mut c = init(); // rung 1, no own measurement
+        c.apply_peer_feedback(BASE_RUNG);
         assert_eq!(
             c.current_rung(),
             BASE_RUNG,
-            "a more-robust command is obeyed at once"
+            "a robust command is obeyed at once"
         );
     }
 
     #[test]
-    fn upshift_requires_sustained_hysteresis_then_steps_one_rung() {
-        let mut c = init();
-        c.apply_rung(2); // sit mid-ladder
-        for _ in 0..UPSHIFT_HYSTERESIS - 1 {
-            c.apply_peer_feedback(0, true); // peer permits faster
-            assert_eq!(
-                c.current_rung(),
-                2,
-                "no upshift before the hysteresis count"
-            );
-        }
-        c.apply_peer_feedback(0, true);
-        assert_eq!(c.current_rung(), 1, "exactly one rung up after hysteresis");
-    }
-
-    #[test]
-    fn keepalive_feedback_never_advances_an_upshift() {
-        let mut c = init();
-        c.apply_rung(2);
-        for _ in 0..UPSHIFT_HYSTERESIS + 2 {
-            c.apply_peer_feedback(0, false); // not an active DATA/ACK over
-        }
+    fn apply_peer_feedback_worse_direction_wins() {
+        // The peer (forward path) permits the fastest rung, but our OWN reverse-path
+        // measurement is poor — the worse direction wins, so we do not speed up.
+        let mut c = init(); // rung 1
+        c.observe_quality(-15.0, 0.0, 10); // our RX of the peer is bad
+        c.apply_peer_feedback(0); // peer says "go fast"
         assert_eq!(
             c.current_rung(),
-            2,
-            "liveness feedback must not fake upshift confidence"
+            BASE_RUNG,
+            "a bad reverse path overrides the peer's fast permit"
         );
     }
 
     #[test]
-    fn a_rung_change_clears_stale_clean_evidence_no_sawtooth() {
-        let mut c = init();
-        for _ in 0..QUALITY_WINDOW {
-            c.record_outcome(true); // would otherwise permit faster
-        }
-        c.apply_rung(3); // any rung change clears the window + streak
-        assert_eq!(
-            c.recommended_rung(),
-            3,
-            "post-change the window is empty ⇒ no opinion (anti-sawtooth / BASE cooldown)"
+    fn apply_rung_resets_fer_and_resets_snr_only_across_a_family() {
+        let mut c = init(); // rung 1 (OFDM family)
+        c.observe_quality(20.0, 0.10, 8);
+        c.apply_rung(2); // within OFDM family
+        assert_eq!(c.snr_raw, 20.0, "SNR persists within a waveform family");
+        assert_eq!(c.fer_samples, 0, "FER always resets on a rung change");
+        c.observe_quality(5.0, 0.0, 8);
+        c.apply_rung(3); // OFDM → floor: cross-family
+        assert!(
+            c.snr_raw.is_nan(),
+            "SNR estimate resets across a family boundary"
         );
+    }
+
+    #[test]
+    fn gate_feedback_downshift_sender_obeys_receiver_measurement() {
+        // The RECEIVER (B) measures a poor channel on the sender's overs and feeds
+        // back a robust rung; the floor-holding sender (A) obeys it and still delivers.
+        let mut p = Pair::new();
+        p.a.connect(Duration::ZERO);
+        p.run(20);
+        let start = p.a.current_rung();
+        p.a.send(b"hello".to_vec());
+        p.b.observe_quality(-15.0, 0.0, 10); // B's view of A's path is bad
+        p.run(60);
+        assert!(
+            p.a.current_rung() > start,
+            "A obeys B's robustness feedback (receiver-authoritative downshift)"
+        );
+        assert_eq!(p.b_messages(), vec![b"hello".to_vec()], "still delivers");
     }
 
     #[test]

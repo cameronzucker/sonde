@@ -120,10 +120,11 @@ impl ChannelQualityReport {
             self.recent_frames_failed as f32 / self.recent_frames_total as f32
         }
     }
-    /// Number of RECEIVED overs in the recent window the FER/SNR were computed
-    /// over — the link's FER-credibility gate (`fer_samples`) needs this (it only
-    /// trusts FER once the count clears `FER_MIN_SAMPLES`). Bounded + recent, not
-    /// a lifetime total.
+    /// Number of RECEIVED overs in the recent window backing
+    /// [`Self::frame_error_rate`] — the link's FER-credibility gate (`fer_samples`):
+    /// a FER measured over too few frames must not gate a mode change (symmetric-SNR
+    /// adaptation design F4; it only trusts FER once the count clears
+    /// `FER_MIN_SAMPLES`). Bounded + recent, not a lifetime total.
     pub fn recent_frames_total(&self) -> u32 {
         self.recent_frames_total
     }

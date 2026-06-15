@@ -70,7 +70,7 @@ fn g5_link_drives_the_real_sondephy_transport() {
     // the adapter is wired to the production trait, not only to test doubles.
     let conn = Connection::initiator(call("K1ABC"), call("W2XYZ"), 0x1234, profile(), 8);
     let phy = SondePhy::new(FloorWaveform::new(), LoopbackRadio::new());
-    let mut link = Link::new(phy, conn, ModeHint::Floor);
+    let mut link = Link::new(phy, conn);
     link.connect(Duration::ZERO);
     for i in 0..5 {
         let _ = link.poll(Duration::from_millis(10 * i));
