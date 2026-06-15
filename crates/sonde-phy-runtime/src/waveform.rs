@@ -67,7 +67,25 @@ pub trait Waveform: Send {
     /// RX window that caught only noise), [`DecodeScan::Detected`] when a frame
     /// was acquired but failed to decode (a real frame error), and
     /// [`DecodeScan::Frame`] on a clean decode.
+    ///
+    /// `decode_scan` is **mode-agnostic / self-synchronising** — it finds its own
+    /// preamble with no external hint. That is what lets [`crate::SondePhy`]'s RX
+    /// pump AUTO-DETECT the received mode across a registry of waveforms (run each
+    /// candidate's `decode_scan`; whichever syncs wins), so a mid-session mode
+    /// switch is never deafening (design 2026-06-15-phy-mode-adaptation-quality §3).
     fn decode_scan(&self, samples: &[f32]) -> DecodeScan;
+
+    /// Cheap, **high-recall** pre-gate for the multi-waveform RX pump: does this
+    /// window plausibly contain *this* waveform's signal? The pump skips
+    /// [`Self::decode_scan`] (the expensive correlator + FEC) for waveforms whose
+    /// `detect` returns `false`. It MUST err toward `true` — a false negative
+    /// makes the receiver deaf to a real frame (costly); a false positive only
+    /// wastes one decode attempt (cheap) (Codex review C3). The default is the
+    /// safe `true` (always attempt the full decode); a waveform overrides it with
+    /// a lightweight preamble-energy check once that pays for itself.
+    fn detect(&self, _samples: &[f32]) -> bool {
+        true
+    }
 
     /// The mode family this waveform serves. Used by [`crate::SondePhy`] to
     /// route a `ModeHint` to the right waveform once more than one is

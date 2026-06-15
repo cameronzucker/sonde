@@ -20,7 +20,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use sonde_phy::error::PhyError;
-use sonde_phy::modes::{ModeHint, ModeTable};
+use sonde_phy::modes::{ModeFamily, ModeHint, ModeTable};
 use sonde_phy::phy_api::{ChannelQualityReport, PhyTransport, RxFrame, TxToken};
 
 use crate::radio::Radio;
@@ -130,6 +130,21 @@ impl SondePhy {
         W: Waveform + 'static,
         R: Radio + 'static,
     {
+        Self::with_waveforms(vec![Box::new(waveform)], radio)
+    }
+
+    /// Spawn the runtime over a REGISTRY of waveforms and a radio. The RX pump
+    /// auto-detects the received mode by running each registered waveform's
+    /// `decode_scan` on the window (the first to self-sync + decode wins); TX
+    /// picks the waveform whose family matches the requested mode. One waveform is
+    /// the common case ([`Self::new`]); more than one enables mid-session mode
+    /// adaptation across families without the receiver going deaf on a switch
+    /// (design 2026-06-15-phy-mode-adaptation-quality §3). Registry order is the
+    /// RX try-order (and the tie-break when two families both decode).
+    pub fn with_waveforms<R>(waveforms: Vec<Box<dyn Waveform>>, radio: R) -> Self
+    where
+        R: Radio + 'static,
+    {
         let (tx_jobs, job_rx) = mpsc::channel::<TxJob>();
         let (frame_tx, rx_frames) = mpsc::channel::<RxFrame>();
         let quality = Arc::new(Mutex::new(QualitySnapshot::default()));
@@ -141,7 +156,7 @@ impl SondePhy {
         let worker_in_flight = Arc::clone(&in_flight);
         let worker = std::thread::spawn(move || {
             Worker {
-                waveform,
+                waveforms,
                 radio,
                 job_rx,
                 frame_tx,
@@ -222,8 +237,8 @@ impl PhyTransport for SondePhy {
     }
 }
 
-struct Worker<W: Waveform, R: Radio> {
-    waveform: W,
+struct Worker<R: Radio> {
+    waveforms: Vec<Box<dyn Waveform>>,
     radio: R,
     job_rx: Receiver<TxJob>,
     frame_tx: Sender<RxFrame>,
@@ -233,7 +248,7 @@ struct Worker<W: Waveform, R: Radio> {
     modes: ModeTable,
 }
 
-impl<W: Waveform, R: Radio> Worker<W, R> {
+impl<R: Radio> Worker<R> {
     fn run(mut self) {
         loop {
             if *self.shutdown.lock().unwrap() {
@@ -249,13 +264,23 @@ impl<W: Waveform, R: Radio> Worker<W, R> {
     }
 
     fn do_tx(&mut self, job: TxJob) {
-        let _mode = self.modes.resolve(job.hint, None);
+        // Pick the waveform whose family serves the requested mode (the registry's
+        // first match; falls back to the first waveform if none matches — the
+        // single-waveform case).
+        let family = self.modes.resolve(job.hint, None).family();
+        let waveform = self
+            .waveforms
+            .iter()
+            .find(|w| w.family() == family)
+            .or_else(|| self.waveforms.first());
         // A transmit/encode error is a soundcard hiccup, not an RX channel
         // measurement — we do not crash the worker, and we do NOT fold it into the
         // RX channel-quality window (that would poison the link's FER with TX-side
         // faults).
-        if let Ok(samples) = self.waveform.encode(&job.payload) {
-            let _ = self.radio.transmit(&samples);
+        if let Some(waveform) = waveform {
+            if let Ok(samples) = waveform.encode(&job.payload) {
+                let _ = self.radio.transmit(&samples);
+            }
         }
         // The over is off the air (PTT released, or the job never made it there
         // on an encode error) — drop it from the in-flight count last, so a link
@@ -271,33 +296,55 @@ impl<W: Waveform, R: Radio> Worker<W, R> {
                 return;
             }
         };
-        match self.waveform.decode_scan(&samples) {
-            DecodeScan::Frame(frame) => {
-                let mode = self.modes.resolve(ModeHint::Floor, None);
-                if let Ok(mut q) = self.quality.lock() {
-                    q.record_over(false, frame.snr_2500_db);
-                }
-                let snr = frame.snr_2500_db.unwrap_or(f32::NAN);
-                let rx = RxFrame::new(frame.payload, mode, None, snr, true);
-                let _ = self.frame_tx.send(rx);
+        // AUTO-DETECT: run each registered waveform's (cheap-gated) self-syncing
+        // decode_scan; the first clean decode wins. This is the sonde-99l answer —
+        // a mid-session mode switch is never deafening, because the receiver
+        // decodes whatever family actually arrives (design §3). With one waveform
+        // this is a single attempt; the loop only does more work when >1 family is
+        // registered AND its cheap `detect` pre-gate passes (Codex review C3).
+        let mut detected_snr: Option<Option<f32>> = None;
+        for waveform in &self.waveforms {
+            if !waveform.detect(&samples) {
+                continue;
             }
-            // A frame was acquired but failed to decode: a real RX frame error.
-            // Recorded as a failed over so `channel_quality().frame_error_rate()`
-            // reflects it — the signal subsystem #5 adapts on. The over still
-            // carries its measured SNR (no survivorship bias). No `RxFrame` is
-            // delivered (there is no payload).
-            DecodeScan::Detected { snr_2500_db } => {
-                if let Ok(mut q) = self.quality.lock() {
-                    q.record_over(true, snr_2500_db);
+            match waveform.decode_scan(&samples) {
+                DecodeScan::Frame(frame) => {
+                    let mode = self.modes.resolve(hint_for_family(frame.family), None);
+                    if let Ok(mut q) = self.quality.lock() {
+                        q.record_over(false, frame.snr_2500_db);
+                    }
+                    let snr = frame.snr_2500_db.unwrap_or(f32::NAN);
+                    let rx = RxFrame::new(frame.payload, mode, None, snr, true);
+                    let _ = self.frame_tx.send(rx);
+                    return; // first clean decode wins
                 }
-            }
-            // Only noise in this window — not a frame error; ages the report.
-            DecodeScan::NoSignal => {
-                if let Ok(mut q) = self.quality.lock() {
-                    q.record_no_signal();
+                // Detected but failed to decode: remember it (with its measured
+                // SNR) in case no other waveform decodes cleanly — then it counts
+                // as one failed over (no survivorship bias).
+                DecodeScan::Detected { snr_2500_db } => {
+                    detected_snr.get_or_insert(snr_2500_db);
                 }
+                DecodeScan::NoSignal => {}
             }
         }
+        // No clean decode this window. A detected-but-failed over is a real frame
+        // error; pure silence only ages the report.
+        if let Ok(mut q) = self.quality.lock() {
+            match detected_snr {
+                Some(snr) => q.record_over(true, snr),
+                None => q.record_no_signal(),
+            }
+        }
+    }
+}
+
+/// Representative `ModeHint` for a decoded frame's family, so the delivered
+/// `RxFrame` carries a mode of the right family. (The link's MODE byte is the
+/// authoritative per-over mode; this is the family-level tag.)
+fn hint_for_family(family: ModeFamily) -> ModeHint {
+    match family {
+        ModeFamily::OfdmMain => ModeHint::MainAuto,
+        ModeFamily::RobustnessFloor => ModeHint::Floor,
     }
 }
 
