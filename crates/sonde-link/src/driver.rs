@@ -39,6 +39,14 @@ use crate::host::HostCommand;
 /// How often to re-poll while the worker is keying, to detect TX completion.
 const TX_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// Part-97 §97.119 periodic-ID cadence, measured in **real** wall-clock time. A
+/// station must identify at least every 10 minutes during a communication; 9 min
+/// leaves margin. This lives in the Driver, not the sans-IO `Connection`, because
+/// the connection's logical clock freezes during keying — a logical-time cadence
+/// would drift past 10 real minutes by exactly the accumulated keyed airtime (see
+/// `docs/superpowers/specs/2026-06-15-frame-conn-id-addressing-design.md` §2.4).
+const ID_INTERVAL: Duration = Duration::from_secs(9 * 60);
+
 /// Real-time driver wrapping a [`Connection`] over a `P: PhyTransport`, clocked
 /// by a `C: Clock`.
 pub struct Driver<P: PhyTransport, C: Clock> {
@@ -52,6 +60,9 @@ pub struct Driver<P: PhyTransport, C: Clock> {
     /// Total real time the worker has spent keying our overs — subtracted from
     /// real time to give the link's frozen-during-TX logical clock.
     tx_airtime: Duration,
+    /// Real (wall-clock) time the last ID-bearing frame was transmitted, for the
+    /// Part-97 ≤10-minute cadence. `None` until the first transmission.
+    last_id_real: Option<Duration>,
     errors: VecDeque<PhyError>,
 }
 
@@ -67,6 +78,7 @@ impl<P: PhyTransport, C: Clock> Driver<P, C> {
             tx_active: false,
             tx_start: Duration::ZERO,
             tx_airtime: Duration::ZERO,
+            last_id_real: None,
             errors: VecDeque::new(),
         }
     }
@@ -118,6 +130,15 @@ impl<P: PhyTransport, C: Clock> Driver<P, C> {
         self.errors.drain(..).collect()
     }
 
+    /// Whether the Part-97 periodic-ID cadence is due in real time: never sent, or
+    /// `ID_INTERVAL` of real wall-clock has elapsed since the last ID-bearing TX.
+    fn id_due(&self, real: Duration) -> bool {
+        match self.last_id_real {
+            None => true,
+            Some(t) => real.saturating_sub(t) >= ID_INTERVAL,
+        }
+    }
+
     /// Real-time instant at which the driver next wants to be polled. While the
     /// worker is keying, poll again soon to detect completion; otherwise map the
     /// link's logical deadline back to real time.
@@ -153,14 +174,44 @@ impl<P: PhyTransport, C: Clock> Driver<P, C> {
         // Flush the next over only when the worker is free (half-duplex).
         if !self.tx_active && self.phy.tx_in_flight() == 0 {
             let mut frames = 0u32;
+            let mut sent_id_bearing = false;
+            let mut first = true;
             let hint = self.conn.current_hint();
             while let Some(frame) = self.conn.poll_transmit(logical) {
+                // On the first frame of this over, fold in a Part-97 periodic ID
+                // (real-time cadence) unless the over already opens with an
+                // ID-bearing frame (CONN/CONN_ACK/DISC/etc. — that satisfies the
+                // cadence; do not double-ID, per the Codex review). Only valid once
+                // `Connected`, where the peer (and so the ID block) is known.
+                if first {
+                    first = false;
+                    if !frame.frame_type.is_id_bearing()
+                        && self.conn.state() == ConnState::Connected
+                        && self.id_due(real)
+                    {
+                        if let Ok(bytes) = self.conn.make_id_frame().encode() {
+                            match self.phy.send_frame(&bytes, hint) {
+                                Ok(_) => {
+                                    frames += 1;
+                                    sent_id_bearing = true;
+                                }
+                                Err(e) => self.errors.push_back(e),
+                            }
+                        }
+                    }
+                }
+                sent_id_bearing |= frame.frame_type.is_id_bearing();
                 if let Ok(bytes) = frame.encode() {
                     match self.phy.send_frame(&bytes, hint) {
                         Ok(_) => frames += 1,
                         Err(e) => self.errors.push_back(e),
                     }
                 }
+            }
+            // Any ID-bearing transmission (the periodic ID OR a start/end
+            // CONN/CONN_ACK/DISC in this over) resets the real-time cadence.
+            if sent_id_bearing {
+                self.last_id_real = Some(real);
             }
             if frames > 0 {
                 self.tx_active = true;
@@ -179,7 +230,7 @@ impl<P: PhyTransport, C: Clock> Driver<P, C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::Callsign;
+    use crate::frame::{Callsign, FrameType, LinkFrame};
     use crate::profile::ModeProfile;
     use sonde_phy::modes::{ModeHint, ModeTable};
     use sonde_phy::phy_api::{ChannelQualityReport, RxFrame, TxToken};
@@ -284,6 +335,65 @@ mod tests {
         }
     }
 
+    /// Like [`WireEnd`] but also records every frame this end transmits, so a test
+    /// can inspect the on-air stream (e.g. for periodic-ID frames).
+    struct RecordingWire {
+        q: Queues,
+        side: usize,
+        sent: Rc<RefCell<Vec<Vec<u8>>>>,
+    }
+    impl PhyTransport for RecordingWire {
+        fn send_frame(&mut self, payload: &[u8], _hint: ModeHint) -> Result<TxToken, PhyError> {
+            self.sent.borrow_mut().push(payload.to_vec());
+            self.q.borrow_mut()[1 - self.side].push_back(payload.to_vec());
+            Ok(TxToken(0))
+        }
+        fn poll_rx(&mut self) -> Option<RxFrame> {
+            let bytes = self.q.borrow_mut()[self.side].pop_front()?;
+            let mode = ModeTable::default().resolve(ModeHint::MainAuto, None);
+            Some(RxFrame::new(bytes, mode, None, 10.0, true))
+        }
+        fn channel_quality(&self) -> ChannelQualityReport {
+            ChannelQualityReport::empty()
+        }
+    }
+
+    /// A recording wire pair; returns (endA, endB, A's sent log, B's sent log).
+    #[allow(clippy::type_complexity)]
+    fn recording_wire() -> (
+        RecordingWire,
+        RecordingWire,
+        Rc<RefCell<Vec<Vec<u8>>>>,
+        Rc<RefCell<Vec<Vec<u8>>>>,
+    ) {
+        let q: Queues = Rc::new(RefCell::new([VecDeque::new(), VecDeque::new()]));
+        let a_sent = Rc::new(RefCell::new(Vec::new()));
+        let b_sent = Rc::new(RefCell::new(Vec::new()));
+        (
+            RecordingWire {
+                q: Rc::clone(&q),
+                side: 0,
+                sent: Rc::clone(&a_sent),
+            },
+            RecordingWire {
+                q,
+                side: 1,
+                sent: Rc::clone(&b_sent),
+            },
+            a_sent,
+            b_sent,
+        )
+    }
+
+    /// Count `ID`-type frames in a recorded transmit log.
+    fn id_frame_count(sent: &Rc<RefCell<Vec<Vec<u8>>>>) -> usize {
+        sent.borrow()
+            .iter()
+            .filter_map(|b| LinkFrame::decode(b).ok())
+            .filter(|f| f.frame_type == FrameType::Id)
+            .count()
+    }
+
     fn messages(events: &[HostEvent]) -> Vec<Vec<u8>> {
         events
             .iter()
@@ -305,7 +415,7 @@ mod tests {
         );
         let mut b = Driver::new(
             eb,
-            Connection::acceptor(call("W2XYZ"), call("K1ABC"), profile(), 8),
+            Connection::acceptor(call("W2XYZ"), profile(), 8),
             clk.clone(),
         );
         a.connect();
@@ -364,6 +474,56 @@ mod tests {
             ConnState::Connecting,
             "frozen logical clock ⇒ no spurious retry/timeout while keying"
         );
+    }
+
+    #[test]
+    fn periodic_id_is_emitted_after_the_real_interval_and_not_before() {
+        // Part-97 ≤10-min cadence in REAL time. A connects (the CONN is the start
+        // ID — no separate ID frame yet), then after ID_INTERVAL of real time A
+        // must fold a periodic ID into its next over.
+        let clk = ManualClock::new();
+        let (ea, eb, a_sent, _b_sent) = recording_wire();
+        let mut a = Driver::new(
+            ea,
+            Connection::initiator(call("K1ABC"), call("W2XYZ"), 0x1234, profile(), 8),
+            clk.clone(),
+        );
+        let mut b = Driver::new(
+            eb,
+            Connection::acceptor(call("W2XYZ"), profile(), 8),
+            clk.clone(),
+        );
+        a.connect();
+        // Settle the handshake + an initial exchange, well under ID_INTERVAL.
+        a.send(b"hi".to_vec());
+        for _ in 0..40 {
+            a.poll();
+            b.poll();
+            clk.advance(Duration::from_millis(50)); // 2 s total real ≪ 9 min
+        }
+        assert_eq!(a.state(), ConnState::Connected);
+        assert_eq!(
+            id_frame_count(&a_sent),
+            0,
+            "no periodic ID before the interval (CONN already identified the start)"
+        );
+
+        // Jump real time past the cadence, then give A something to transmit.
+        clk.advance(ID_INTERVAL + Duration::from_secs(1));
+        a.send(b"after".to_vec());
+        let mut b_ev = Vec::new();
+        for _ in 0..60 {
+            a.poll();
+            b_ev.extend(b.poll());
+            clk.advance(Duration::from_millis(50));
+        }
+        assert!(
+            id_frame_count(&a_sent) >= 1,
+            "A folds a periodic ID into its over once ID_INTERVAL of real time has passed"
+        );
+        // The whole message still delivers — the ID frame rides along in the over,
+        // it does not disrupt delivery.
+        assert!(messages(&b_ev).contains(&b"after".to_vec()));
     }
 
     #[test]
