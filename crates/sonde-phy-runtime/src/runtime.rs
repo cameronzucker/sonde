@@ -264,27 +264,36 @@ impl<R: Radio> Worker<R> {
     }
 
     fn do_tx(&mut self, job: TxJob) {
-        // Pick the waveform whose family serves the requested mode (the registry's
-        // first match; falls back to the first waveform if none matches — the
-        // single-waveform case).
+        // Transmit ONLY with a waveform that actually serves the resolved mode's
+        // family. If none is registered we DROP the over rather than substitute a
+        // different family's waveform — silently keying floor RF for an
+        // OFDM-requested over (the old `.or_else(first)` fallback) is a real
+        // correctness footgun: the link's MODE byte would claim one mode while the
+        // air carries another. A dropped over surfaces as a missed over (the link's
+        // turn-recovery / P1 BASE-fallback handles it); a wrong-family over does
+        // not surface at all. The link is responsible for only requesting modes the
+        // PHY registers (ladder-from-registry, sonde-lcw.1).
         let family = self.modes.resolve(job.hint, None).family();
-        let waveform = self
-            .waveforms
-            .iter()
-            .find(|w| w.family() == family)
-            .or_else(|| self.waveforms.first());
-        // A transmit/encode error is a soundcard hiccup, not an RX channel
-        // measurement — we do not crash the worker, and we do NOT fold it into the
-        // RX channel-quality window (that would poison the link's FER with TX-side
-        // faults).
-        if let Some(waveform) = waveform {
-            if let Ok(samples) = waveform.encode(&job.payload) {
-                let _ = self.radio.transmit(&samples);
+        match self.waveforms.iter().find(|w| w.family() == family) {
+            Some(waveform) => {
+                // A transmit/encode error is a soundcard hiccup, not an RX channel
+                // measurement — we do not crash the worker, and we do NOT fold it
+                // into the RX channel-quality window (that would poison the link's
+                // FER with TX-side faults).
+                if let Ok(samples) = waveform.encode(&job.payload) {
+                    let _ = self.radio.transmit(&samples);
+                }
+            }
+            None => {
+                // No registered waveform serves this family — drop, do not key the
+                // wrong waveform. (Worker has no error channel back to the caller;
+                // the over simply does not go on the air.)
             }
         }
-        // The over is off the air (PTT released, or the job never made it there
-        // on an encode error) — drop it from the in-flight count last, so a link
-        // polling `tx_in_flight()` sees the frame keyed for the whole TX window.
+        // The over is off the air (PTT released, dropped on no-match, or never made
+        // it there on an encode error) — drop it from the in-flight count last, so
+        // a link polling `tx_in_flight()` sees the frame keyed for the whole TX
+        // window.
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 
@@ -368,6 +377,57 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// A radio that counts `transmit` calls (and the last buffer length) so a test
+    /// can assert whether an over actually went on the air.
+    #[derive(Clone, Default)]
+    struct CountingRadio {
+        tx_calls: std::sync::Arc<AtomicUsize>,
+    }
+    impl crate::Radio for CountingRadio {
+        fn transmit(&mut self, samples: &[f32]) -> Result<(), PhyError> {
+            if !samples.is_empty() {
+                self.tx_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        fn receive(&mut self, max: usize) -> Result<Vec<f32>, PhyError> {
+            std::thread::sleep(Duration::from_millis(2));
+            Ok(vec![0.0; max])
+        }
+    }
+
+    #[test]
+    fn tx_drops_an_over_with_no_waveform_for_its_family_instead_of_substituting() {
+        // Only a floor-family waveform is registered. A MainAuto hint resolves to
+        // the OFDM family — which no registered waveform serves — so the over MUST
+        // be dropped, NOT keyed as floor RF (the silent-fallback footgun, 99l.5).
+        let radio = CountingRadio::default();
+        let calls = std::sync::Arc::clone(&radio.tx_calls);
+        let mut phy = SondePhy::new(FloorWaveform::new(), radio);
+
+        phy.send_frame(b"ofdm-please", ModeHint::MainAuto).unwrap();
+        // Give the worker time to process the job.
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "an OFDM-requested over must NOT be transmitted as floor when no OFDM waveform is registered"
+        );
+
+        // A Floor hint DOES match the registered floor waveform → it transmits.
+        phy.send_frame(b"floor-ok", ModeHint::Floor).unwrap();
+        let start = Instant::now();
+        while calls.load(Ordering::SeqCst) == 0 && start.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a Floor-requested over IS transmitted by the registered floor waveform"
+        );
+        phy.shutdown();
     }
 
     #[test]
