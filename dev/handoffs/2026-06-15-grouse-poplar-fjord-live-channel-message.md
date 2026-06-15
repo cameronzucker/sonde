@@ -1,10 +1,23 @@
 # Handoff — live real-channel ARDOP demo + S-meters + message payloads (sonde-imh.2)
 
+> **CORRECTION — 2026-06-15 (agent magpie-juniper-alder).** The "PR #44 merged
+> only an early slice; main is MISSING the rest" framing below is **wrong as of
+> this date.** Git history shows PR #44's merge commit (`9d46730`) has `3b75c20`
+> (the message-payloads commit, the branch's final substantive commit) as its
+> **second parent** — i.e. **#44 merged the FULL branch**: real Watterson channel
+> (`hf-channel-pcm`), S-meters, SNDM message payloads, and the corrected
+> `sonde_through_channel.rs` example are **all already on `main`**. Every work
+> file was confirmed present on `origin/main`. **PR #51 therefore carries no
+> functional change — only this handoff doc.** It is being merged as a docs-only
+> record. The earlier `e19b636` "correction" commit (which re-asserted the false
+> claim) is itself superseded by this note. The laptop visual verification is
+> still worthwhile as a "confirm the shipped demo works" check, but it is **not a
+> merge gate** — the demo already shipped via #44.
+
 - **Agent:** grouse-poplar-fjord
 - **Date:** 2026-06-15
-- **Branch:** `sonde-imh.1/ardop-live-backend` → **PR #51** (open; all work pushed).
-  NOTE: PR #44 merged an EARLY state (two-waterfall work only); main is MISSING the
-  real-channel / S-meter / message-payload / example-fix work, which **PR #51** carries.
+- **Branch:** `sonde-imh.1/ardop-live-backend` → **PR #51** (docs-only; superseded
+  by the correction above — all functional work landed earlier via **PR #44**).
 - **Worktree:** `worktrees/sonde-imh.1-ardop-live-backend`
 - **Builds on:** `2026-06-14-grouse-poplar-fjord-ardop-connected-session.md`
 
@@ -72,9 +85,12 @@ Confirm: layout fits one screen (no clip), S-meters read sensibly, message rende
   are gitignored.
 
 ## What REMAINS
-1. **Operator verify + merge PR #51** (NOT #44 — that already merged the early part).
-   Prefer `gh pr merge 51 --merge --delete-branch` (no-ff per ADR 0002, not squash —
-   #44 was squash-merged, which is why main got only a prefix).
+1. ~~**Operator verify + merge PR #51**~~ — **DONE / superseded (see CORRECTION at top).**
+   All functional work already landed on `main` via **PR #44** (its merge commit
+   `9d46730` has the final work commit `3b75c20` as second parent). PR #51 is
+   docs-only and is merged via `gh pr merge 51 --merge --delete-branch` to preserve
+   this session record on `main`. Optional: an operator laptop pass to confirm the
+   *shipped* demo still renders (not a gate).
 2. **Wire Sonde as a connected peer** — `sonde-sc0` (P1). Two SondePhy stations over snd-aloop
    bridged through hf-channel-pcm, each on sonde-link's real-time Driver. BLOCKER: the
    two-station-over-shared-medium path is the link agent's documented follow-up (needs a
