@@ -540,68 +540,80 @@ body {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   COCKPIT — single-viewport live layout (sonde-imh.2)
-   One screen, no scrolling for the interactive parts: a topbar of levers + the
-   Connect action, a hero waterfall (left), and a telemetry/ARQ-log/recon rail
-   (right). The honesty banner + explainer live below the fold.
+   COCKPIT — live, compact, single-screen-ish layout (sonde-imh.2)
+   Goal: the interactive parts fit a laptop viewport WITHOUT clipping. The trick
+   is NOT a rigid 100vh box with overflow:hidden (that clips pane contents) — it's
+   sizing each pane's BODY with viewport-relative clamps so the contents actually
+   shrink to fit. Nothing is ever clipped; on a short viewport it scrolls a little.
    ═══════════════════════════════════════════════════════════════════════════ */
-html, body { height: 100%; }
-
 .cockpit {
   position: relative; z-index: 1; box-sizing: border-box;
-  height: 100vh; max-width: 1720px; margin: 0 auto;
-  display: grid; grid-template-rows: auto minmax(0, 1fr);
-  gap: 12px; padding: 12px 16px; overflow: hidden;
+  max-width: 1720px; margin: 0 auto;
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 10px 16px;
 }
 
 /* ── Topbar ── */
-.topbar { display: flex; align-items: center; gap: 12px 22px; flex-wrap: wrap; padding: 2px 2px; }
-.topbar .wordmark { gap: 12px; }
-.topbar .chip { margin-left: 4px; }
-.topbar__levers { display: flex; align-items: flex-end; gap: 18px; flex: 1 1 460px; flex-wrap: wrap; }
+.topbar { display: flex; align-items: center; gap: 10px 20px; flex-wrap: wrap; padding: 0; }
+.topbar .wordmark { gap: 10px; }
+.topbar .wordmark__sub { font-size: 8.5px; }
+.topbar .chip { margin-left: 4px; font-size: 9.5px; padding: 5px 9px; }
+.topbar__levers { display: flex; align-items: flex-end; gap: 16px; flex: 1 1 440px; flex-wrap: wrap; }
 .topbar__actions { display: flex; align-items: center; gap: 10px; }
-.lever { display: flex; flex-direction: column; gap: 6px; }
-.lever--snr { min-width: 190px; flex: 1 1 210px; }
+.lever { display: flex; flex-direction: column; gap: 5px; }
+.lever--snr { min-width: 180px; flex: 1 1 200px; }
 .lever__label {
-  font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.12em;
+  font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.1em;
   text-transform: uppercase; color: var(--muted);
   display: flex; justify-content: space-between; gap: 10px; align-items: baseline;
 }
 .lever__val { color: var(--teal); font-weight: 600; font-size: 12px; }
 .topbar .slider { margin: 0; }
 .topbar .segmented { padding: 3px; gap: 3px; }
-.topbar .seg { padding: 6px 9px; font-size: 11px; }
-.runbtn { margin: 0; width: auto; padding: 11px 22px; }
+.topbar .seg { padding: 5px 8px; font-size: 11px; }
+.runbtn { margin: 0; width: auto; padding: 10px 20px; }
 
 /* ── Main: waterfall (left) + telemetry/log/recon rail (right) ── */
-.cockpit__main { display: grid; grid-template-columns: 1.62fr 1fr; gap: 12px; min-height: 0; }
-.cockpit__left  { display: grid; grid-template-rows: minmax(0, 1fr) auto; gap: 12px; min-height: 0; }
-.cockpit__right { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; gap: 12px; min-height: 0; }
-.cockpit .panel { margin: 0; min-height: 0; animation: none; }
+.cockpit__main { display: grid; grid-template-columns: 1.62fr 1fr; gap: 10px; align-items: start; }
+.cockpit__left  { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.cockpit__right { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.cockpit .panel { margin: 0; animation: none; }
 
-/* hero waterfall fills its cell (override the tall standalone min-height) */
-.cockpit .panel--hero { min-height: 0; }
-.cockpit .panel--hero .stage { min-height: 220px; margin: 12px; }
-.cockpit .adaptation { margin: 0; border-radius: var(--radius-s); padding: 12px 16px; }
+/* Compact pane CHROME everywhere (this is what was clipping — headers/padding
+   were sized for the big standalone panels). */
+.cockpit .panel__head { padding: 9px 13px; }
+.cockpit .panel__title { font-size: 12.5px; gap: 9px; }
+.cockpit .panel__title .idx { padding: 1px 5px; font-size: 10px; }
+.cockpit .panel__hint { font-size: 10px; }
 
-/* right-rail log grows + scrolls internally; telemetry + recon stay natural height */
-.cockpit .panel--console { min-height: 0; }
-.cockpit .panel--console .flog { flex: 1; min-height: 0; }
-.cockpit .panel--console .flog__stream { height: auto; flex: 1; min-height: 0; }
-.cockpit .panel--stats .stats { flex: 0 0 auto; }
-.cockpit .recon { padding: 12px 16px; }
-.cockpit #recon-image { width: 100%; height: auto; max-height: 200px; object-fit: contain; }
+/* Hero waterfall: viewport-bounded height (never forces overflow). */
+.cockpit .panel--hero .stage { height: clamp(240px, 44vh, 520px); min-height: 0; margin: 10px; }
+.cockpit .adaptation { margin: 0; border-radius: var(--radius-s); padding: 9px 13px; }
+.cockpit .adaptation__text { font-size: 12px; }
+
+/* Telemetry: compact stat cells. */
+.cockpit .stats { gap: 1px; }
+.cockpit .stat { padding: 8px 11px; }
+.cockpit .stat__k { font-size: 9.5px; }
+.cockpit .stat__v { font-size: 15px; }
+.cockpit .stat__sub { font-size: 10px; }
+
+/* Connection/ARQ log: bounded body that scrolls internally. */
+.cockpit .panel--console .flog__stream { height: clamp(150px, 22vh, 300px); padding: 6px 14px; font-size: 12px; }
+
+/* Recon: keep the canvas aspect ratio, bound its height, center it. */
+.cockpit .recon { padding: 10px 14px; align-items: center; gap: 8px; }
+.cockpit #recon-image { width: auto; max-width: 100%; height: clamp(130px, 19vh, 190px); }
 
 /* ── Below the fold: framing + credits (scroll down) ── */
 .belowfold {
   position: relative; z-index: 1; max-width: 1100px; margin: 0 auto;
-  padding: 28px 18px 64px; display: flex; flex-direction: column; gap: 20px;
+  padding: 26px 18px 60px; display: flex; flex-direction: column; gap: 20px;
 }
 .belowfold .honesty, .belowfold .explainer, .belowfold .colophon { margin: 0; }
 
-/* ── Narrow / short screens: stack and allow scrolling rather than clip ── */
-@media (max-width: 1080px) {
-  .cockpit { height: auto; min-height: 100vh; overflow: visible; }
+/* ── Narrow screens: stack the two columns. ── */
+@media (max-width: 1024px) {
   .cockpit__main { grid-template-columns: 1fr; }
-  .cockpit .panel--hero .stage { min-height: 320px; }
+  .cockpit .panel--hero .stage { height: clamp(260px, 40vh, 460px); }
 }
