@@ -77,10 +77,6 @@ fn through_channel(clean: &[f32], condition: ChannelCondition, snr_db: f64, seed
     faded.iter().map(|c| c.re).collect()
 }
 
-/// Length of the preamble the floor prepends — the known body offset used to
-/// bypass the (separately-tracked) sync correlator in the equalizer gate.
-const PREAMBLE_LEN: usize = 192;
-
 /// Deterministic seed for the i-th channel realization (golden-ratio stride).
 fn seed_for(i: u64) -> u64 {
     0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i + 1) ^ 0xC0DE_6402
@@ -89,45 +85,46 @@ fn seed_for(i: u64) -> u64 {
 /// The regression seed the root-cause analysis converged on.
 const CONVERGED_SEED: u64 = 0xC0DE_6402;
 
-// ─── A. Equalizer contract: seed-robust coded decode at KNOWN alignment ──────
+// ─── A. Seed-robust coded decode THROUGH the production sync path ────────────
 //
-// Load-bearing proof of this slice's fix (channel-aware soft LLR + equalizer
-// edge extrapolation). It slices the body at the known preamble length so the
-// real-valued preamble correlator is BYPASSED — the correlator mislocates the
-// frame under some channel phase rotations, a SEPARATE defect tracked under its
-// own bd issue (complex matched-filter sync). Good is seed-robust at correct
-// alignment (measured 40/40 across the fixed seed stride); we assert all 8.
+// Load-bearing proof that the equalizer fix (channel-aware soft LLR + edge
+// extrapolation, sonde-64w.2) AND the rebuilt synchronizer (Schmidl-Cox
+// detection + CFO derotation + template-MF timing, sonde-xhw.3) together decode
+// seed-robustly through a Watterson fade. This test previously sliced the body
+// at the known preamble length to BYPASS a real-ZC correlator that mislocated
+// the frame under channel phase rotation; that defect is now fixed, so the
+// bypass is removed — decode runs through `receive_multi_with_sync` (real
+// acquisition + frequency correction in the loop) or it does not count.
 
-fn assert_coded_decodes_sync_bypassed(condition: ChannelCondition, seed: u64) {
+fn assert_coded_decodes_via_sync(condition: ChannelCondition, seed: u64) {
     let payload = b"FLOOR FADING GATE PAYLOAD";
     let floor = WidebandLowDensityFloor::with_fec(Box::new(FloorRate14Codec::new()));
     let clean = floor.transmit_multi_with_preamble(payload).unwrap();
     let rx = through_channel(&clean, condition, 30.0, seed);
-    let decoded = floor
-        .receive_multi(&rx[PREAMBLE_LEN..])
+    let (_start, decoded) = floor
+        .receive_multi_with_sync(&rx)
         .unwrap_or_else(|e| panic!("{condition:?} seed {seed:#x}: coded receive failed: {e:?}"));
     assert_eq!(
         decoded, payload,
-        "{condition:?} seed {seed:#x}: coded payload mismatch (sync-bypassed)"
+        "{condition:?} seed {seed:#x}: coded payload mismatch (via production sync)"
     );
 }
 
 #[test]
-fn equalizer_seed_robust_good_sync_bypassed() {
+fn equalizer_seed_robust_good_via_production_sync() {
     for i in 0..8 {
-        assert_coded_decodes_sync_bypassed(ChannelCondition::Good, seed_for(i));
+        assert_coded_decodes_via_sync(ChannelCondition::Good, seed_for(i));
     }
 }
 
 // ─── B. End-to-end production path on the regression seed ────────────────────
 //
 // Proves the integrated path (preamble sync → channel-aware demod → rate-1/4
-// LDPC) still recovers the payload on the converged seed for both conditions.
-// This is a regression smoke, NOT a claim that sync is seed-robust: full
-// production seed-robustness is blocked on the complex-correlator sync defect
-// (separate bd issue). Across the fixed 40-seed stride the production path
-// currently decodes 27/40 Good, 29/40 Moderate; perfect-align is 40/40 and
-// 37/40 — i.e. the gap is sync, not the equalizer.
+// LDPC) recovers the payload on the converged seed for both conditions through
+// `receive_multi_with_sync`. With the sonde-xhw.3 synchronizer the production
+// path now tracks perfect-alignment seed-robustness (the earlier sync gap is
+// closed); the combined CFO + clock + timing gate lives in
+// `tests/sync_impairment_gate.rs`.
 
 fn assert_e2e_decodes(condition: ChannelCondition) {
     let payload = b"FLOOR FADING GATE PAYLOAD";

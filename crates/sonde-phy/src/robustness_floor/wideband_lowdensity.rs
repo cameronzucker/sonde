@@ -21,27 +21,32 @@ use crate::ofdm_main::transmitter::OfdmTransmitter;
 use crate::robustness_floor::coded_framing::{
     blocks_from_first_block, deframe_info_bits, frame_info_bits,
 };
+use crate::sync::carrier_offset::{analytic_signal, derotate};
 use crate::sync::preamble::{PreambleDetector, PreambleGenerator};
 
-/// Sample count of the Zadoff-Chu preamble emitted by
-/// [`WidebandLowDensityFloor::transmit_with_preamble`]. Matches the
-/// pin in [`crate::sync::preamble`].
-pub const PREAMBLE_LEN_SAMPLES: usize = 192;
+/// Sample count of the Schmidl-Cox repeated-pair preamble emitted by
+/// [`WidebandLowDensityFloor::transmit_with_preamble`]. Re-exported from
+/// [`crate::sync::preamble`] so the two never drift.
+pub const PREAMBLE_LEN_SAMPLES: usize = crate::sync::preamble::PREAMBLE_LEN;
 
 /// Early-alignment guard: the symbol FFT window starts this many samples
-/// EARLIER than the detected preamble end. The real-valued correlator can lock
-/// onto the *delayed* path of a multipath channel (measured: Watterson Moderate
-/// detects ~48 samples late), so without the guard the window would start late
-/// and spill into the next symbol. Backing off by a fixed margin lands the
-/// window inside the cyclic prefix, where the offset is just a per-sub-carrier
-/// phase ramp the channel estimator absorbs. 128 covers ITU-R F.520
-/// Good/Moderate/Poor path delays (24/48/96 samples @ 48 kHz) with margin, well
-/// inside the 512-sample CP.
+/// EARLIER than the detected preamble end. The phase-invariant (I/Q) correlator
+/// detects the frame accurately, but can still lock the *delayed* path of a
+/// multipath channel (Good Δτ=24, Moderate Δτ=48 samples @ 48 kHz), which would
+/// bias the window late and spill into the next symbol (ISI). Backing off a
+/// small margin biases the window EARLY — within the 512-sample cyclic prefix,
+/// where the offset is only a gentle per-sub-carrier phase ramp the channel
+/// estimator absorbs (early is safe, late is ISI).
+///
+/// 32 was chosen empirically (sonde-64w.3): a 40-seed Watterson Good/Moderate
+/// sweep decodes every detected frame at any guard in [0, 32], and a small early
+/// bias absorbs delayed-path lock. The prior value of 128 over-steepened the
+/// phase ramp on *accurately* detected frames and itself cost decodes.
 ///
 /// NOTE: timing is NOT the dominant fading failure mode — frequency-selective
 /// nulls are (see [`crate::ofdm_main::receiver`] and the fading gate). This
 /// guard is a robustness margin for delayed-path lock, not the fading fix.
-const SYNC_WINDOW_GUARD_SAMPLES: usize = 128;
+const SYNC_WINDOW_GUARD_SAMPLES: usize = 32;
 
 /// Raised-cosine inter-symbol windowing roll-off, in samples. Confined to the
 /// 512-sample cyclic-prefix guard so the FFT body stays intact (decode is
@@ -70,6 +75,53 @@ fn soft_clip_to_papr(signal: &[f32], target_papr_db: f32) -> Vec<f32> {
     signal.iter().map(|&s| s.clamp(-amp, amp)).collect()
 }
 
+/// Three-way outcome of a sync+decode scan, distinguishing "the window held
+/// only noise" from "we acquired the preamble but the frame did not decode."
+///
+/// [`WidebandLowDensityFloor::receive_multi_with_sync`] collapses the latter two
+/// into a flat `Err`, which is correct for a caller that just wants the payload.
+/// But subsystem #5's link-adaptation needs the distinction: a detected-but-
+/// failed frame is a real frame error (it must count toward FER), whereas pure
+/// noise is not (counting it would drown the error rate in silence). The floor
+/// demod already knows which case it is — it acquires the preamble *before*
+/// attempting FEC — so this just surfaces that internal state.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SyncDecodeOutcome {
+    /// No preamble above the detector threshold: the window held only noise.
+    NoSignal,
+    /// The preamble was acquired (sync locked at `start_sample`) but the coded
+    /// frame that followed did not decode — truncated body, or the FEC rejected
+    /// a block. A genuine frame error for FER accounting.
+    DetectedDecodeFailed {
+        /// Sample index where the preamble was detected.
+        start_sample: usize,
+    },
+    /// Clean decode: preamble acquired at `start_sample`, payload recovered.
+    Frame {
+        /// Sample index where the preamble was detected.
+        start_sample: usize,
+        /// FEC-corrected payload bytes.
+        payload: Vec<u8>,
+    },
+}
+
+/// Private intermediate: the result of locating + CFO-correcting a frame body,
+/// shared by [`WidebandLowDensityFloor::receive_multi_with_sync`] and
+/// [`WidebandLowDensityFloor::receive_multi_with_sync_scan`] so the analytic-
+/// lift / detect / derotate DSP is written once.
+enum SyncLocate {
+    /// No preamble above threshold.
+    NoPreamble,
+    /// Preamble acquired at `start_sample` but no body samples follow it.
+    NoBody { start_sample: usize },
+    /// Preamble acquired; `corrected[body_start..]` is the derotated body.
+    Body {
+        start_sample: usize,
+        corrected: Vec<f32>,
+        body_start: usize,
+    },
+}
+
 /// Default robustness floor: wide-band OFDM, BPSK on every occupied
 /// sub-carrier, with a composed FEC codec. Strategic posture is "go
 /// wider, not denser" — see overview §5.A.1.
@@ -79,6 +131,10 @@ pub struct WidebandLowDensityFloor {
     // adapters (e.g. sonde-phy-runtime's `FloorWaveform`); a bare
     // `dyn` trait object would strip the auto-trait. All codecs are Send.
     fec: Box<dyn FecCodec + Send>,
+    /// When `Some`, the demod uses this FIXED noise variance instead of the
+    /// per-symbol empty-bin estimate. Production leaves it `None`; only the
+    /// sonde-gtg differential gate's control arm sets it (to `0.1`).
+    n0_override: Option<f32>,
 }
 
 impl WidebandLowDensityFloor {
@@ -90,6 +146,7 @@ impl WidebandLowDensityFloor {
         Self {
             params,
             fec: Box::new(IdentityFec::new(block)),
+            n0_override: None,
         }
     }
 
@@ -98,7 +155,16 @@ impl WidebandLowDensityFloor {
         Self {
             params: OfdmParams::for_mode(OfdmModeName::Wide),
             fec,
+            n0_override: None,
         }
+    }
+
+    /// Force a FIXED demod noise variance instead of the per-symbol empty-bin
+    /// estimate. Diagnostic / differential-gate use only — the production demod
+    /// estimates `n0` per symbol (see [`crate::ofdm_main::receiver`]).
+    pub fn with_fixed_n0(mut self, n0: f32) -> Self {
+        self.n0_override = Some(n0);
+        self
     }
 
     /// Borrowed access to the underlying OFDM parameter set.
@@ -142,13 +208,39 @@ impl WidebandLowDensityFloor {
         tx.modulate_one_symbol(&sym_bits, &bits_per_sc)
     }
 
-    /// Demodulate one OFDM symbol to soft LLRs (one per data
-    /// sub-carrier; positive ⇒ bit 0). LLRs are NOT hard-decided here —
-    /// the soft values flow straight to `FecCodec::decode_soft`.
-    fn demodulate_coded_symbol(&self, samples: &[f32]) -> Vec<f32> {
+    /// Demodulate the `spb` OFDM symbols of one coded block (starting at sample
+    /// `base`) to per-symbol soft LLRs, TIME-SMOOTHING the pilot channel estimate
+    /// across just those symbols ([`OfdmReceiver::demodulate_frame`]). LLRs are
+    /// NOT hard-decided here — the soft values flow straight to
+    /// `FecCodec::decode_soft`.
+    ///
+    /// Frame-level (not per-symbol) demod is the fix for sonde-vb9: the floor's
+    /// channel is slowly varying, so averaging each pilot across neighbouring
+    /// symbols recovers the ~4 dB the independent per-symbol estimate threw away
+    /// at the coded path's low per-symbol SNR. Smoothing is scoped to the BLOCK's
+    /// own symbols (not the whole capture) so trailing non-signal symbols — the
+    /// key-up tail / appended silence past the frame — can never bleed a noise-
+    /// only pilot into a real symbol's estimate.
+    ///
+    /// Returns `FrameDetect` if the block's symbols run past `samples`.
+    fn demodulate_block_symbols(
+        &self,
+        samples: &[f32],
+        base: usize,
+        spb: usize,
+    ) -> Result<Vec<Vec<f32>>, PhyError> {
+        let sym = self.symbol_size_samples();
+        let mut slices: Vec<&[f32]> = Vec::with_capacity(spb);
+        for s in 0..spb {
+            let start = base + s * sym;
+            if start + sym > samples.len() {
+                return Err(PhyError::FrameDetect("coded block truncated".into()));
+            }
+            slices.push(&samples[start..start + sym]);
+        }
         let bits_per_sc = self.bits_per_subcarrier();
-        let rx = OfdmReceiver::new(&self.params);
-        rx.demodulate_one_symbol(samples, &bits_per_sc)
+        let rx = OfdmReceiver::with_n0_override(&self.params, self.n0_override);
+        Ok(rx.demodulate_frame(&slices, &bits_per_sc))
     }
 
     /// Modulate one OFDM symbol carrying `payload` through the coded
@@ -260,15 +352,15 @@ impl WidebandLowDensityFloor {
                 spb
             )));
         }
+        // Per block: time-smooth the pilot channel estimate across the block's
+        // own symbols (sonde-vb9), then assemble + decode. Scoping the smoothing
+        // to the block keeps trailing non-signal symbols out of the average.
         let decode_block = |blk: usize| -> Result<Vec<u8>, PhyError> {
             let base = blk * spb * sym;
+            let per_sym = self.demodulate_block_symbols(samples, base, spb)?;
             let mut llrs = Vec::with_capacity(spb * dps);
-            for s in 0..spb {
-                let start = base + s * sym;
-                if start + sym > samples.len() {
-                    return Err(PhyError::FrameDetect("coded block truncated".into()));
-                }
-                llrs.extend_from_slice(&self.demodulate_coded_symbol(&samples[start..start + sym]));
+            for sym_llrs in &per_sym {
+                llrs.extend_from_slice(sym_llrs);
             }
             llrs.truncate(block_coded);
             self.fec
@@ -350,25 +442,104 @@ impl WidebandLowDensityFloor {
     ///   threshold;
     /// - no body samples follow the preamble, or the body is truncated.
     pub fn receive_multi_with_sync(&self, samples: &[f32]) -> Result<(usize, Vec<u8>), PhyError> {
-        let detector = PreambleDetector::new();
-        let detection = detector.scan(samples).ok_or_else(|| {
-            PhyError::FrameDetect(
+        match self.locate_synced_body(samples) {
+            SyncLocate::NoPreamble => Err(PhyError::FrameDetect(
                 "preamble not detected in input (signal too weak or no preamble \
                  present); pass a longer/cleaner capture"
                     .to_string(),
-            )
-        })?;
-        let body_start = (detection.start_sample + PREAMBLE_LEN_SAMPLES)
-            .saturating_sub(SYNC_WINDOW_GUARD_SAMPLES);
-        if body_start >= samples.len() {
-            return Err(PhyError::FrameDetect(format!(
-                "preamble detected at sample {} but no body samples follow",
-                detection.start_sample
-            )));
+            )),
+            SyncLocate::NoBody { start_sample } => Err(PhyError::FrameDetect(format!(
+                "preamble detected at sample {start_sample} but no body samples follow"
+            ))),
+            SyncLocate::Body {
+                start_sample,
+                corrected,
+                body_start,
+            } => {
+                // Preserve the body decode's error variant (FrameDetect for a
+                // truncated block, FecDecode for a codec reject) for callers
+                // that distinguish them.
+                let payload = self.receive_multi(&corrected[body_start..])?;
+                Ok((start_sample, payload))
+            }
         }
-        let body = &samples[body_start..];
-        let payload = self.receive_multi(body)?;
-        Ok((detection.start_sample, payload))
+    }
+
+    /// Like [`Self::receive_multi_with_sync`], but returns a three-way
+    /// [`SyncDecodeOutcome`] that separates "no preamble found" ([`NoSignal`])
+    /// from "preamble acquired but the frame failed to decode"
+    /// ([`DetectedDecodeFailed`]). Subsystem #5 needs that split to count frame
+    /// errors honestly (a detected-but-failed frame is a real error; silence is
+    /// not). The decode work is identical to `receive_multi_with_sync`; only the
+    /// outcome shape differs.
+    ///
+    /// [`NoSignal`]: SyncDecodeOutcome::NoSignal
+    /// [`DetectedDecodeFailed`]: SyncDecodeOutcome::DetectedDecodeFailed
+    pub fn receive_multi_with_sync_scan(&self, samples: &[f32]) -> SyncDecodeOutcome {
+        match self.locate_synced_body(samples) {
+            SyncLocate::NoPreamble => SyncDecodeOutcome::NoSignal,
+            SyncLocate::NoBody { start_sample } => {
+                SyncDecodeOutcome::DetectedDecodeFailed { start_sample }
+            }
+            SyncLocate::Body {
+                start_sample,
+                corrected,
+                body_start,
+            } => match self.receive_multi(&corrected[body_start..]) {
+                Ok(payload) => SyncDecodeOutcome::Frame {
+                    start_sample,
+                    payload,
+                },
+                Err(_) => SyncDecodeOutcome::DetectedDecodeFailed { start_sample },
+            },
+        }
+    }
+
+    /// Locate the preamble, derotate by the estimated CFO, and slice out the
+    /// frame body — the shared front half of both sync-decode entry points.
+    fn locate_synced_body(&self, samples: &[f32]) -> SyncLocate {
+        // Two-stage synchronization (sonde-xhw.3), all on the analytic signal:
+        //   1. Schmidl-Cox `M(d)` for CFO-invariant detection + coarse CFO,
+        //   2. derotate + a sharp template MF for exact timing,
+        // then derotate the whole capture in the time domain BEFORE the
+        // per-symbol FFT. Without CFO correction the floor collapses above ~20 Hz
+        // — a ±100 Hz offset is ~4 sub-carrier spacings, which slides the
+        // spectrum off the pilot bins (the per-symbol pilot equalizer absorbs a
+        // constant phase + a phase ramp, but not a frequency shift). Detection
+        // must be CFO-invariant too: a template matched filter's magnitude
+        // collapses below the noise floor at ±100 Hz, so we detect on `M(d)`.
+        //
+        // We pad the analytic lift on both ends so the Hilbert FFT's circular
+        // wrap cannot contaminate the frame region (Codex Q3). `Re{analytic(x)}`
+        // == `x`, so with a ~0 Hz estimate the projection is the identity and the
+        // clean path stays bit-identical.
+        const ANALYTIC_PAD: usize = 512;
+        let sr = crate::audio_io::SAMPLE_RATE_HZ as f32;
+        let mut padded = vec![0.0_f32; samples.len() + 2 * ANALYTIC_PAD];
+        padded[ANALYTIC_PAD..ANALYTIC_PAD + samples.len()].copy_from_slice(samples);
+        let mut analytic = analytic_signal(&padded);
+        let det = match PreambleDetector::new().detect_analytic(&analytic, sr) {
+            Some(det) => det,
+            None => return SyncLocate::NoPreamble,
+        };
+        derotate(&mut analytic, det.cfo_hz, sr);
+        let corrected: Vec<f32> = analytic[ANALYTIC_PAD..ANALYTIC_PAD + samples.len()]
+            .iter()
+            .map(|c| c.re)
+            .collect();
+
+        // `det.start_sample` is in padded coordinates; convert back.
+        let start_sample = det.start_sample.saturating_sub(ANALYTIC_PAD);
+        let body_start =
+            (start_sample + PREAMBLE_LEN_SAMPLES).saturating_sub(SYNC_WINDOW_GUARD_SAMPLES);
+        if body_start >= corrected.len() {
+            return SyncLocate::NoBody { start_sample };
+        }
+        SyncLocate::Body {
+            start_sample,
+            corrected,
+            body_start,
+        }
     }
 }
 
@@ -775,6 +946,57 @@ mod tests {
         assert!(matches!(
             floor.receive_multi_with_sync(truncated),
             Err(PhyError::FrameDetect(_))
+        ));
+    }
+
+    // ─── three-way sync scan (sonde-jt6) ───────────────────────────────
+
+    #[test]
+    fn sync_scan_reports_no_signal_on_silence() {
+        // Pure noise must read as NoSignal, NOT a frame error — counting
+        // silence toward FER would drown the link's adaptation signal.
+        let floor = WidebandLowDensityFloor::new();
+        let silence = vec![0.0_f32; 20_000];
+        assert_eq!(
+            floor.receive_multi_with_sync_scan(&silence),
+            SyncDecodeOutcome::NoSignal
+        );
+    }
+
+    #[test]
+    fn sync_scan_reports_frame_on_clean_capture() {
+        let floor = WidebandLowDensityFloor::new();
+        let payload = b"scan ok";
+        let samples = floor.transmit_multi_with_preamble(payload).unwrap();
+        match floor.receive_multi_with_sync_scan(&samples) {
+            SyncDecodeOutcome::Frame {
+                start_sample,
+                payload: got,
+            } => {
+                assert_eq!(start_sample, 0, "clean capture aligns at sample 0");
+                assert_eq!(got, payload);
+            }
+            other => panic!("expected Frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_scan_reports_detected_decode_failed_on_truncated_body() {
+        // Same construction as the FrameDetect truncation test above: block 0's
+        // header declares a multi-block frame but only one block's samples are
+        // present. The preamble IS acquired (so this is not NoSignal); the
+        // decode then fails on the missing blocks — a real frame error that must
+        // count toward FER. This is the case the flat `Err` could not separate
+        // from silence.
+        let floor = WidebandLowDensityFloor::new();
+        let payload: Vec<u8> = (0..600).map(|i| (i % 251) as u8).collect();
+        let full = floor.transmit_multi_with_preamble(&payload).unwrap();
+        let trunc_len =
+            PREAMBLE_LEN_SAMPLES + floor.symbol_size_samples() * floor.symbols_per_block();
+        let truncated = &full[..trunc_len];
+        assert!(matches!(
+            floor.receive_multi_with_sync_scan(truncated),
+            SyncDecodeOutcome::DetectedDecodeFailed { .. }
         ));
     }
 }

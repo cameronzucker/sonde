@@ -17,6 +17,7 @@ hound.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 rand = "0.8"
+rand_chacha = "0.3"
 # Channel simulator — drives the robustness-floor fading gate
 # (tests/robustness_floor_fading.rs). Dev-only; not a runtime dep.
 hf-channel-sim.workspace = true
