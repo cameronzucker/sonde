@@ -31,7 +31,7 @@ use std::collections::{HashSet, VecDeque};
 use std::time::Duration;
 
 use crate::arq::{Reassembler, RecvBuffer, SendWindow, FIRST_SEQ};
-use crate::frame::{Callsign, FrameType, LinkFrame};
+use crate::frame::{Callsign, FrameType, LinkFrame, StationId};
 use crate::mac::{self, ArqStrategy, BASE_RUNG, DEFAULT_RUNG};
 use crate::profile::ModeProfile;
 use sonde_phy::modes::ModeHint;
@@ -90,7 +90,15 @@ pub enum HostEvent {
 /// A half-duplex, connected-mode link connection to a single peer.
 pub struct Connection {
     local: Callsign,
-    remote: Callsign,
+    /// The peer station. An **initiator** is *configured* with whom it calls
+    /// (`Some`, `remote_is_learned == false`). A fresh **acceptor** is a listener
+    /// (`None`, `remote_is_learned == true`) that *learns* the peer from the
+    /// `SRC` of the inbound `CONN`. A learned peer is cleared on session reset so
+    /// the listener can accept a different station next time; a configured peer is
+    /// preserved (Codex review of sonde-sbt).
+    remote: Option<Callsign>,
+    /// Whether `remote` is learned-from-CONN (acceptor) vs configured (initiator).
+    remote_is_learned: bool,
     profile: ModeProfile,
     conn_id: u16,
 
@@ -123,6 +131,7 @@ pub struct Connection {
 
 impl Connection {
     /// Construct the connection initiator (owns the first floor after CONN_ACK).
+    /// The initiator is *configured* with the peer it calls.
     pub fn initiator(
         local: Callsign,
         remote: Callsign,
@@ -130,17 +139,21 @@ impl Connection {
         profile: ModeProfile,
         window: u32,
     ) -> Self {
-        Self::new(local, remote, conn_id, profile, window)
+        Self::new(local, Some(remote), false, conn_id, profile, window)
     }
 
-    /// Construct a connection acceptor (adopts the peer's CONN_ID).
-    pub fn acceptor(local: Callsign, remote: Callsign, profile: ModeProfile, window: u32) -> Self {
-        Self::new(local, remote, 0, profile, window)
+    /// Construct a connection acceptor — a listener that *learns* the calling
+    /// station from the inbound `CONN` (no pre-configured peer) and adopts the
+    /// peer's `CONN_ID`. Per the conn_id-addressing change, the data plane carries
+    /// no callsigns, so the peer identity comes from the `CONN`'s station-ID block.
+    pub fn acceptor(local: Callsign, profile: ModeProfile, window: u32) -> Self {
+        Self::new(local, None, true, 0, profile, window)
     }
 
     fn new(
         local: Callsign,
-        remote: Callsign,
+        remote: Option<Callsign>,
+        remote_is_learned: bool,
         conn_id: u16,
         profile: ModeProfile,
         window: u32,
@@ -148,6 +161,7 @@ impl Connection {
         Self {
             local,
             remote,
+            remote_is_learned,
             profile,
             conn_id,
             state: ConnState::Closed,
@@ -203,6 +217,16 @@ impl Connection {
         self.current_rung
     }
 
+    /// Build a periodic station-`ID` frame (Part-97 §97.119) stamped with the
+    /// current `conn_id` and mode. Used by the real-time [`Driver`](crate::Driver)
+    /// to satisfy the ≤10-minute ID cadence in **real** time (the sans-IO
+    /// connection runs on a logical clock that freezes during keying, so the
+    /// cadence itself cannot live here — only the frame primitive does). The peer
+    /// is always known mid-session, so this is only valid while `Connected`.
+    pub fn make_id_frame(&self) -> LinkFrame {
+        LinkFrame::id_frame(self.station_id(), self.conn_id).with_mode(self.current_rung)
+    }
+
     /// Begin connecting (initiator). No-op unless `Closed`.
     pub fn connect(&mut self, now: Duration) {
         if self.state != ConnState::Closed {
@@ -243,16 +267,19 @@ impl Connection {
     }
 
     /// Feed one decoded inbound frame.
+    ///
+    /// Addressing is by **`conn_id`**, not by per-frame callsign (the data plane
+    /// no longer carries callsigns). The data plane (`DATA`/`ACK`/`KEEPALIVE`) is
+    /// demuxed by `session_ok` (Connected + matching `conn_id`). ID-bearing frames
+    /// (`CONN`/`CONN_ACK`/`DISC`/`DISC_ACK`/`ID`) validate the station-ID block
+    /// inside their handlers (peer bootstrap + defense-in-depth).
     pub fn handle_frame(&mut self, frame: LinkFrame, now: Duration) {
-        // Addressing: ignore frames not from our peer / not for us.
-        if frame.src != self.remote || frame.dst != self.local {
-            return;
-        }
         match frame.frame_type {
             FrameType::Conn => self.on_conn(&frame, now),
             FrameType::ConnAck => self.on_conn_ack(&frame),
             FrameType::Disc => self.on_disc(&frame),
-            FrameType::DiscAck => self.on_disc_ack(),
+            FrameType::DiscAck => self.on_disc_ack(&frame),
+            FrameType::Id => self.on_id(&frame),
             FrameType::Data if self.session_ok(&frame) => self.on_data(frame),
             FrameType::Ack if self.session_ok(&frame) => self.on_ack(&frame),
             FrameType::Keepalive if self.session_ok(&frame) => self.on_keepalive(&frame),
@@ -407,8 +434,13 @@ impl Connection {
         }
     }
 
-    /// Reset per-session state to a fresh start (keeps callsigns/profile/conn_id).
+    /// Reset per-session state to a fresh start. Keeps `local`/profile/conn_id and
+    /// a *configured* peer (initiator), but clears a *learned* peer (acceptor) so a
+    /// listener can accept a different station on its next session (Codex review).
     fn reset_session(&mut self) {
+        if self.remote_is_learned {
+            self.remote = None;
+        }
         self.send.reset();
         self.recv.reset();
         self.reasm.reset();
@@ -452,25 +484,32 @@ impl Connection {
         self.state == ConnState::Connected && frame.conn_id == self.conn_id
     }
 
-    fn make_control(&self, frame_type: FrameType, seq: u32) -> LinkFrame {
-        LinkFrame::control(
-            frame_type,
+    /// The station-ID block (`SRC` = us, `DST` = peer) for an ID-bearing frame.
+    /// Only called once the peer is known (initiator: always; acceptor: after the
+    /// CONN that taught it `remote`).
+    fn station_id(&self) -> StationId {
+        StationId::new(
             self.local.clone(),
-            self.remote.clone(),
-            self.conn_id,
-            seq,
+            self.remote
+                .clone()
+                .expect("id-bearing frame requires a known peer"),
         )
-        .with_mode(self.current_rung)
+    }
+
+    /// Build a control frame, ID-bearing or not per its type. `CONN`/`CONN_ACK`/
+    /// `DISC`/`DISC_ACK` carry the station-ID block (Part-97 start/end ID);
+    /// `KEEPALIVE`/`NAK` carry no callsigns.
+    fn make_control(&self, frame_type: FrameType, seq: u32) -> LinkFrame {
+        let f = if frame_type.is_id_bearing() {
+            LinkFrame::id_control(frame_type, self.station_id(), self.conn_id, seq)
+        } else {
+            LinkFrame::control(frame_type, self.conn_id, seq)
+        };
+        f.with_mode(self.current_rung)
     }
 
     fn make_data(&self, seq: u32, payload: Vec<u8>) -> LinkFrame {
-        let mut f = LinkFrame::data(
-            self.local.clone(),
-            self.remote.clone(),
-            self.conn_id,
-            seq,
-            payload,
-        );
+        let mut f = LinkFrame::data(self.conn_id, seq, payload);
         f.ack_through = self.recv.ack_through();
         f.sack = self.sack_to_send();
         f.mode = self.current_rung;
@@ -481,14 +520,8 @@ impl Connection {
     }
 
     fn make_ack(&self) -> LinkFrame {
-        LinkFrame::ack(
-            self.local.clone(),
-            self.remote.clone(),
-            self.conn_id,
-            self.recv.ack_through(),
-            self.sack_to_send(),
-        )
-        .with_mode(self.current_rung)
+        LinkFrame::ack(self.conn_id, self.recv.ack_through(), self.sack_to_send())
+            .with_mode(self.current_rung)
     }
 
     /// The SACK bitmap to advertise: the live receive-buffer bitmap under
@@ -541,20 +574,41 @@ impl Connection {
     }
 
     fn on_conn(&mut self, frame: &LinkFrame, now: Duration) {
+        // A CONN must carry a station-ID block and be addressed to us.
+        let peer = match &frame.id {
+            Some(id) if id.dst == self.local => id.src.clone(),
+            _ => return,
+        };
         match self.state {
-            ConnState::Closed => self.accept_connection_as_acceptor(frame.conn_id, frame.seq, now),
+            ConnState::Closed => {
+                if self.remote_is_learned {
+                    // Listener: learn the calling station from CONN.src.
+                    self.remote = Some(peer);
+                } else if self.remote.as_ref() != Some(&peer) {
+                    // Configured initiator idle in Closed: accept only our peer.
+                    return;
+                }
+                self.accept_connection_as_acceptor(frame.conn_id, frame.seq, now);
+            }
             ConnState::Connected => {
-                if frame.conn_id == self.conn_id {
-                    // Idempotent: peer didn't hear our CONN_ACK — resend it.
+                // Idempotent CONN replay for THIS session, from our peer: peer
+                // didn't hear our CONN_ACK — resend it. A different conn_id is a
+                // stale/half-open peer (R6 follow-up): drop, do not regress.
+                if frame.conn_id == self.conn_id && self.remote.as_ref() == Some(&peer) {
                     let ack = self.make_control(FrameType::ConnAck, frame.seq);
                     self.outbox.push_back(ack);
                 }
-                // Different conn_id while connected ⇒ stale/half-open: drop.
             }
             ConnState::Connecting => {
-                // CONN/CONN collision: tie-break by callsign (higher keeps the
-                // initiator role; lower becomes the acceptor — design §4).
-                if self.local.as_str() <= self.remote.as_str() {
+                // CONN/CONN collision. We are an initiator with a configured peer;
+                // the colliding CONN must be from that peer, then tie-break by
+                // callsign (higher keeps the initiator role; lower becomes the
+                // acceptor — design §4). Learning never happens here, so it cannot
+                // corrupt the tie-break (Codex review).
+                if self.remote.as_ref() != Some(&peer) {
+                    return;
+                }
+                if self.local.as_str() <= peer.as_str() {
                     self.accept_connection_as_acceptor(frame.conn_id, frame.seq, now);
                 }
             }
@@ -564,6 +618,12 @@ impl Connection {
 
     fn on_conn_ack(&mut self, frame: &LinkFrame) {
         if self.state == ConnState::Connecting && frame.conn_id == self.conn_id {
+            // Defense-in-depth: the acceptor's ID block must name our peer (SRC)
+            // and us (DST). conn_id is the primary check.
+            match &frame.id {
+                Some(id) if id.dst == self.local && self.remote.as_ref() == Some(&id.src) => {}
+                _ => return,
+            }
             self.state = ConnState::Connected;
             self.floor = Floor::Sending; // initiator owns the first floor
             self.silent_overs = 0;
@@ -575,6 +635,7 @@ impl Connection {
     fn on_disc(&mut self, frame: &LinkFrame) {
         if (self.state == ConnState::Connected || self.state == ConnState::Disconnecting)
             && frame.conn_id == self.conn_id
+            && self.id_addressed_to_us(frame)
         {
             let ack = self.make_control(FrameType::DiscAck, 0);
             self.outbox.push_back(ack);
@@ -582,9 +643,37 @@ impl Connection {
         }
     }
 
-    fn on_disc_ack(&mut self) {
-        if self.state == ConnState::Disconnecting {
+    fn on_disc_ack(&mut self, frame: &LinkFrame) {
+        if self.state == ConnState::Disconnecting
+            && frame.conn_id == self.conn_id
+            && self.id_addressed_to_us(frame)
+        {
             self.close(Some(HostEvent::Disconnected));
+        }
+    }
+
+    /// A received periodic `ID` (Part-97) on this session: it proves the peer is
+    /// alive (like a keepalive) and confirms the peer's current mode. No host
+    /// event; passes the floor only if it carries the over-end token.
+    fn on_id(&mut self, frame: &LinkFrame) {
+        if !self.session_ok(frame) || !self.id_addressed_to_us(frame) {
+            return;
+        }
+        self.silent_overs = 0;
+        self.follow_mode(frame.mode);
+        if frame.is_end_of_over() {
+            self.on_over_end();
+        }
+    }
+
+    /// Defense-in-depth check for an ID-bearing frame: its `DST` names us and (once
+    /// the peer is known) its `SRC` names our peer. `conn_id` remains the primary
+    /// demux; this just rejects an obviously cross-addressed ID-bearing frame.
+    fn id_addressed_to_us(&self, frame: &LinkFrame) -> bool {
+        match &frame.id {
+            // MSRV 1.75: `map_or(true, ...)` rather than `Option::is_none_or` (1.82).
+            Some(id) => id.dst == self.local && self.remote.as_ref().map_or(true, |r| *r == id.src),
+            None => false,
         }
     }
 
@@ -648,6 +737,16 @@ mod tests {
         Callsign::new(s).unwrap()
     }
 
+    /// A CONN from `K1ABC` to `W2XYZ` (the standard peer pair in these tests).
+    fn conn_from_k1abc(conn_id: u16, seq: u32) -> LinkFrame {
+        LinkFrame::id_control(
+            FrameType::Conn,
+            StationId::new(call("K1ABC"), call("W2XYZ")),
+            conn_id,
+            seq,
+        )
+    }
+
     fn profile() -> ModeProfile {
         // Small per-over MTU so multi-frame messages are easy to force.
         ModeProfile::new(Duration::from_millis(10), 4)
@@ -678,7 +777,7 @@ mod tests {
     impl Pair {
         fn new() -> Self {
             let a = Connection::initiator(call("K1ABC"), call("W2XYZ"), 0x1234, profile(), 8);
-            let b = Connection::acceptor(call("W2XYZ"), call("K1ABC"), profile(), 8);
+            let b = Connection::acceptor(call("W2XYZ"), profile(), 8);
             Self {
                 a,
                 b,
@@ -852,7 +951,7 @@ mod tests {
         Connection::initiator(call("K1ABC"), call("W2XYZ"), 0x1234, profile(), 8)
     }
     fn acc() -> Connection {
-        Connection::acceptor(call("W2XYZ"), call("K1ABC"), profile(), 8)
+        Connection::acceptor(call("W2XYZ"), profile(), 8)
     }
 
     #[test]
@@ -900,20 +999,11 @@ mod tests {
     #[test]
     fn frame_with_wrong_conn_id_is_rejected_half_open() {
         let mut b = acc();
-        b.handle_frame(
-            LinkFrame::control(
-                FrameType::Conn,
-                call("K1ABC"),
-                call("W2XYZ"),
-                0x1234,
-                FIRST_SEQ,
-            ),
-            Duration::ZERO,
-        );
+        b.handle_frame(conn_from_k1abc(0x1234, FIRST_SEQ), Duration::ZERO);
         assert_eq!(b.state(), ConnState::Connected);
         while b.poll_event().is_some() {} // drain the Connected event
                                           // A DATA frame stamped with a *different* session id must be ignored.
-        let stale = LinkFrame::data(call("K1ABC"), call("W2XYZ"), 0x9999, 1, b"x".to_vec())
+        let stale = LinkFrame::data(0x9999, 1, b"x".to_vec())
             .end_of_msg()
             .end_of_over();
         b.handle_frame(stale, Duration::ZERO);
@@ -924,25 +1014,72 @@ mod tests {
     }
 
     #[test]
-    fn frame_from_a_third_party_is_ignored() {
-        let mut b = acc();
+    fn conn_addressed_to_a_different_station_is_ignored() {
+        // With per-frame callsigns gone, a CONN is addressed by its station-ID
+        // block. A listener must ignore a CONN whose DST is not itself (it is a
+        // call to some other station that happens to be audible).
+        let mut b = acc(); // local = W2XYZ
+        let not_for_us = LinkFrame::id_control(
+            FrameType::Conn,
+            StationId::new(call("K1ABC"), call("N0BODY")),
+            0x1234,
+            FIRST_SEQ,
+        );
+        b.handle_frame(not_for_us, Duration::ZERO);
+        assert_eq!(
+            b.state(),
+            ConnState::Closed,
+            "a CONN for another station must not open a session"
+        );
+        assert!(b.poll_event().is_none());
+    }
+
+    #[test]
+    fn acceptor_learns_the_caller_and_ids_back_to_it() {
+        // The listener has no pre-configured peer; it learns K1ABC from the CONN
+        // and its CONN_ACK must identify back to that learned peer.
+        let mut b = acc(); // local = W2XYZ, remote unknown
+        b.handle_frame(conn_from_k1abc(0x1234, FIRST_SEQ), Duration::ZERO);
+        let ack = b.poll_transmit(Duration::ZERO).expect("CONN_ACK queued");
+        assert_eq!(ack.frame_type, FrameType::ConnAck);
+        let id = ack.id.expect("CONN_ACK is ID-bearing");
+        assert_eq!(id.src.as_str(), "W2XYZ", "we identify as ourselves");
+        assert_eq!(id.dst.as_str(), "K1ABC", "addressed to the learned caller");
+    }
+
+    #[test]
+    fn a_listener_clears_a_learned_peer_on_close_and_accepts_a_new_one() {
+        let mut b = acc(); // learner
+        b.handle_frame(conn_from_k1abc(0x1234, FIRST_SEQ), Duration::ZERO);
+        while b.poll_event().is_some() {}
+        // Peer disconnects → close → learned remote must clear.
         b.handle_frame(
-            LinkFrame::control(
-                FrameType::Conn,
-                call("K1ABC"),
-                call("W2XYZ"),
+            LinkFrame::id_control(
+                FrameType::Disc,
+                StationId::new(call("K1ABC"), call("W2XYZ")),
                 0x1234,
-                FIRST_SEQ,
+                0,
             ),
             Duration::ZERO,
         );
+        assert_eq!(b.state(), ConnState::Closed);
         while b.poll_event().is_some() {}
-        // Correct session id but the SRC is not our peer.
-        let intruder = LinkFrame::data(call("N0BODY"), call("W2XYZ"), 0x1234, 1, b"x".to_vec())
-            .end_of_msg()
-            .end_of_over();
-        b.handle_frame(intruder, Duration::ZERO);
-        assert!(b.poll_event().is_none());
+        while b.poll_transmit(Duration::ZERO).is_some() {} // flush the DISC_ACK
+                                                           // A *different* station now calls; the listener must accept it.
+        let other = LinkFrame::id_control(
+            FrameType::Conn,
+            StationId::new(call("N0CALL"), call("W2XYZ")),
+            0x55AA,
+            FIRST_SEQ,
+        );
+        b.handle_frame(other, Duration::ZERO);
+        assert_eq!(b.state(), ConnState::Connected);
+        let ack = b.poll_transmit(Duration::ZERO).expect("CONN_ACK queued");
+        assert_eq!(
+            ack.id.unwrap().dst.as_str(),
+            "N0CALL",
+            "bound to the new peer"
+        );
     }
 
     #[test]
@@ -959,18 +1096,9 @@ mod tests {
     #[test]
     fn duplicate_data_is_not_delivered_twice() {
         let mut b = acc();
-        b.handle_frame(
-            LinkFrame::control(
-                FrameType::Conn,
-                call("K1ABC"),
-                call("W2XYZ"),
-                0x1234,
-                FIRST_SEQ,
-            ),
-            Duration::ZERO,
-        );
+        b.handle_frame(conn_from_k1abc(0x1234, FIRST_SEQ), Duration::ZERO);
         while b.poll_event().is_some() {}
-        let data = LinkFrame::data(call("K1ABC"), call("W2XYZ"), 0x1234, 1, b"hi".to_vec())
+        let data = LinkFrame::data(0x1234, 1, b"hi".to_vec())
             .end_of_msg()
             .end_of_over();
         b.handle_frame(data.clone(), Duration::ZERO);
@@ -1040,21 +1168,9 @@ mod tests {
     fn sack_disabled_suppresses_the_bitmap_even_with_a_buffered_gap() {
         // Selective-repeat receiver with a real out-of-order gap buffered.
         let mut b = acc();
-        b.handle_frame(
-            LinkFrame::control(
-                FrameType::Conn,
-                call("K1ABC"),
-                call("W2XYZ"),
-                0x1234,
-                FIRST_SEQ,
-            ),
-            Duration::ZERO,
-        );
+        b.handle_frame(conn_from_k1abc(0x1234, FIRST_SEQ), Duration::ZERO);
         // seq 2 arrives before seq 1 ⇒ a gap is buffered ⇒ recv.sack() != 0.
-        b.handle_frame(
-            LinkFrame::data(call("K1ABC"), call("W2XYZ"), 0x1234, 2, b"x".to_vec()),
-            Duration::ZERO,
-        );
+        b.handle_frame(LinkFrame::data(0x1234, 2, b"x".to_vec()), Duration::ZERO);
         assert_ne!(b.recv.sack(), 0, "precondition: a gap is buffered");
         assert_ne!(b.make_ack().sack, 0, "selective repeat advertises the gap");
 
@@ -1070,7 +1186,7 @@ mod tests {
         // multi-fragment message byte-exact and in order.
         let mut a = Connection::initiator(call("K1ABC"), call("W2XYZ"), 0x1234, profile(), 8)
             .with_strategy(ArqStrategy::WholeMessage);
-        let mut b = Connection::acceptor(call("W2XYZ"), call("K1ABC"), profile(), 8)
+        let mut b = Connection::acceptor(call("W2XYZ"), profile(), 8)
             .with_strategy(ArqStrategy::WholeMessage);
         a.connect(Duration::ZERO);
         a.send(b"floor-msg!".to_vec()); // 10 bytes, mtu 4 ⇒ 3 fragments
@@ -1125,28 +1241,24 @@ mod tests {
     #[test]
     fn disconnect_resets_arq_and_reassembly_so_a_reconnect_is_clean() {
         let mut b = acc();
-        b.handle_frame(
-            LinkFrame::control(
-                FrameType::Conn,
-                call("K1ABC"),
-                call("W2XYZ"),
-                0x1234,
-                FIRST_SEQ,
-            ),
-            Duration::ZERO,
-        );
+        b.handle_frame(conn_from_k1abc(0x1234, FIRST_SEQ), Duration::ZERO);
         while b.poll_event().is_some() {}
         // A partial message: one fragment, NOT end-of-msg ⇒ reassembler holds it
         // and the receive high-water advances.
         b.handle_frame(
-            LinkFrame::data(call("K1ABC"), call("W2XYZ"), 0x1234, 1, b"STALE".to_vec()),
+            LinkFrame::data(0x1234, 1, b"STALE".to_vec()),
             Duration::ZERO,
         );
         assert_eq!(b.recv.ack_through(), 1, "precondition: recv advanced");
 
         // Peer disconnects.
         b.handle_frame(
-            LinkFrame::control(FrameType::Disc, call("K1ABC"), call("W2XYZ"), 0x1234, 0),
+            LinkFrame::id_control(
+                FrameType::Disc,
+                StationId::new(call("K1ABC"), call("W2XYZ")),
+                0x1234,
+                0,
+            ),
             Duration::ZERO,
         );
         assert_eq!(b.state(), ConnState::Closed);
@@ -1156,19 +1268,10 @@ mod tests {
         // message. It must deliver exactly itself — the stale "STALE" fragment
         // must NOT bleed into it.
         while b.poll_event().is_some() {}
-        b.handle_frame(
-            LinkFrame::control(
-                FrameType::Conn,
-                call("K1ABC"),
-                call("W2XYZ"),
-                0xBEEF,
-                FIRST_SEQ,
-            ),
-            Duration::ZERO,
-        );
+        b.handle_frame(conn_from_k1abc(0xBEEF, FIRST_SEQ), Duration::ZERO);
         while b.poll_event().is_some() {}
         b.handle_frame(
-            LinkFrame::data(call("K1ABC"), call("W2XYZ"), 0xBEEF, 1, b"CLEAN".to_vec())
+            LinkFrame::data(0xBEEF, 1, b"CLEAN".to_vec())
                 .end_of_msg()
                 .end_of_over(),
             Duration::ZERO,

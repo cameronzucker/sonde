@@ -513,8 +513,7 @@ impl LinkPair {
         );
         let b = Link::new(
             eb,
-            Connection::acceptor(callsign("W2XYZ"), callsign("K1ABC"), gate_profile(), 8)
-                .with_strategy(strategy),
+            Connection::acceptor(callsign("W2XYZ"), gate_profile(), 8).with_strategy(strategy),
             ModeHint::MainAuto,
         );
         Self {
