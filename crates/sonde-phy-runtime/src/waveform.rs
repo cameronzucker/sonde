@@ -8,9 +8,11 @@
 //! [`Waveform::decode_scan`] with FM-appropriate pre-emphasis handling,
 //! deviation/PAPR control, and channel model.
 
-use sonde_fec::codec::FloorRate14Codec;
+use sonde_fec::codec::{FloorRate14Codec, OfdmAdaptiveCodec};
+use sonde_fec::codes::{BlockN, WifiLdpcRate};
 use sonde_phy::error::PhyError;
 use sonde_phy::modes::ModeFamily;
+use sonde_phy::ofdm_main::ofdm_params::{OfdmModeName, OfdmParams};
 use sonde_phy::robustness_floor::wideband_lowdensity::{
     SyncDecodeOutcome, WidebandLowDensityFloor,
 };
@@ -147,9 +149,87 @@ impl Waveform for FloorWaveform {
     }
 }
 
+/// OFDM main-family waveform `ofdm-wide`: Wide OFDM params, QPSK (2 bits per
+/// sub-carrier), WiFi LDPC N1296 R1/2 — a faster, higher-SNR mode that sits above
+/// the [`FloorWaveform`] on the adaptation ladder (sonde-c7i). It reuses the floor
+/// engine's mode-agnostic preamble + Schmidl-Cox sync + pilot-equalized demod
+/// ([`WidebandLowDensityFloor::with_params_constellation_fec`]); the only
+/// differences from the floor are the constellation order and code rate.
+/// Physics-gated end-to-end over AWGN in `sonde-phy/tests/ofdm_main_gate.rs`.
+///
+/// Narrower OFDM modes (`ofdm-mid`/`ofdm-narrow`) and higher constellations follow
+/// the same recipe; a multi-mode OFDM ladder also needs per-mode identity in the
+/// runtime's family-only routing (tracked separately).
+pub struct OfdmMainWaveform {
+    inner: WidebandLowDensityFloor,
+}
+
+impl OfdmMainWaveform {
+    /// Construct `ofdm-wide` (Wide / QPSK / N1296 R1/2).
+    pub fn new() -> Self {
+        Self {
+            inner: WidebandLowDensityFloor::with_params_constellation_fec(
+                OfdmParams::for_mode(OfdmModeName::Wide),
+                2, // QPSK
+                Box::new(OfdmAdaptiveCodec::new(BlockN::N1296, WifiLdpcRate::R1_2)),
+            ),
+        }
+    }
+}
+
+impl Default for OfdmMainWaveform {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Waveform for OfdmMainWaveform {
+    fn encode(&self, payload: &[u8]) -> Result<Vec<f32>, PhyError> {
+        self.inner.transmit_multi_with_preamble(payload)
+    }
+
+    fn decode_scan(&self, samples: &[f32]) -> DecodeScan {
+        match self.inner.receive_multi_with_sync_scan(samples) {
+            SyncDecodeOutcome::Frame {
+                payload,
+                snr_2500_db,
+                ..
+            } => DecodeScan::Frame(DecodedFrame {
+                payload,
+                family: ModeFamily::OfdmMain,
+                snr_2500_db,
+            }),
+            SyncDecodeOutcome::DetectedDecodeFailed { snr_2500_db, .. } => {
+                DecodeScan::Detected { snr_2500_db }
+            }
+            SyncDecodeOutcome::NoSignal => DecodeScan::NoSignal,
+        }
+    }
+
+    fn family(&self) -> ModeFamily {
+        ModeFamily::OfdmMain
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ofdm_main_waveform_round_trips_a_payload() {
+        let wf = OfdmMainWaveform::new();
+        let payload = b"ofdm-main end to end";
+        let samples = wf.encode(payload).expect("encode");
+        let mut captured = vec![0.0f32; 500];
+        captured.extend_from_slice(&samples);
+        match wf.decode_scan(&captured) {
+            DecodeScan::Frame(frame) => {
+                assert_eq!(frame.payload, payload);
+                assert_eq!(frame.family, ModeFamily::OfdmMain);
+            }
+            other => panic!("expected an OFDM-main frame, got {other:?}"),
+        }
+    }
 
     #[test]
     fn floor_waveform_round_trips_a_payload() {
