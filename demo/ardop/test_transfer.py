@@ -94,13 +94,32 @@ def test_capacity_map_matches_ardopcf():
     assert m and int(m.group(1)) == ac.FRAME_CAPACITY[frame]
 
 
+def test_transfer_window_fits_the_default_payload():
+    """Regression guard for sonde-0t3: the post-CONNECT transfer window must stay
+    large enough for the ~3.3 KB default message to finish on a non-ideal link.
+
+    The default payload fully delivers over a Good @ SNR 10 channel in ~287 s
+    (measured); the historic 90 s window only ever fit the pristine Ideal channel,
+    so Good/Moderate/Poor silently delivered a partial. Keep a generous floor so a
+    future edit can't quietly reintroduce that bug. No binaries needed."""
+    import testbench as tb
+    assert tb.SessionParams().data_timeout >= 300.0, (
+        "data_timeout regressed below the measured Good@SNR10 transfer time "
+        "(~287 s) — the default payload will partial on non-ideal channels")
+
+
 if __name__ == "__main__":
+    # The config regression test needs no binaries — always exercise it first.
+    print("  test_transfer_window_fits_the_default_payload ...", end=" ", flush=True)
+    test_transfer_window_fits_the_default_payload()
+    print("ok")
     if not _HAVE_BINS:
-        print("SKIP:", _SKIP)
+        print("SKIP (integration tests):", _SKIP)
         sys.exit(0)
-    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    fns = [v for k, v in sorted(globals().items())
+           if k.startswith("test_") and k != "test_transfer_window_fits_the_default_payload"]
     for fn in fns:
         print(f"  {fn.__name__} ...", end=" ", flush=True)
         fn()
         print("ok")
-    print(f"\n{len(fns)} backend transfer tests passed.")
+    print(f"\n{len(fns) + 1} backend transfer tests passed.")
