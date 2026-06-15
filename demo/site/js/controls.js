@@ -65,7 +65,7 @@ export function createControls(onRun) {
     runBtn.disabled = running;
     runBtn.setAttribute("aria-busy", String(running));
     const txt = runBtn.querySelector(".runbtn__txt");
-    if (txt) txt.textContent = running ? "Connected — live…" : "Connect";
+    if (txt) txt.textContent = running ? "Connected" : "Connect";
   }
 
   return { getState, setRunning };

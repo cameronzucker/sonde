@@ -74,7 +74,13 @@
       </div>
     </header>
 
-    <!-- ── MAIN: waterfall hero (left) · telemetry/log/recon (right) ── -->
+    <!-- ── Thin live status strip (replaces the bulky STATUS pane) ── -->
+    <div class="statusbar" id="adaptation-readout" aria-live="polite">
+      <span class="statusbar__tag">STATUS</span>
+      <span class="adaptation__text">Set the channel + bandwidth ceiling, then press Connect.</span>
+    </div>
+
+    <!-- ── MAIN: waterfall + log (left) · telemetry/recon (right) ── -->
     <main class="cockpit__main">
 
       <section class="cockpit__left">
@@ -91,17 +97,24 @@
             <div class="stage__boot" id="stage-boot">press Connect — the live spectrum streams in as the modems transmit…</div>
           </div>
         </div>
-        <div class="adaptation" id="adaptation-readout" aria-live="polite">
-          <span class="adaptation__tag">STATUS</span>
-          <span class="adaptation__text">Set the channel + bandwidth ceiling, then press Connect.</span>
-        </div>
+
+        <!-- CONNECTION / ARQ LOG — under the waterfall, fills the width -->
+        <section class="panel panel--console" aria-labelledby="console-label">
+          <div class="panel__head">
+            <h2 class="panel__title" id="console-label"><span class="idx">02</span> Connection / ARQ Log</h2>
+            <span class="panel__hint"><span class="flip">delivered <span id="session-progress">0/0 B</span></span></span>
+          </div>
+          <div class="flog">
+            <div class="flog__stream" id="session-log-stream"><span class="console__idle">— awaiting session —</span></div>
+          </div>
+        </section>
       </section>
 
       <aside class="cockpit__right">
         <!-- TELEMETRY -->
         <section class="panel panel--stats" aria-labelledby="stats-label">
           <div class="panel__head">
-            <h2 class="panel__title" id="stats-label"><span class="idx">02</span> Link Telemetry</h2>
+            <h2 class="panel__title" id="stats-label"><span class="idx">03</span> Link Telemetry</h2>
             <span class="panel__hint">live</span>
           </div>
           <div class="stats">
@@ -126,17 +139,6 @@
               <span class="stat__k">Time to deliver</span>
               <span class="stat__v" id="stat-deliver">—</span>
             </div>
-          </div>
-        </section>
-
-        <!-- CONNECTION / ARQ LOG -->
-        <section class="panel panel--console" aria-labelledby="console-label">
-          <div class="panel__head">
-            <h2 class="panel__title" id="console-label"><span class="idx">03</span> Connection / ARQ Log</h2>
-            <span class="panel__hint"><span class="flip">delivered <span id="session-progress">0/0 B</span></span></span>
-          </div>
-          <div class="flog">
-            <div class="flog__stream" id="session-log-stream"><span class="console__idle">— awaiting session —</span></div>
           </div>
         </section>
 
