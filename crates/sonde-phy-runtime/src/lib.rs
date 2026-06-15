@@ -32,7 +32,7 @@ pub mod soundcard;
 
 pub use radio::{LoopbackRadio, Radio};
 pub use runtime::SondePhy;
-pub use waveform::{DecodeScan, DecodedFrame, FloorWaveform, Waveform};
+pub use waveform::{DecodeScan, DecodedFrame, FloorWaveform, OfdmMainWaveform, Waveform};
 
 #[cfg(feature = "hardware")]
 pub use soundcard::SoundcardRadio;

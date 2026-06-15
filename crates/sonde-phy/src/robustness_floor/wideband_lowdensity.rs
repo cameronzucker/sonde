@@ -140,6 +140,12 @@ pub struct WidebandLowDensityFloor {
     // adapters (e.g. sonde-phy-runtime's `FloorWaveform`); a bare
     // `dyn` trait object would strip the auto-trait. All codecs are Send.
     fec: Box<dyn FecCodec + Send>,
+    /// Bits per occupied sub-carrier (constellation order): 1 = BPSK (the floor),
+    /// 2 = QPSK, 4 = QAM16, 6 = QAM64. The transmit/demod paths already consume a
+    /// per-sub-carrier bit count, so this is the single knob that turns the BPSK
+    /// floor engine into a faster OFDM-main mode (sonde-c7i). `1` reproduces the
+    /// gated floor bit-for-bit.
+    bits_per_sc: u8,
     /// When `Some`, the demod uses this FIXED noise variance instead of the
     /// per-symbol empty-bin estimate. Production leaves it `None`; only the
     /// sonde-gtg differential gate's control arm sets it (to `0.1`).
@@ -155,6 +161,7 @@ impl WidebandLowDensityFloor {
         Self {
             params,
             fec: Box::new(IdentityFec::new(block)),
+            bits_per_sc: 1,
             n0_override: None,
         }
     }
@@ -164,6 +171,30 @@ impl WidebandLowDensityFloor {
         Self {
             params: OfdmParams::for_mode(OfdmModeName::Wide),
             fec,
+            bits_per_sc: 1,
+            n0_override: None,
+        }
+    }
+
+    /// General coded-OFDM waveform: arbitrary `params` (Narrow/Mid/Wide),
+    /// constellation order `bits_per_sc` (1 BPSK / 2 QPSK / 4 QAM16 / 6 QAM64),
+    /// and codec — the engine the OFDM main-family waveforms (sonde-c7i) use.
+    /// Reuses the floor's mode-agnostic preamble + Schmidl-Cox sync + pilot-
+    /// equalized demod unchanged. `new` / `with_fec` are the pinned floor
+    /// specialisation (Wide, BPSK), preserved bit-for-bit.
+    pub fn with_params_constellation_fec(
+        params: OfdmParams,
+        bits_per_sc: u8,
+        fec: Box<dyn FecCodec + Send>,
+    ) -> Self {
+        debug_assert!(
+            matches!(bits_per_sc, 1 | 2 | 4 | 6),
+            "bits_per_sc must be 1/2/4/6 (BPSK/QPSK/QAM16/QAM64)"
+        );
+        Self {
+            params,
+            fec,
+            bits_per_sc,
             n0_override: None,
         }
     }
@@ -181,11 +212,12 @@ impl WidebandLowDensityFloor {
         &self.params
     }
 
-    /// BPSK on every occupied sub-carrier — entries at pilot positions
-    /// are ignored by the transmitter / receiver but follow the same
-    /// index convention as [`OfdmParams::subcarrier_indices`].
+    /// Constellation order on every occupied sub-carrier (`bits_per_sc`; 1 = BPSK
+    /// floor). Entries at pilot positions are ignored by the transmitter /
+    /// receiver but follow the same index convention as
+    /// [`OfdmParams::subcarrier_indices`].
     pub fn bits_per_subcarrier(&self) -> Vec<u8> {
-        vec![1; self.params.subcarrier_indices().len()]
+        vec![self.bits_per_sc; self.params.subcarrier_indices().len()]
     }
 
     /// Sample count of one OFDM symbol (FFT body + cyclic prefix).
@@ -193,10 +225,11 @@ impl WidebandLowDensityFloor {
         self.params.fft_size() + self.params.cp_len()
     }
 
-    /// Data bits carried by one BPSK OFDM symbol (one per data
-    /// sub-carrier).
+    /// Data bits carried by one OFDM symbol: `bits_per_sc` per DATA sub-carrier
+    /// (pilots carry no payload bits). BPSK (`bits_per_sc == 1`) gives one per
+    /// data sub-carrier — the floor value.
     fn data_bits_per_symbol(&self) -> usize {
-        self.params.data_indices().len()
+        self.params.data_indices().len() * self.bits_per_sc as usize
     }
 
     /// OFDM symbols needed to carry one FEC block's coded bits, with
