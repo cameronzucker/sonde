@@ -636,10 +636,21 @@ body {
   transition: width 0.05s linear;
 }
 .vu__peak {
-  position: absolute; top: -1px; bottom: -1px; left: 0%; width: 2px;
+  position: absolute; top: -1px; bottom: -1px; left: 0%; width: 2px; z-index: 3;
   background: var(--ink); box-shadow: 0 0 4px rgba(255, 255, 255, 0.6);
 }
-.vu__db { font-size: 9px; color: var(--faint); flex: none; min-width: 34px; text-align: right; }
+/* S-unit graduations (S1·S3·S5·S7·S9 across the bar). */
+.vu__scale {
+  position: absolute; inset: 0; z-index: 2; pointer-events: none;
+  background-image: repeating-linear-gradient(90deg,
+    transparent 0, transparent calc(25% - 1px),
+    rgba(150, 178, 208, 0.22) calc(25% - 1px), rgba(150, 178, 208, 0.22) 25%);
+}
+.vu__read {
+  font-size: 9.5px; font-weight: 600; color: var(--muted); flex: none;
+  min-width: 42px; text-align: right; letter-spacing: 0.03em;
+}
+.vu__read--hot { color: var(--amber); }
 
 /* Constellation — honest stub (Sonde-side; ARDOP doesn't expose demod symbols). */
 .cockpit__right .panel--constellation { flex: 0 0 auto; }

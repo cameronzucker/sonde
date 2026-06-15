@@ -12,7 +12,7 @@ import { createSessionLog } from "./session-log.js";
 import { createImageReveal } from "./image-reveal.js";
 import { createControls } from "./controls.js";
 import { createLiveAudio } from "./live-audio.js";
-import { createMeter } from "./vu-meter.js";
+import { createSMeter } from "./s-meter.js";
 
 // ── DOM handles ─────────────────────────────────────────────────────────────
 const el = (id) => document.getElementById(id);
@@ -182,9 +182,9 @@ async function boot() {
     getAnalyser: () => liveAudio.getAnalyser("rev"),
     isPlaying: () => liveAudio.isPlaying("rev"),
   });
-  // Per-station V/U meters off the same per-direction analysers (real on-air level).
-  meterFwd = createMeter(el("vu-fwd"), { getAnalyser: () => liveAudio.getAnalyser("fwd") });
-  meterRev = createMeter(el("vu-rev"), { getAnalyser: () => liveAudio.getAnalyser("rev") });
+  // Per-station S-meters off the same per-direction analysers (real on-air level).
+  meterFwd = createSMeter(el("vu-fwd"), { getAnalyser: () => liveAudio.getAnalyser("fwd") });
+  meterRev = createSMeter(el("vu-rev"), { getAnalyser: () => liveAudio.getAnalyser("rev") });
   sessionLog = createSessionLog(el("session-log-stream"), el("session-progress"));
   imageReveal = createImageReveal(el("recon-image"));
   controls = createControls(runConnectedSession);

@@ -1,16 +1,32 @@
-// vu-meter.js — live per-station audio-level (V/U) meter (ES module).
+// s-meter.js — live per-station S-meter (ES module).
 //
-// Reads RMS from one direction's AnalyserNode each frame and drives a fill bar +
-// peak-hold marker + dB readout. Honest: it's the ACTUAL on-air audio level for that
-// station, so the A->B meter pulses on data bursts and the B->A meter pulses on the
-// receiver's ACK/NAK bursts — the half-duplex turn-taking, as levels.
+// Reads RMS from one direction's AnalyserNode each frame and renders it as an
+// amateur-radio S-meter: S-units (6 dB each, the conventional spacing) with over-S9
+// shown as "S9+N dB". Honest: it's the ACTUAL on-air audio level for that station,
+// so the A->B meter rises on data bursts and B->A on the receiver's ACK/NAK bursts.
+//
+// There is no calibrated RF reference here (it's audio through a simulated channel),
+// so S9 is anchored at a strong on-air burst (~-5 dBFS) and the scale runs down from
+// there at 6 dB/S-unit — a relative signal-strength display, not a calibrated dBm.
 
-const DB_FLOOR = -48; // bottom of the meter scale (dBFS)
+const S9_DBFS = -5; // a strong on-air burst reads ~S9
+const DB_PER_S = 6; // conventional S-unit spacing
 
-export function createMeter(vuEl, { getAnalyser } = {}) {
-  const fill = vuEl.querySelector(".vu__fill");
-  const peakEl = vuEl.querySelector(".vu__peak");
-  const dbEl = vuEl.querySelector(".vu__db");
+/** dBFS → { fill: 0..1 (S1..S9 across the bar), text: "S7" | "S9+12", over: bool } */
+function readS(db) {
+  if (db <= -120) return { fill: 0, text: "S—", over: false };
+  if (db > S9_DBFS) {
+    return { fill: 1, text: `S9+${Math.round(db - S9_DBFS)}`, over: true };
+  }
+  const s = 9 + (db - S9_DBFS) / DB_PER_S; // continuous S-units (≤ 9 here)
+  const fill = Math.max(0, Math.min(1, (s - 1) / 8)); // S1→0, S9→1
+  return { fill, text: `S${Math.max(0, Math.round(s))}`, over: false };
+}
+
+export function createSMeter(el, { getAnalyser } = {}) {
+  const fillEl = el.querySelector(".vu__fill");
+  const peakEl = el.querySelector(".vu__peak");
+  const readEl = el.querySelector(".vu__read");
   let buf = null;
   let peak = 0;
   let raf = null;
@@ -26,21 +42,27 @@ export function createMeter(vuEl, { getAnalyser } = {}) {
     for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
     const rms = Math.sqrt(sum / buf.length);
     const db = rms > 1e-5 ? 20 * Math.log10(rms) : -120;
-    const level = Math.max(0, Math.min(1, (db - DB_FLOOR) / -DB_FLOOR));
+    const { fill, text, over } = readS(db);
 
-    peak = level >= peak ? level : Math.max(level, peak * 0.94); // fast attack, slow fall
-    if (fill) fill.style.width = `${(level * 100).toFixed(1)}%`;
+    peak = fill >= peak ? fill : Math.max(fill, peak * 0.94); // fast attack, slow fall
+    if (fillEl) fillEl.style.width = `${(fill * 100).toFixed(1)}%`;
     if (peakEl) peakEl.style.left = `${(peak * 100).toFixed(1)}%`;
-    if (dbEl) dbEl.textContent = db <= -120 ? "—" : `${Math.round(db)} dB`;
+    if (readEl) {
+      readEl.textContent = text;
+      readEl.classList.toggle("vu__read--hot", over);
+    }
   }
   raf = requestAnimationFrame(frame);
 
   return {
     reset() {
       peak = 0;
-      if (fill) fill.style.width = "0%";
+      if (fillEl) fillEl.style.width = "0%";
       if (peakEl) peakEl.style.left = "0%";
-      if (dbEl) dbEl.textContent = "—";
+      if (readEl) {
+        readEl.textContent = "S—";
+        readEl.classList.remove("vu__read--hot");
+      }
     },
     dispose() { if (raf) cancelAnimationFrame(raf); },
   };
