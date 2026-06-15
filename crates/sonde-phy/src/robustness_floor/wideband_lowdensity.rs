@@ -225,6 +225,18 @@ impl WidebandLowDensityFloor {
         self.params.fft_size() + self.params.cp_len()
     }
 
+    /// Net info bitrate (information bits / second): one FEC block's info bits over
+    /// the airtime of the symbols carrying it. Used to derive Eb/N0 from the
+    /// reported `SNR_2500`.
+    pub fn info_bitrate_bps(&self) -> f32 {
+        let block_secs = (self.symbols_per_block() * self.symbol_size_samples()) as f32
+            / crate::audio_io::SAMPLE_RATE_HZ as f32;
+        if block_secs <= 0.0 {
+            return 0.0;
+        }
+        self.fec.block_info_bits() as f32 / block_secs
+    }
+
     /// Data bits carried by one OFDM symbol: `bits_per_sc` per DATA sub-carrier
     /// (pilots carry no payload bits). BPSK (`bits_per_sc == 1`) gives one per
     /// data sub-carrier — the floor value.

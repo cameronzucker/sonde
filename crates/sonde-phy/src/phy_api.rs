@@ -81,6 +81,21 @@ pub struct ChannelQualityReport {
     recent_frames_total: u32,
     recent_frames_failed: u32,
     current_bit_loading: Option<Vec<u8>>,
+    /// Eb/N0 (energy per LDPC info bit, dB) of the most recent over — the
+    /// gate/audit reference, derived from `aggregate_snr_db` and the resolved
+    /// mode's net info bitrate. `NaN` when unknown. Exposed alongside `SNR_2500`
+    /// per Codex review C6 (the link consumes `SNR_2500`; Eb/N0 catches rate/3 dB
+    /// mistakes).
+    ebn0_info_db: f32,
+    /// Stable id of the mode the report pertains to (e.g. `"ofdm-wide"`), or
+    /// `None` before any over. The link resets its SNR estimate across waveform
+    /// families because reported SNR is mode-conditioned (design F6); this tag
+    /// makes the domain explicit (Codex review C5).
+    mode_name: Option<&'static str>,
+    /// Stable id of the estimator that produced the SNR (e.g. `"ofdm-pilot"`,
+    /// `"nfsk-tone"`) — per-family estimator bias is real, so the link knows which
+    /// estimator domain a number came from (Codex review C5).
+    estimator_id: &'static str,
 }
 
 impl ChannelQualityReport {
@@ -92,6 +107,9 @@ impl ChannelQualityReport {
             recent_frames_total: 0,
             recent_frames_failed: 0,
             current_bit_loading: None,
+            ebn0_info_db: f32::NAN,
+            mode_name: None,
+            estimator_id: "none",
         }
     }
     /// Channel SNR referenced to a **2500 Hz noise bandwidth** (the SSB channel),
@@ -132,8 +150,22 @@ impl ChannelQualityReport {
     pub fn current_bit_loading(&self) -> Option<&[u8]> {
         self.current_bit_loading.as_deref()
     }
+    /// Eb/N0 (energy per info bit, dB) of the most recent over — the audit/gate
+    /// reference (see field docs). `NaN` when unknown.
+    pub fn ebn0_info_db(&self) -> f32 {
+        self.ebn0_info_db
+    }
+    /// Stable id of the mode this report pertains to (`None` before any over).
+    pub fn mode_name(&self) -> Option<&'static str> {
+        self.mode_name
+    }
+    /// Stable id of the estimator that produced the SNR.
+    pub fn estimator_id(&self) -> &'static str {
+        self.estimator_id
+    }
     /// Construct a `ChannelQualityReport` from explicit parts. Used by the
-    /// PHY when synthesizing the snapshot from internal state.
+    /// PHY when synthesizing the snapshot from internal state. The mode-tag /
+    /// Eb/N0 fields default to "unknown"; set them with [`Self::with_mode_quality`].
     pub fn from_parts(
         per_subcarrier_snr_db: Vec<f32>,
         aggregate_snr_db: f32,
@@ -147,7 +179,23 @@ impl ChannelQualityReport {
             recent_frames_total,
             recent_frames_failed,
             current_bit_loading,
+            ebn0_info_db: f32::NAN,
+            mode_name: None,
+            estimator_id: "none",
         }
+    }
+    /// Attach the resolved mode tag, estimator id, and Eb/N0 of the most recent
+    /// over to a report (C5/C6). Chained after [`Self::from_parts`].
+    pub fn with_mode_quality(
+        mut self,
+        mode_name: Option<&'static str>,
+        estimator_id: &'static str,
+        ebn0_info_db: f32,
+    ) -> Self {
+        self.mode_name = mode_name;
+        self.estimator_id = estimator_id;
+        self.ebn0_info_db = ebn0_info_db;
+        self
     }
 }
 

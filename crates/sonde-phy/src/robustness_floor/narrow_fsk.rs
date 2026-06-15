@@ -85,6 +85,12 @@ impl NarrowFskFloor {
         (SAMPLE_RATE_HZ as f32 * SYMBOL_DURATION_SEC) as usize
     }
 
+    /// Info bitrate (bits / second): 3 bits per 8-FSK symbol over the symbol
+    /// period (uncoded). Used to derive Eb/N0 from the reported `SNR_2500`.
+    pub fn info_bitrate_bps(&self) -> f32 {
+        3.0 / SYMBOL_DURATION_SEC
+    }
+
     fn tone_freq_hz(&self, idx: usize) -> f32 {
         let low = CENTER_FREQ_HZ - (M as f32 / 2.0 - 0.5) * TONE_SPACING_HZ;
         low + idx as f32 * TONE_SPACING_HZ

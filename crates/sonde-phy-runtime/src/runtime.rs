@@ -57,6 +57,15 @@ struct OverOutcome {
     snr_2500_db: Option<f32>,
 }
 
+/// Per-over metadata the report tags itself with (Codex review C5/C6): which mode
+/// + estimator produced the SNR, and the mode's net info bitrate (for Eb/N0).
+#[derive(Clone, Copy)]
+struct OverMeta {
+    mode_name: Option<&'static str>,
+    estimator_id: &'static str,
+    info_bitrate_bps: Option<f32>,
+}
+
 /// Shared channel-quality state, updated by the worker, read by
 /// `channel_quality()`. A bounded ring of recent RECEIVED overs (newest last)
 /// plus a staleness counter; see [`FER_WINDOW`] / [`STALE_AFTER_NOSIGNAL_WINDOWS`].
@@ -65,12 +74,15 @@ struct QualitySnapshot {
     recent: VecDeque<OverOutcome>,
     /// Consecutive `NoSignal` RX windows since the last received over (staleness).
     windows_since_rx: u32,
+    /// Mode/estimator/rate tag of the most recent received over.
+    latest_meta: Option<OverMeta>,
 }
 
 impl QualitySnapshot {
     /// Record a received over (clean or detected-but-failed). Resets staleness.
-    fn record_over(&mut self, failed: bool, snr_2500_db: Option<f32>) {
+    fn record_over(&mut self, failed: bool, snr_2500_db: Option<f32>, meta: OverMeta) {
         self.windows_since_rx = 0;
+        self.latest_meta = Some(meta);
         self.recent.push_back(OverOutcome {
             failed,
             snr_2500_db,
@@ -90,7 +102,8 @@ impl QualitySnapshot {
     }
 
     /// Build the link-facing report: raw latest-over SNR (the link owns the EWMA),
-    /// windowed FER, and the received-over count. Empty window ⇒ no measurement.
+    /// windowed FER, the received-over count, and the mode/estimator/Eb/N0 tag.
+    /// Empty window ⇒ no measurement.
     fn report(&self) -> ChannelQualityReport {
         if self.recent.is_empty() {
             return ChannelQualityReport::empty();
@@ -104,7 +117,25 @@ impl QualitySnapshot {
             .find_map(|o| o.snr_2500_db)
             .unwrap_or(f32::NAN);
         let failed = self.recent.iter().filter(|o| o.failed).count() as u32;
-        ChannelQualityReport::from_parts(Vec::new(), snr, self.recent.len() as u32, failed, None)
+        let base = ChannelQualityReport::from_parts(
+            Vec::new(),
+            snr,
+            self.recent.len() as u32,
+            failed,
+            None,
+        );
+        match self.latest_meta {
+            Some(m) => {
+                // Eb/N0 = SNR_2500 − 10·log10(R_info / 2500): de-reference the
+                // channel SNR by the mode's net info bitrate (audit/gate ref, C6).
+                let ebn0 = match (snr.is_finite(), m.info_bitrate_bps) {
+                    (true, Some(r)) if r > 0.0 => snr - 10.0 * (r / 2500.0).log10(),
+                    _ => f32::NAN,
+                };
+                base.with_mode_quality(m.mode_name, m.estimator_id, ebn0)
+            }
+            None => base,
+        }
     }
 }
 
@@ -321,11 +352,16 @@ impl<R: Radio> Worker<R> {
         // decodes whatever family actually arrives (design §3). With one waveform
         // this is a single attempt; the loop only does more work when >1 family is
         // registered AND its cheap `detect` pre-gate passes (Codex review C3).
-        let mut detected_snr: Option<Option<f32>> = None;
+        let mut detected: Option<(Option<f32>, OverMeta)> = None;
         for waveform in &self.waveforms {
             if !waveform.detect(&samples) {
                 continue;
             }
+            let meta = OverMeta {
+                mode_name: waveform.mode_name(),
+                estimator_id: waveform.estimator_id(),
+                info_bitrate_bps: waveform.info_bitrate_bps(),
+            };
             match waveform.decode_scan(&samples) {
                 DecodeScan::Frame(frame) => {
                     // Label the RxFrame with the SPECIFIC mode the winning waveform
@@ -336,18 +372,19 @@ impl<R: Radio> Worker<R> {
                         None => self.modes.resolve(hint_for_family(frame.family), None),
                     };
                     if let Ok(mut q) = self.quality.lock() {
-                        q.record_over(false, frame.snr_2500_db);
+                        q.record_over(false, frame.snr_2500_db, meta);
                     }
                     let snr = frame.snr_2500_db.unwrap_or(f32::NAN);
                     let rx = RxFrame::new(frame.payload, mode, None, snr, true);
                     let _ = self.frame_tx.send(rx);
                     return; // first clean decode wins
                 }
-                // Detected but failed to decode: remember it (with its measured
-                // SNR) in case no other waveform decodes cleanly — then it counts
-                // as one failed over (no survivorship bias).
+                // Detected but failed to decode: remember it (with its measured SNR
+                // + this waveform's mode/estimator tag) in case no other waveform
+                // decodes cleanly — then it counts as one failed over (no
+                // survivorship bias).
                 DecodeScan::Detected { snr_2500_db } => {
-                    detected_snr.get_or_insert(snr_2500_db);
+                    detected.get_or_insert((snr_2500_db, meta));
                 }
                 DecodeScan::NoSignal => {}
             }
@@ -355,8 +392,8 @@ impl<R: Radio> Worker<R> {
         // No clean decode this window. A detected-but-failed over is a real frame
         // error; pure silence only ages the report.
         if let Ok(mut q) = self.quality.lock() {
-            match detected_snr {
-                Some(snr) => q.record_over(true, snr),
+            match detected {
+                Some((snr, meta)) => q.record_over(true, snr, meta),
                 None => q.record_no_signal(),
             }
         }
@@ -380,6 +417,15 @@ mod tests {
     use sonde_phy::modes::ModeHint;
     use sonde_phy::phy_api::PhyTransport;
     use std::time::{Duration, Instant};
+
+    /// Placeholder over-metadata for the QualitySnapshot unit tests.
+    fn tmeta() -> OverMeta {
+        OverMeta {
+            mode_name: Some("floor-wblo"),
+            estimator_id: "test",
+            info_bitrate_bps: Some(1000.0),
+        }
+    }
 
     /// Poll `poll_rx` until a frame arrives or the deadline passes.
     fn wait_for_frame(phy: &mut SondePhy, timeout: Duration) -> Option<RxFrame> {
@@ -469,7 +515,7 @@ mod tests {
         let mut q = QualitySnapshot::default();
         // Fill past the window with clean overs; FER stays 0, count caps at FER_WINDOW.
         for _ in 0..(FER_WINDOW + 4) {
-            q.record_over(false, Some(20.0));
+            q.record_over(false, Some(20.0), tmeta());
         }
         let r = q.report();
         assert_eq!(
@@ -485,14 +531,14 @@ mod tests {
 
         // A burst of failures pushes FER up within the window …
         for _ in 0..FER_WINDOW {
-            q.record_over(true, Some(2.0));
+            q.record_over(true, Some(2.0), tmeta());
         }
         let r = q.report();
         assert_eq!(r.frame_error_rate(), 1.0, "window now all failures");
 
         // … and a run of clean overs recovers it (recent, not lifetime).
         for _ in 0..FER_WINDOW {
-            q.record_over(false, Some(18.0));
+            q.record_over(false, Some(18.0), tmeta());
         }
         assert_eq!(
             q.report().frame_error_rate(),
@@ -502,9 +548,34 @@ mod tests {
     }
 
     #[test]
+    fn report_carries_mode_estimator_and_ebn0_tag() {
+        let mut q = QualitySnapshot::default();
+        q.record_over(
+            false,
+            Some(15.0),
+            OverMeta {
+                mode_name: Some("ofdm-wide"),
+                estimator_id: "ofdm-pilot",
+                info_bitrate_bps: Some(2500.0),
+            },
+        );
+        let r = q.report();
+        assert_eq!(r.mode_name(), Some("ofdm-wide"));
+        assert_eq!(r.estimator_id(), "ofdm-pilot");
+        // Eb/N0 = SNR_2500 − 10log10(R/2500); R=2500 ⇒ Eb/N0 == SNR_2500.
+        assert!(
+            (r.ebn0_info_db() - 15.0).abs() < 1e-3,
+            "ebn0 = {}",
+            r.ebn0_info_db()
+        );
+        // empty report has no tag.
+        assert_eq!(QualitySnapshot::default().report().mode_name(), None);
+    }
+
+    #[test]
     fn quality_window_goes_stale_after_sustained_silence() {
         let mut q = QualitySnapshot::default();
-        q.record_over(false, Some(25.0));
+        q.record_over(false, Some(25.0), tmeta());
         assert!(q.report().aggregate_snr_db().is_finite(), "fresh reading");
 
         // Sustained dead air ages the report back to "no measurement" (NaN),
