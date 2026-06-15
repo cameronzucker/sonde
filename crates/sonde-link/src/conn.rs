@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use crate::arq::{Reassembler, RecvBuffer, SendWindow, FIRST_SEQ};
 use crate::frame::{Callsign, FrameType, LinkFrame, StationId};
-use crate::mac::{self, ArqStrategy, BASE_RUNG, DEFAULT_RUNG};
+use crate::mac::{self, ArqStrategy};
 use crate::profile::ModeProfile;
 use sonde_phy::modes::ModeHint;
 
@@ -174,7 +174,7 @@ impl Connection {
         profile: ModeProfile,
         window: u32,
     ) -> Self {
-        Self {
+        let mut c = Self {
             local,
             remote,
             remote_is_learned,
@@ -192,7 +192,7 @@ impl Connection {
             awaiting_reply: false,
             owe_ack: false,
             sack_enabled: true,
-            current_rung: DEFAULT_RUNG,
+            current_rung: mac::default_rung(),
             snr_raw: f32::NAN,
             snr_smoothed: f32::NAN,
             fer: 0.0,
@@ -201,7 +201,11 @@ impl Connection {
             silent_overs: 0,
             conn_retries: 0,
             disc_retries: 0,
-        }
+        };
+        // The ARQ follows the registered default mode (today the wideband floor =
+        // WholeMessage/window-1); `with_strategy` can override before `connect`.
+        c.configure_arq_for_rung(c.current_rung);
+        c
     }
 
     /// Select the ARQ strategy (builder; apply before `connect`). The floor
@@ -210,7 +214,13 @@ impl Connection {
     /// keeps the constructed window and SACK.
     pub fn with_strategy(mut self, strategy: ArqStrategy) -> Self {
         match strategy {
-            ArqStrategy::SelectiveRepeat => self.sack_enabled = true,
+            ArqStrategy::SelectiveRepeat => {
+                self.sack_enabled = true;
+                // Restore the constructed window (the default mode may be the
+                // window-1 floor, which `new` configured).
+                self.send = SendWindow::new(self.initial_window);
+                self.recv = RecvBuffer::new(self.initial_window);
+            }
             ArqStrategy::WholeMessage => {
                 self.sack_enabled = false;
                 self.send = SendWindow::new(1);
@@ -341,15 +351,15 @@ impl Connection {
                     // its own (the Idle-floor blind spot), and sustained misses still
                     // cascade to the P1 BASE-fallback below.
                     self.silent_overs += 1;
-                    if self.current_rung != BASE_RUNG
-                        && self.silent_overs >= DOWNSHIFT_TO_BASE_OVERS
-                    {
+                    let base = mac::base_rung();
+                    if self.current_rung != base && self.silent_overs >= DOWNSHIFT_TO_BASE_OVERS {
                         // We cannot get through at this mode — fall to the robust
                         // BASE mode (design P1) and keep trying there with a fresh
                         // death budget. Both ends do this symmetrically (and the
                         // peer also follows our mode-id), so they converge to BASE
-                        // instead of dying. Re-take the floor to retransmit.
-                        self.apply_rung(BASE_RUNG);
+                        // instead of dying. BASE is the most-robust *available* rung.
+                        // Re-take the floor to retransmit.
+                        self.apply_rung(base);
                         self.silent_overs = 0;
                         self.floor = Floor::Sending;
                         self.deadline = None;
@@ -359,8 +369,9 @@ impl Connection {
                         // Graceful self-downshift one step on a missed reply (§2.4),
                         // independent of any feedback; sustained misses still cascade
                         // to the P1 BASE-fallback above. Then re-take the floor to
-                        // retransmit the unacked window.
-                        if self.current_rung != BASE_RUNG {
+                        // retransmit the unacked window. apply_rung clamps to the next
+                        // *available* rung (a no-op once we are at BASE).
+                        if self.current_rung != base {
                             self.apply_rung(self.current_rung + 1);
                         }
                         self.floor = Floor::Sending;
@@ -435,16 +446,19 @@ impl Connection {
     /// the rung's strategy. The airtime-aware timer *profile* is intentionally
     /// NOT swapped here — real per-mode profiles come from the PHY (design §6,
     /// not yet available); the constructed profile is kept until then.
+    ///
+    /// `id` is **clamped to an available rung** ([`mac::clamp_available`]) — a
+    /// fabricated/unregistered rung is never selected or transmitted (C7), and a
+    /// peer advertising a rung this build lacks (version skew) is absorbed toward
+    /// the nearest more-robust real rung.
     fn apply_rung(&mut self, id: u8) {
+        let id = mac::clamp_available(id);
         if id == self.current_rung {
             return;
         }
         let old_family = mac::family_of(self.current_rung);
         self.current_rung = id;
-        let r = mac::rung(id);
-        self.send.reconfigure(r.window.window);
-        self.recv.reconfigure(r.window.window);
-        self.sack_enabled = matches!(r.strategy, ArqStrategy::SelectiveRepeat);
+        self.configure_arq_for_rung(id);
         // FER is mode-conditioned ⇒ always reset on a rung change (design F6).
         self.fer = 0.0;
         self.fer_samples = 0;
@@ -455,6 +469,17 @@ impl Connection {
             self.snr_raw = f32::NAN;
             self.snr_smoothed = f32::NAN;
         }
+    }
+
+    /// Configure the ARQ (window + SACK/strategy) to match a ladder rung. The
+    /// registered default mode is the wideband floor (`WholeMessage`, window 1, no
+    /// SACK), so the link runs stop-and-wait until a `SelectiveRepeat` mode (the
+    /// OFDM family) registers a real waveform.
+    fn configure_arq_for_rung(&mut self, id: u8) {
+        let r = mac::rung(id);
+        self.send.reconfigure(r.window.window);
+        self.recv.reconfigure(r.window.window);
+        self.sack_enabled = matches!(r.strategy, ArqStrategy::SelectiveRepeat);
     }
 
     /// Follow a peer frame's advertised mode (the mode-id confirmation path): if
@@ -506,7 +531,10 @@ impl Connection {
     /// good forward path cannot pull the shared rung up and break a bad reverse
     /// path. Applied authoritatively in both directions — no probe, no streak.
     fn apply_peer_feedback(&mut self, peer_rx_rung: u8) {
-        let target = peer_rx_rung.min(BASE_RUNG).max(self.recommended_rung());
+        // More robust (higher id) of the peer's feedback and our own reverse-path
+        // recommendation. `apply_rung` clamps the result to an available rung, so a
+        // peer advertising a rung this build lacks (version skew) is absorbed.
+        let target = peer_rx_rung.max(self.recommended_rung());
         self.apply_rung(target);
     }
 
@@ -531,12 +559,10 @@ impl Connection {
         self.send.reset();
         self.recv.reset();
         self.reasm.reset();
-        // Restore the default mode + window so a same-object reconnect starts
-        // fresh at the top of the ladder, not stuck at a degraded BASE.
-        self.current_rung = DEFAULT_RUNG;
-        self.send.reconfigure(self.initial_window);
-        self.recv.reconfigure(self.initial_window);
-        self.sack_enabled = true;
+        // Restore the default (most-robust available) registered mode and its ARQ
+        // config so a same-object reconnect starts fresh at a real rung.
+        self.current_rung = mac::default_rung();
+        self.configure_arq_for_rung(self.current_rung);
         self.snr_raw = f32::NAN;
         self.snr_smoothed = f32::NAN;
         self.fer = 0.0;
@@ -1278,8 +1304,10 @@ mod tests {
 
     #[test]
     fn sack_disabled_suppresses_the_bitmap_even_with_a_buffered_gap() {
-        // Selective-repeat receiver with a real out-of-order gap buffered.
-        let mut b = acc();
+        // Selective-repeat receiver with a real out-of-order gap buffered. The
+        // default mode today is the WholeMessage floor, so request SelectiveRepeat
+        // explicitly to exercise the SACK path (dormant until an OFDM mode lands).
+        let mut b = acc().with_strategy(ArqStrategy::SelectiveRepeat);
         b.handle_frame(conn_from_k1abc(0x1234, FIRST_SEQ), Duration::ZERO);
         // seq 2 arrives before seq 1 ⇒ a gap is buffered ⇒ recv.sack() != 0.
         b.handle_frame(LinkFrame::data(0x1234, 2, b"x".to_vec()), Duration::ZERO);
@@ -1421,107 +1449,83 @@ mod tests {
         );
     }
 
+    // With only ONE registered mode today (the wideband floor, C7), the link holds
+    // that single real rung and never selects a fabricated mode. The rich multi-rung
+    // adaptation ALGORITHM is unit-tested in mac (`adapt_rung_with`, synthetic
+    // all-available ladder); these tests pin the link's honest single-mode behavior.
+
     #[test]
-    fn recommended_rung_holds_without_measurement_and_drops_on_low_snr() {
-        let mut c = init(); // rung DEFAULT_RUNG
-        assert_eq!(c.recommended_rung(), DEFAULT_RUNG, "no measurement ⇒ hold");
+    fn the_single_registered_mode_is_held_for_any_measurement() {
+        // No fabricated OFDM mode is ever recommended/selected; the link recommends
+        // the one real mode (the floor = base_rung) regardless of the channel.
+        let mut c = init();
+        let base = mac::base_rung();
+        assert_eq!(
+            c.current_rung(),
+            base,
+            "starts at the only real mode, not OFDM"
+        );
+        assert_eq!(c.recommended_rung(), base, "no measurement ⇒ the real mode");
         c.observe_quality(-15.0, 0.0, 10);
         assert_eq!(
             c.recommended_rung(),
-            BASE_RUNG,
-            "a collapse ⇒ recommend the floor"
+            base,
+            "a collapse can't go below the only mode"
         );
-    }
-
-    #[test]
-    fn recommended_rung_upshifts_on_credible_clean_high_snr() {
-        let mut c = init(); // rung 1
         c.observe_quality(25.0, 0.0, 10);
-        assert_eq!(c.recommended_rung(), 0, "clean high SNR ⇒ recommend faster");
-    }
-
-    #[test]
-    fn apply_peer_feedback_obeys_a_downshift_immediately() {
-        let mut c = init(); // rung 1, no own measurement
-        c.apply_peer_feedback(BASE_RUNG);
         assert_eq!(
-            c.current_rung(),
-            BASE_RUNG,
-            "a robust command is obeyed at once"
+            c.recommended_rung(),
+            base,
+            "no faster mode is registered to climb to"
         );
     }
 
     #[test]
-    fn apply_peer_feedback_worse_direction_wins() {
-        // The peer (forward path) permits the fastest rung, but our OWN reverse-path
-        // measurement is poor — the worse direction wins, so we do not speed up.
-        let mut c = init(); // rung 1
-        c.observe_quality(-15.0, 0.0, 10); // our RX of the peer is bad
-        c.apply_peer_feedback(0); // peer says "go fast"
-        assert_eq!(
-            c.current_rung(),
-            BASE_RUNG,
-            "a bad reverse path overrides the peer's fast permit"
-        );
+    fn peer_feedback_never_selects_an_unavailable_mode() {
+        // Even if a (skewed) peer commands a different rung, the clamp keeps us on
+        // the one real mode — nothing fabricated is ever applied.
+        let mut c = init();
+        let base = mac::base_rung();
+        c.apply_peer_feedback(0); // "go to the fastest OFDM rung" — unavailable
+        assert_eq!(c.current_rung(), base);
+        c.apply_peer_feedback(mac::NUM_RUNGS - 1); // "go to the deep-floor" — unavailable
+        assert_eq!(c.current_rung(), base);
     }
 
     #[test]
-    fn apply_rung_resets_fer_and_resets_snr_only_across_a_family() {
-        let mut c = init(); // rung 1 (OFDM family)
-        c.observe_quality(20.0, 0.10, 8);
-        c.apply_rung(2); // within OFDM family
-        assert_eq!(c.snr_raw, 20.0, "SNR persists within a waveform family");
-        assert_eq!(c.fer_samples, 0, "FER always resets on a rung change");
-        c.observe_quality(5.0, 0.0, 8);
-        c.apply_rung(3); // OFDM → floor: cross-family
-        assert!(
-            c.snr_raw.is_nan(),
-            "SNR estimate resets across a family boundary"
-        );
-    }
-
-    #[test]
-    fn gate_feedback_downshift_sender_obeys_receiver_measurement() {
-        // The RECEIVER (B) measures a poor channel on the sender's overs and feeds
-        // back a robust rung; the floor-holding sender (A) obeys it and still delivers.
+    fn link_holds_the_floor_under_bad_feedback_and_still_delivers() {
+        // The receiver reports a poor channel; with one registered mode the sender
+        // cannot downshift further (the floor IS the base) — it holds and delivers.
         let mut p = Pair::new();
         p.a.connect(Duration::ZERO);
         p.run(20);
-        let start = p.a.current_rung();
+        let base = mac::base_rung();
         p.a.send(b"hello".to_vec());
-        p.b.observe_quality(-15.0, 0.0, 10); // B's view of A's path is bad
+        p.b.observe_quality(-15.0, 0.0, 10);
         p.run(60);
-        assert!(
-            p.a.current_rung() > start,
-            "A obeys B's robustness feedback (receiver-authoritative downshift)"
-        );
+        assert_eq!(p.a.current_rung(), base, "holds the one real mode");
         assert_eq!(p.b_messages(), vec![b"hello".to_vec()], "still delivers");
     }
 
     #[test]
-    fn gate_a_sustained_fade_downshifts_then_clears_and_delivers() {
-        // A fade (lost overs) must downshift the rung WITHOUT dropping the link,
-        // and once it clears the message still delivers byte-exact.
+    fn a_recoverable_fade_still_delivers_at_the_single_mode() {
+        // Drop a couple of overs (a transient fade), then let the channel clear: the
+        // message still delivers, and the link never leaves the one real mode.
         let mut p = Pair::new();
         p.a.connect(Duration::ZERO);
         p.run(20);
-        let start = p.a.current_rung();
-        p.a.send(b"x".to_vec()); // single-frame message ⇒ a clean whole-over drop
-        let mut steps = 0;
-        while p.a.current_rung() == start && steps < 30 {
-            p.step_drop(Some(0)); // drop A's whole over
-            steps += 1;
+        let base = mac::base_rung();
+        p.a.send(b"x".to_vec());
+        // Drive steps explicitly (so the turn-recovery timer fires through the
+        // transient drops); `run` would early-exit on the first no-movement step.
+        for i in 0..200 {
+            if i < 2 {
+                p.step_drop(Some(0)); // a transient fade: two lost overs
+            } else {
+                p.step();
+            }
         }
-        assert!(
-            p.a.current_rung() > start,
-            "a sustained fade must downshift the rung"
-        );
-        assert_ne!(
-            p.a.state(),
-            ConnState::Closed,
-            "graceful downshift, not a link drop"
-        );
-        p.run(160); // channel clears
+        assert_eq!(p.a.current_rung(), base, "never selects a fabricated mode");
         assert_eq!(
             p.b_messages(),
             vec![b"x".to_vec()],
@@ -1530,14 +1534,11 @@ mod tests {
     }
 
     #[test]
-    fn gate_d_delivery_is_byte_exact_across_a_rung_change() {
-        // A mid-session rung change (window + strategy reconfigured in place) must
-        // preserve the continuous ARQ seq stream — the whole message still arrives.
+    fn multi_fragment_delivery_is_byte_exact_at_the_single_mode() {
         let mut p = Pair::new();
         p.a.connect(Duration::ZERO);
         p.run(20);
-        p.a.send(b"0123456789".to_vec()); // 3 fragments at mtu 4
-        p.a.apply_rung(BASE_RUNG); // force a downshift to window-1 WholeMessage
+        p.a.send(b"0123456789".to_vec()); // 3 fragments at the test mtu
         p.run(200);
         assert_eq!(p.b_messages(), vec![b"0123456789".to_vec()]);
     }

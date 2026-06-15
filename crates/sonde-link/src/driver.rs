@@ -515,12 +515,13 @@ mod tests {
     }
 
     #[test]
-    fn driver_adapts_the_rung_from_the_phys_channel_quality() {
-        // End-to-end glue: B's PHY reports a poor channel; B folds it into adaptation
-        // and feeds back a robust rung, and the floor-holding sender A obeys (its
-        // rung climbs toward BASE). Proves the Driver → channel_quality →
-        // observe_quality → adapt_rung → apply path is wired, not just the in-memory
-        // logic. (RADIO-1: in-memory doubles, nothing keyed.)
+    fn driver_feeds_phy_quality_into_adaptation_and_holds_the_real_mode() {
+        // End-to-end glue: B's PHY reports a real channel measurement, which B folds
+        // into adaptation via channel_quality() → observe_quality. With one
+        // registered mode (the floor) there is nowhere to move, so the link holds
+        // the real mode and delivers — proving the Driver → channel_quality →
+        // observe_quality → adapt_rung → apply path is wired (it gains range when
+        // faster modes register). (RADIO-1: in-memory doubles, nothing keyed.)
         let clk = ManualClock::new();
         let q: Queues = Rc::new(RefCell::new([VecDeque::new(), VecDeque::new()]));
         let ea = WireEnd {
@@ -545,7 +546,6 @@ mod tests {
             clk.clone(),
         );
         a.connect();
-        let start = a.current_rung();
         a.send(b"adapt".to_vec());
         let mut b_ev = Vec::new();
         for _ in 0..80 {
@@ -553,9 +553,10 @@ mod tests {
             b_ev.extend(b.poll());
             clk.advance(Duration::from_millis(20));
         }
-        assert!(
-            a.current_rung() > start,
-            "A downshifts from B's poor-channel feedback (end-to-end through the Driver)"
+        assert_eq!(
+            a.current_rung(),
+            crate::mac::base_rung(),
+            "the link holds the one registered mode (no fabricated mode selected)"
         );
         assert!(
             messages(&b_ev).contains(&b"adapt".to_vec()),

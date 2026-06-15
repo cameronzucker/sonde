@@ -41,6 +41,7 @@ pub use frame::{Callsign, FrameError, FrameType, LinkFrame, LINK_MTU, LINK_OVERH
 pub use host::HostCommand;
 pub use link::Link;
 pub use mac::{
-    recommended_rung, route, rung, ArqStrategy, Route, WindowParams, BASE_RUNG, NUM_RUNGS,
+    adapt_rung, base_rung, clamp_available, default_rung, recommended_rung, route, rung,
+    ArqStrategy, Route, WindowParams, NUM_RUNGS,
 };
 pub use profile::ModeProfile;
