@@ -67,6 +67,34 @@ impl AwgnGenerator {
             };
         }
     }
+
+    /// Add complex AWGN at a FIXED per-component standard deviation, independent of
+    /// the signal's instantaneous power (a constant band-noise floor).
+    ///
+    /// Unlike [`add_noise`](Self::add_noise), which sets the noise level from the
+    /// block's measured signal power, this adds the same noise level regardless of
+    /// the signal — so SILENCE still carries the floor and a deeply-faded signal is
+    /// genuinely buried. This is the model needed for real-time / streaming use
+    /// (e.g. piping a live modem's audio through the channel), where "SNR" is
+    /// referenced to a fixed transmit level rather than measured per block. Each
+    /// real (and imaginary) noise component is N(0, `std`²).
+    pub fn add_noise_fixed(&mut self, signal: &mut [Complex<f32>], std: f32) {
+        if signal.is_empty() || std <= 0.0 {
+            return;
+        }
+        // `complex_gaussian_block` returns unit-variance COMPLEX samples (each of the
+        // real/imag components has variance 1/2), so scale by std·√2 to make each
+        // component N(0, std²) — i.e. `std` is the per-component standard deviation,
+        // which is what the real-projected audio noise floor uses.
+        let amp = std * std::f32::consts::SQRT_2;
+        let pairs = complex_gaussian_block(&mut self.rng, signal.len());
+        for (s, (nre, nim)) in signal.iter_mut().zip(pairs) {
+            *s += Complex {
+                re: nre * amp,
+                im: nim * amp,
+            };
+        }
+    }
 }
 
 #[cfg(test)]
@@ -132,5 +160,24 @@ mod tests {
         g.reset();
         g.add_noise(&mut s2, 0.0);
         assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn fixed_noise_floors_silence() {
+        // Unlike add_noise (which adds nothing to silence), add_noise_fixed adds the
+        // floor regardless of signal. Each component is N(0, std²) so E[|n|²] = 2·std².
+        let mut silence = vec![Complex { re: 0.0, im: 0.0 }; 100_000];
+        AwgnGenerator::new(5).add_noise_fixed(&mut silence, 0.5);
+        let p = power(&silence);
+        assert!((p - 0.5).abs() < 0.02, "expected ~2·std²=0.5, got {p}");
+    }
+
+    #[test]
+    fn fixed_noise_same_seed_deterministic() {
+        let mut a = vec![Complex { re: 0.0, im: 0.0 }; 256];
+        let mut b = a.clone();
+        AwgnGenerator::new(9).add_noise_fixed(&mut a, 0.3);
+        AwgnGenerator::new(9).add_noise_fixed(&mut b, 0.3);
+        assert_eq!(a, b);
     }
 }

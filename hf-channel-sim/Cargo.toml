@@ -30,3 +30,9 @@ hound = "3"           # WAV I/O for the wav_channel example (sonde-imh ARDOP spi
 [[bin]]
 name = "hf-channel-sim-cli"
 path = "src/bin/hf-channel-sim-cli.rs"
+
+# Real-time PCM-through-channel bridge: splices the sim into a live modem audio
+# pipe (the ARDOP demo, and Sonde's own waveform testing).
+[[bin]]
+name = "hf-channel-pcm"
+path = "src/bin/hf-channel-pcm.rs"
