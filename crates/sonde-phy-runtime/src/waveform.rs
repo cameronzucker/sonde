@@ -120,6 +120,20 @@ pub trait Waveform: Send {
     fn mode_name(&self) -> Option<&'static str> {
         None
     }
+
+    /// Net info bitrate (information bits per second) this mode carries, used by
+    /// the runtime to derive the over's Eb/N0 from the reported `SNR_2500`
+    /// (`Eb/N0 = SNR_2500 − 10log10(R_info / 2500)`). `None` when unknown.
+    fn info_bitrate_bps(&self) -> Option<f32> {
+        None
+    }
+
+    /// Stable id of the SNR estimator this waveform uses (e.g. `"ofdm-pilot"`,
+    /// `"nfsk-tone"`) — per-family estimator bias is real, so the link knows which
+    /// estimator domain a reported SNR came from (Codex review C5).
+    fn estimator_id(&self) -> &'static str {
+        "none"
+    }
 }
 
 /// HF wide-band low-density floor waveform (`floor-wblo`). Wraps
@@ -177,6 +191,14 @@ impl Waveform for FloorWaveform {
 
     fn mode_name(&self) -> Option<&'static str> {
         Some("floor-wblo")
+    }
+
+    fn info_bitrate_bps(&self) -> Option<f32> {
+        Some(self.inner.info_bitrate_bps())
+    }
+
+    fn estimator_id(&self) -> &'static str {
+        "ofdm-pilot"
     }
 }
 
@@ -262,6 +284,14 @@ impl Waveform for OfdmMainWaveform {
     fn mode_name(&self) -> Option<&'static str> {
         Some(self.mode_name)
     }
+
+    fn info_bitrate_bps(&self) -> Option<f32> {
+        Some(self.inner.info_bitrate_bps())
+    }
+
+    fn estimator_id(&self) -> &'static str {
+        "ofdm-pilot"
+    }
 }
 
 /// Narrow-FSK deep-floor waveform `floor-nfsk` (RobustnessFloor family): a
@@ -316,6 +346,14 @@ impl Waveform for NfskWaveform {
 
     fn mode_name(&self) -> Option<&'static str> {
         Some("floor-nfsk")
+    }
+
+    fn info_bitrate_bps(&self) -> Option<f32> {
+        Some(self.inner.info_bitrate_bps())
+    }
+
+    fn estimator_id(&self) -> &'static str {
+        "nfsk-tone"
     }
 }
 
