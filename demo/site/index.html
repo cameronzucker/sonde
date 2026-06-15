@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>HF Data Modem — Live ARDOP Connected-Mode Demo</title>
-  <meta name="description" content="Watch two real ARDOP modems connect over a real ITU-R F.520 Watterson HF channel — live: real CONNECT handshake, bandwidth negotiation, and adaptive-rate ARQ delivering an EmComm SITREP image, with the on-air signal streamed live to a 3D waterfall." />
+  <meta name="description" content="Watch two real ARDOP modems connect over a real ITU-R F.520 Watterson HF channel — live: real CONNECT handshake, bandwidth negotiation, and adaptive-rate ARQ delivering an EmComm SITREP message (text + photo), with the on-air signal streamed live to a 3D waterfall." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Chivo:ital,wght@0,300;0,400;0,500;0,700;0,900;1,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -167,15 +167,13 @@
           </div>
         </section>
 
-        <!-- RECON IMAGE -->
-        <section class="panel panel--recon" aria-labelledby="recon-label">
+        <!-- DELIVERED MESSAGE (text + image attachment, à la Winlink) -->
+        <section class="panel panel--message" aria-labelledby="msg-label">
           <div class="panel__head">
-            <h2 class="panel__title" id="recon-label"><span class="idx">04</span> Recon Attachment</h2>
-            <span class="panel__hint">ARQ-delivered</span>
+            <h2 class="panel__title" id="msg-label"><span class="idx">04</span> Delivered Message</h2>
+            <span class="panel__hint">text + attachment · ARQ-delivered</span>
           </div>
-          <div class="recon">
-            <canvas id="recon-image" width="320" height="240" aria-label="Reconnaissance photo delivered over the ARQ link"></canvas>
-          </div>
+          <div class="message" id="message-mount" aria-label="The message delivered over the link"></div>
         </section>
 
         <!-- CONSTELLATION — honest stub: ARDOP doesn't expose demod symbols. -->
@@ -225,12 +223,13 @@
           <em>bandwidth ceiling</em> (the widest mode allowed), and press <em>Connect</em>. A session is real
           airtime — it plays out live over ~30–60 s.</li>
         <li><strong>Two real ARDOP stations connect.</strong> The backend runs a real CONNECT handshake,
-          negotiates a bandwidth, and transfers a ~3&nbsp;KB image over <strong>adaptive-rate ARQ</strong> —
-          their audio bridged through a real ITU-R F.520 Watterson HF channel (hf-channel-sim). Real
-          modulation, real fading, real FEC, real retransmission.</li>
+          negotiates a bandwidth, and transfers a small EmComm <strong>message</strong> (a SITREP text + a photo
+          attachment, ~3&nbsp;KB) over <strong>adaptive-rate ARQ</strong> — their audio bridged through a real
+          ITU-R F.520 Watterson HF channel (hf-channel-sim). Real modulation, real fading, real FEC, real
+          retransmission. (Compose your own with <code>demo/ardop/make_payload.py</code>.)</li>
         <li><strong>Watch + hear it live.</strong> The on-air signal streams to the waterfall (and your
           speakers) as it transmits; the connection/ARQ log streams the handshake, the negotiated mode, and
-          every rate change; the recon photo lands intact — slower as the rate drops, and not at all once the
+          every rate change; the message lands intact — slower as the rate drops, and not at all once the
           SNR falls below the connect cliff.</li>
       </ol>
     </section>

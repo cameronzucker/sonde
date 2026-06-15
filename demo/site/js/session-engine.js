@@ -25,7 +25,7 @@ export const SAMPLE_RATE_HZ = 12000;
 
 let _offsets = null; // {total_len, fields[], image_byte_len}
 
-/** Load the payload field offsets (for the recon-image reveal). Call once at startup. */
+/** Load the payload manifest (the delivered message's parts). Call once at startup. */
 export async function initSession(base = ".") {
   const resp = await fetch(`${base}/assets/payload.offsets.json`);
   if (!resp.ok) throw new Error(`payload.offsets.json ${resp.status}`);

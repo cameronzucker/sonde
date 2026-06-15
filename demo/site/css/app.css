@@ -596,9 +596,9 @@ body {
 /* LEFT: waterfall (grows) + ARQ log (grows under it, scrolls) fill the column. */
 .cockpit__left .panel--hero { flex: 1.5 1 0; min-height: 0; }
 .cockpit__left .panel--console { flex: 1 1 0; min-height: 0; }
-/* RIGHT: telemetry natural height; recon fills the rest. */
+/* RIGHT: telemetry natural height; the message panel fills the rest. */
 .cockpit__right .panel--stats { flex: 0 0 auto; }
-.cockpit__right .panel--recon { flex: 1 1 0; min-height: 0; }
+.cockpit__right .panel--message { flex: 1 1 0; min-height: 0; }
 
 /* Compact pane chrome. */
 .cockpit .panel__head { padding: 8px 13px; flex: 0 0 auto; }
@@ -676,8 +676,25 @@ body {
 .cockpit .panel--console .flog__stream { flex: 1; height: auto; min-height: 0; padding: 6px 14px; font-size: 12px; }
 
 /* Recon fills its panel; the canvas scales to fit, centered, aspect preserved. */
-.cockpit .recon { flex: 1; min-height: 0; padding: 10px 14px; align-items: center; justify-content: center; gap: 8px; }
-.cockpit #recon-image { width: auto; height: auto; max-width: 100%; max-height: 100%; }
+/* Delivered message: text body + image attachment(s), scrolls if tall. */
+.cockpit .panel--message .message { flex: 1; min-height: 0; overflow-y: auto; padding: 10px 14px; display: flex; flex-direction: column; gap: 12px; }
+.msg__part { display: flex; flex-direction: column; gap: 6px; }
+.msg__label { font-family: var(--font-mono); font-size: 9.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--teal); }
+.msg__text {
+  margin: 0; font-family: var(--font-mono); font-size: 11.5px; line-height: 1.5;
+  color: var(--ink); white-space: pre-wrap; word-break: break-word;
+  padding: 9px 11px; border-radius: var(--radius-s);
+  background: rgba(0, 0, 0, 0.28); border: 1px solid var(--line);
+}
+.msg__img { display: block; max-width: 100%; max-height: 200px; border-radius: var(--radius-s); border: 1px solid var(--line); }
+.msg__imgmiss { font-family: var(--font-mono); font-size: 11px; color: var(--faint); }
+.msg__placeholder { margin: auto; text-align: center; font-family: var(--font-mono); }
+.msg__ph1 { font-size: 13px; letter-spacing: 0.16em; color: var(--faint); text-transform: uppercase; }
+.msg__ph2 { font-size: 11px; color: var(--faint); margin-top: 5px; }
+.msg__receiving { display: flex; flex-direction: column; gap: 7px; }
+.msg__rxhead { font-family: var(--font-mono); font-size: 11px; color: var(--teal); }
+.msg__rxrow { font-family: var(--font-mono); font-size: 11.5px; color: var(--faint); }
+.msg__rxrow--got { color: var(--green-ok); }
 
 /* ── Below the fold: framing + credits (scroll down) ── */
 .belowfold {
@@ -692,5 +709,5 @@ body {
   .cockpit__main { grid-template-columns: 1fr; }
   .cockpit__left .panel--hero { min-height: 320px; }
   .cockpit__left .panel--console { min-height: 220px; }
-  .cockpit__right .panel--recon { min-height: 220px; }
+  .cockpit__right .panel--message { min-height: 220px; }
 }
