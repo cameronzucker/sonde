@@ -105,7 +105,7 @@ pub struct Connection {
     /// Whether `remote` is learned-from-CONN (acceptor) vs configured (initiator).
     remote_is_learned: bool,
     profile: ModeProfile,
-    conn_id: u16,
+    conn_id: u32,
 
     state: ConnState,
     floor: Floor,
@@ -151,7 +151,7 @@ impl Connection {
     pub fn initiator(
         local: Callsign,
         remote: Callsign,
-        conn_id: u16,
+        conn_id: u32,
         profile: ModeProfile,
         window: u32,
     ) -> Self {
@@ -170,7 +170,7 @@ impl Connection {
         local: Callsign,
         remote: Option<Callsign>,
         remote_is_learned: bool,
-        conn_id: u16,
+        conn_id: u32,
         profile: ModeProfile,
         window: u32,
     ) -> Self {
@@ -678,7 +678,7 @@ impl Connection {
         self.outbox.extend(built);
     }
 
-    fn accept_connection_as_acceptor(&mut self, conn_id: u16, seq: u32, now: Duration) {
+    fn accept_connection_as_acceptor(&mut self, conn_id: u32, seq: u32, now: Duration) {
         self.conn_id = conn_id;
         self.state = ConnState::Connected;
         // The initiator owns the first floor; listen for it, but fall back to
@@ -698,6 +698,10 @@ impl Connection {
             Some(id) if id.dst == self.local => id.src.clone(),
             _ => return,
         };
+        // The reserved (zero) conn_id is never a live session — reject (sonde-44n).
+        if frame.conn_id == crate::frame::CONN_ID_RESERVED {
+            return;
+        }
         match self.state {
             ConnState::Closed => {
                 if self.remote_is_learned {
@@ -876,7 +880,7 @@ mod tests {
     }
 
     /// A CONN from `K1ABC` to `W2XYZ` (the standard peer pair in these tests).
-    fn conn_from_k1abc(conn_id: u16, seq: u32) -> LinkFrame {
+    fn conn_from_k1abc(conn_id: u32, seq: u32) -> LinkFrame {
         LinkFrame::id_control(
             FrameType::Conn,
             StationId::new(call("K1ABC"), call("W2XYZ")),
@@ -1183,6 +1187,27 @@ mod tests {
         let id = ack.id.expect("CONN_ACK is ID-bearing");
         assert_eq!(id.src.as_str(), "W2XYZ", "we identify as ourselves");
         assert_eq!(id.dst.as_str(), "K1ABC", "addressed to the learned caller");
+    }
+
+    #[test]
+    fn conn_bearing_the_reserved_zero_conn_id_is_rejected() {
+        // sonde-44n: conn_id 0 is reserved; a CONN proposing it is invalid and must
+        // not establish a session (an uninitialized/garbage frame or a peer that
+        // failed to pick a random nonzero id).
+        let mut b = acc();
+        b.handle_frame(
+            conn_from_k1abc(crate::frame::CONN_ID_RESERVED, FIRST_SEQ),
+            Duration::ZERO,
+        );
+        assert_eq!(
+            b.state,
+            ConnState::Closed,
+            "reserved conn_id must not connect"
+        );
+        assert!(
+            b.poll_transmit(Duration::ZERO).is_none(),
+            "no CONN_ACK for conn_id 0"
+        );
     }
 
     #[test]

@@ -5,18 +5,19 @@
 //! ```text
 //! off field        size  notes
 //! 0   MAGIC 53 4C   2
-//! 2   VER           1    = 2
+//! 2   VER           1    = 3
 //! 3   TYPE          1    DATA/ACK/NAK/CONN/CONN_ACK/DISC/DISC_ACK/KEEPALIVE/ID
 //! 4   FLAGS         1    bit0 END_OF_OVER (this frame ends the sender's over → floor passes)
 //!                        bit1 END_OF_MSG  (last fragment of a host message)
-//! 5   CONN_ID       2    session id — THE demux/routing key (rejects half-open / cross-session)
-//! 7   SEQ           4    DATA frame seq, or control context seq
-//! 11  ACK_THROUGH   4    cumulative in-order high-water acknowledged
-//! 15  SACK          4    bitmap: bit i ⇒ (ACK_THROUGH+1+i) received out-of-order
-//! 19  MODE          1    link mode/rung id this frame was sent under (link adaptation)
-//! 20  LEN           2    payload-region length
-//! 22  PAYLOAD       N
-//! 22+N CRC32        4    IEEE, over [0 .. 22+N)
+//! 5   CONN_ID       4    session id (u32) — THE demux/routing key; rejects half-open /
+//!                        cross-session; random nonzero, 0 reserved (sonde-44n)
+//! 9   SEQ           4    DATA frame seq, or control context seq
+//! 13  ACK_THROUGH   4    cumulative in-order high-water acknowledged
+//! 17  SACK          4    bitmap: bit i ⇒ (ACK_THROUGH+1+i) received out-of-order
+//! 21  MODE          1    link mode/rung id this frame was sent under (link adaptation)
+//! 22  LEN           2    payload-region length
+//! 24  PAYLOAD       N
+//! 24+N CRC32        4    IEEE, over [0 .. 24+N)
 //! ```
 //!
 //! **Callsigns are NOT in every frame.** Per Part-97 §97.119 a station identifies
@@ -41,12 +42,28 @@ use thiserror::Error;
 
 /// Frame magic ("SL").
 pub const MAGIC: [u8; 2] = [0x53, 0x4C];
-/// Link protocol version this build speaks. Bumped to 2 with the callsign-removal
-/// wire change: a v1 frame now fails [`FrameError::BadVersion`] rather than
-/// silently mis-parsing under the old (callsign-bearing) layout.
-pub const VERSION: u8 = 2;
+/// Link protocol version this build speaks. v2 = callsign-removal layout; **v3**
+/// widened `CONN_ID` from u16 to u32 (sonde-44n shared-channel collision
+/// robustness), shifting every field after it by 2 bytes. An older frame now
+/// fails [`FrameError::BadVersion`] rather than silently mis-parsing.
+pub const VERSION: u8 = 3;
+
+// Wire field offsets (big-endian), single-sourced so the layout cannot drift.
+// MAGIC[2] VER[1] TYPE[1] FLAGS[1] then:
+/// CONN_ID offset — the u32 session/routing key (sonde-44n).
+const OFF_CONN_ID: usize = 5;
+/// SEQ offset (u32).
+const OFF_SEQ: usize = OFF_CONN_ID + 4; // 9
+/// ACK_THROUGH offset (u32).
+const OFF_ACK_THROUGH: usize = OFF_SEQ + 4; // 13
+/// SACK offset (u32 bitmap).
+const OFF_SACK: usize = OFF_ACK_THROUGH + 4; // 17
+/// MODE offset (u8 rung id).
+const OFF_MODE: usize = OFF_SACK + 4; // 21
+/// LEN offset (u16 payload-region length).
+const OFF_LEN: usize = OFF_MODE + 1; // 22
 /// Fixed bytes before the payload region (MAGIC..=LEN).
-pub const HEADER_LEN: usize = 22;
+pub const HEADER_LEN: usize = OFF_LEN + 2; // 24
 /// CRC trailer length.
 pub const CRC_LEN: usize = 4;
 /// Total fixed per-frame overhead (header + CRC).
@@ -54,6 +71,13 @@ pub const LINK_OVERHEAD: usize = HEADER_LEN + CRC_LEN;
 /// Maximum payload bytes carriable in one frame (the PHY caps total frame bytes
 /// at `u16::MAX`; the header+CRC eat `LINK_OVERHEAD`).
 pub const LINK_MTU: usize = u16::MAX as usize - LINK_OVERHEAD;
+
+/// Reserved `CONN_ID` value (sonde-44n): never assigned to a live session, so a
+/// zero conn_id on the wire is always invalid (an uninitialized/garbage frame, or
+/// a peer that failed to pick a random id). The link rejects inbound frames
+/// bearing it and never generates it. Real ids are random nonzero u32 (collision
+/// probability ~N²/2³³ on a shared channel).
+pub const CONN_ID_RESERVED: u32 = 0;
 
 /// One wire callsign field width (NUL-padded).
 const CALLSIGN_WIRE_LEN: usize = 10;
@@ -200,7 +224,7 @@ pub struct LinkFrame {
     /// Control flags (see [`FLAG_END_OF_OVER`]).
     pub flags: u8,
     /// Session id (0 before a connection is established) — the routing key.
-    pub conn_id: u16,
+    pub conn_id: u32,
     /// Data sequence number, or control context sequence.
     pub seq: u32,
     /// Cumulative in-order high-water acknowledged (0 if not carrying an ack).
@@ -220,7 +244,7 @@ pub struct LinkFrame {
 
 impl LinkFrame {
     /// Build a DATA frame (flags clear; set the turn token with [`Self::end_of_over`]).
-    pub fn data(conn_id: u16, seq: u32, payload: Vec<u8>) -> Self {
+    pub fn data(conn_id: u32, seq: u32, payload: Vec<u8>) -> Self {
         Self {
             frame_type: FrameType::Data,
             flags: 0,
@@ -235,7 +259,7 @@ impl LinkFrame {
     }
 
     /// Build an ACK frame carrying cumulative + selective acknowledgement.
-    pub fn ack(conn_id: u16, ack_through: u32, sack: u32) -> Self {
+    pub fn ack(conn_id: u32, ack_through: u32, sack: u32) -> Self {
         Self {
             frame_type: FrameType::Ack,
             flags: 0,
@@ -251,7 +275,7 @@ impl LinkFrame {
 
     /// Build a bare (non-ID-bearing) control frame — `KEEPALIVE` or `NAK`.
     /// ID-bearing control frames are built with [`Self::id_control`].
-    pub fn control(frame_type: FrameType, conn_id: u16, seq: u32) -> Self {
+    pub fn control(frame_type: FrameType, conn_id: u32, seq: u32) -> Self {
         Self {
             frame_type,
             flags: 0,
@@ -267,7 +291,7 @@ impl LinkFrame {
 
     /// Build an ID-bearing control frame (`CONN`/`CONN_ACK`/`DISC`/`DISC_ACK`)
     /// carrying the station-ID block (Part-97 start/end identification).
-    pub fn id_control(frame_type: FrameType, station: StationId, conn_id: u16, seq: u32) -> Self {
+    pub fn id_control(frame_type: FrameType, station: StationId, conn_id: u32, seq: u32) -> Self {
         Self {
             frame_type,
             flags: 0,
@@ -282,7 +306,7 @@ impl LinkFrame {
     }
 
     /// Build a periodic `ID` frame (Part-97 §97.119, ≤10 min identification).
-    pub fn id_frame(station: StationId, conn_id: u16) -> Self {
+    pub fn id_frame(station: StationId, conn_id: u32) -> Self {
         Self::id_control(FrameType::Id, station, conn_id, 0)
     }
 
@@ -392,7 +416,7 @@ impl LinkFrame {
         }
         let frame_type = FrameType::from_u8(buf[3])?;
         let flags = buf[4];
-        let len = u16::from_be_bytes([buf[20], buf[21]]) as usize;
+        let len = u16::from_be_bytes([buf[OFF_LEN], buf[OFF_LEN + 1]]) as usize;
         let expected = LINK_OVERHEAD + len;
         if buf.len() != expected {
             return Err(FrameError::LengthMismatch {
@@ -406,11 +430,12 @@ impl LinkFrame {
         if crc_calc != crc_read {
             return Err(FrameError::BadCrc);
         }
-        let conn_id = u16::from_be_bytes([buf[5], buf[6]]);
-        let seq = u32::from_be_bytes([buf[7], buf[8], buf[9], buf[10]]);
-        let ack_through = u32::from_be_bytes([buf[11], buf[12], buf[13], buf[14]]);
-        let sack = u32::from_be_bytes([buf[15], buf[16], buf[17], buf[18]]);
-        let mode = buf[19];
+        let rd32 = |o: usize| u32::from_be_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+        let conn_id = rd32(OFF_CONN_ID);
+        let seq = rd32(OFF_SEQ);
+        let ack_through = rd32(OFF_ACK_THROUGH);
+        let sack = rd32(OFF_SACK);
+        let mode = buf[OFF_MODE];
         let region = &buf[HEADER_LEN..HEADER_LEN + len];
         let (id, payload) = if frame_type.is_id_bearing() {
             if len != STATION_ID_LEN {
@@ -511,10 +536,25 @@ mod tests {
     }
 
     #[test]
-    fn overhead_dropped_to_26_bytes() {
-        // The callsign-removal win: 20 bytes (SRC+DST) gone from every frame.
-        assert_eq!(HEADER_LEN, 22);
-        assert_eq!(LINK_OVERHEAD, 26);
+    fn overhead_is_28_bytes_with_u32_conn_id() {
+        // Callsign-removal dropped 20 B; the u32 conn_id (sonde-44n) added 2 B back.
+        assert_eq!(HEADER_LEN, 24);
+        assert_eq!(LINK_OVERHEAD, 28);
+    }
+
+    #[test]
+    fn conn_id_is_u32_and_round_trips_above_u16_max() {
+        // sonde-44n: conn_id is a 32-bit session key; a value > u16::MAX must
+        // survive encode/decode (it could not be expressed under the old u16 wire).
+        let f = LinkFrame::data(0xDEAD_BEEF, 1, b"x".to_vec());
+        let bytes = f.encode().unwrap();
+        assert_eq!(
+            u32::from_be_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]),
+            0xDEAD_BEEF,
+            "conn_id is 4 big-endian bytes at offset 5"
+        );
+        let g = LinkFrame::decode(&bytes).unwrap();
+        assert_eq!(g.conn_id, 0xDEAD_BEEF);
     }
 
     #[test]
@@ -564,14 +604,14 @@ mod tests {
         assert_eq!(g.sack, 0b1011);
         assert!(g.payload.is_empty());
         assert_eq!(g.id, None);
-        assert_eq!(u16::from_be_bytes([bytes[20], bytes[21]]), 0); // LEN at offset 20
+        assert_eq!(u16::from_be_bytes([bytes[22], bytes[23]]), 0); // LEN at offset 22
     }
 
     #[test]
-    fn mode_id_round_trips_at_offset_19() {
+    fn mode_id_round_trips_at_offset_21() {
         let f = LinkFrame::data(1, 5, b"x".to_vec()).with_mode(3);
         let bytes = f.encode().unwrap();
-        assert_eq!(bytes[19], 3, "MODE at offset 19");
+        assert_eq!(bytes[21], 3, "MODE at offset 21");
         let g = LinkFrame::decode(&bytes).unwrap();
         assert_eq!(g.mode, 3);
         // Default mode is 0 when not stamped (on an ID-bearing CONN here).
@@ -583,7 +623,10 @@ mod tests {
     fn conn_id_round_trips_at_offset_5() {
         let f = LinkFrame::data(0xBEEF, 1, b"x".to_vec());
         let bytes = f.encode().unwrap();
-        assert_eq!(u16::from_be_bytes([bytes[5], bytes[6]]), 0xBEEF);
+        assert_eq!(
+            u32::from_be_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]),
+            0xBEEF
+        );
     }
 
     #[test]
@@ -686,8 +729,8 @@ mod tests {
         let f = LinkFrame::data(1, 1, b"abc".to_vec());
         let mut bytes = f.encode().unwrap();
         let fake = (1000u16).to_be_bytes();
-        bytes[20] = fake[0];
-        bytes[21] = fake[1];
+        bytes[OFF_LEN] = fake[0];
+        bytes[OFF_LEN + 1] = fake[1];
         assert!(matches!(
             LinkFrame::decode(&bytes),
             Err(FrameError::LengthMismatch { .. })
