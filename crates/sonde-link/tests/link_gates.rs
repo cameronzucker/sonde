@@ -25,8 +25,8 @@ use sonde_phy::modes::{ModeHint, ModeTable};
 use sonde_phy::phy_api::{ChannelQualityReport, PhyTransport, RxFrame, TxToken};
 
 use sonde_link::{
-    ArqStrategy, Callsign, ConnState, Connection, HostCommand, HostEvent, Link, ModeProfile,
-    BASE_RUNG,
+    base_rung, ArqStrategy, Callsign, ConnState, Connection, HostCommand, HostEvent, Link,
+    LinkFrame, ModeProfile,
 };
 
 // ---------------------------------------------------------------------------
@@ -213,11 +213,18 @@ impl Medium {
             }
         }
 
-        // Mode-selective channel: only BASE-mode frames decode (MODE byte at
-        // header offset 39). Anything at a faster mode is lost.
-        if self.base_mode_only && bytes.len() > 39 && bytes[39] != BASE_RUNG {
-            self.stats.lost += 1;
-            return;
+        // Mode-selective channel: only BASE-mode frames decode; anything at a
+        // faster mode is lost (read the MODE via the decoder rather than a raw
+        // offset). With a single registered mode today the link is already at BASE,
+        // so this drops nothing — the gate degenerates to "operates at BASE and
+        // delivers"; it regains teeth when faster modes register (sonde-c7i).
+        if self.base_mode_only {
+            if let Ok(f) = LinkFrame::decode(&bytes) {
+                if f.mode != base_rung() {
+                    self.stats.lost += 1;
+                    return;
+                }
+            }
         }
 
         // Gilbert-Elliott burst loss (advances the chain every transmitted frame).
