@@ -200,10 +200,16 @@ impl<P: PhyTransport, C: Clock> Driver<P, C> {
                         }
                     }
                 }
-                sent_id_bearing |= frame.frame_type.is_id_bearing();
+                let id_bearing = frame.frame_type.is_id_bearing();
                 if let Ok(bytes) = frame.encode() {
                     match self.phy.send_frame(&bytes, hint) {
-                        Ok(_) => frames += 1,
+                        Ok(_) => {
+                            frames += 1;
+                            // Only a SUCCESSFUL send advances the ID cadence — a
+                            // failed ID-bearing send must not let a later TX skip a
+                            // required station ID (sonde-i3h).
+                            sent_id_bearing |= id_bearing;
+                        }
                         Err(e) => self.errors.push_back(e),
                     }
                 }
@@ -427,6 +433,29 @@ mod tests {
             clk.advance(Duration::from_millis(5));
         }
         assert_eq!(messages(&b_ev), vec![b"driven".to_vec()]);
+    }
+
+    #[test]
+    fn a_failed_id_bearing_send_does_not_advance_the_id_cadence() {
+        // sonde-i3h: if an ID-bearing frame's send_frame fails, the Part-97
+        // periodic-ID cadence must NOT advance — else a later SUCCESSFUL TX could
+        // skip a required station ID (the driver wrongly believing one aired).
+        let clk = ManualClock::new();
+        let mut a = Driver::new(
+            ErrPhy,
+            Connection::initiator(call("K1ABC"), call("W2XYZ"), 0x1234, profile(), 8),
+            clk.clone(),
+        );
+        a.connect();
+        a.poll(); // flushes the CONN (ID-bearing); ErrPhy fails every send
+        assert!(
+            !a.take_errors().is_empty(),
+            "the failed CONN send is surfaced"
+        );
+        assert!(
+            a.last_id_real.is_none(),
+            "a failed ID-bearing send must not advance the ID cadence"
+        );
     }
 
     #[test]
