@@ -93,6 +93,17 @@ pub trait Waveform: Send {
     /// route a `ModeHint` to the right waveform once more than one is
     /// registered (HF floor + FM).
     fn family(&self) -> ModeFamily;
+
+    /// The stable mode identity this waveform implements (e.g. `"ofdm-wide"`,
+    /// `"floor-wblo"`), matching [`sonde_phy::modes::ModeDescriptor::short_name`].
+    /// `SondePhy` uses it to route a resolved mode to the *specific* waveform —
+    /// not just the family — so a multi-rung ladder within one family
+    /// (ofdm-narrow/mid/wide) selects the right rung on TX and labels the right
+    /// mode on RX. `None` means "family-routed only" (a waveform that is the sole
+    /// member of its family doesn't need a name).
+    fn mode_name(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// HF wide-band low-density floor waveform (`floor-wblo`). Wraps
@@ -147,32 +158,54 @@ impl Waveform for FloorWaveform {
     fn family(&self) -> ModeFamily {
         ModeFamily::RobustnessFloor
     }
+
+    fn mode_name(&self) -> Option<&'static str> {
+        Some("floor-wblo")
+    }
 }
 
-/// OFDM main-family waveform `ofdm-wide`: Wide OFDM params, QPSK (2 bits per
-/// sub-carrier), WiFi LDPC N1296 R1/2 — a faster, higher-SNR mode that sits above
-/// the [`FloorWaveform`] on the adaptation ladder (sonde-c7i). It reuses the floor
-/// engine's mode-agnostic preamble + Schmidl-Cox sync + pilot-equalized demod
-/// ([`WidebandLowDensityFloor::with_params_constellation_fec`]); the only
-/// differences from the floor are the constellation order and code rate.
-/// Physics-gated end-to-end over AWGN in `sonde-phy/tests/ofdm_main_gate.rs`.
-///
-/// Narrower OFDM modes (`ofdm-mid`/`ofdm-narrow`) and higher constellations follow
-/// the same recipe; a multi-mode OFDM ladder also needs per-mode identity in the
-/// runtime's family-only routing (tracked separately).
+/// OFDM main-family waveform — a faster, higher-SNR family above the
+/// [`FloorWaveform`] on the adaptation ladder (sonde-c7i / sonde-99l.6). Each
+/// instance is ONE rung: `ofdm-wide` / `ofdm-mid` / `ofdm-narrow`, all QPSK
+/// (2 bits/sub-carrier) + WiFi LDPC N1296 R1/2, differing only in OFDM bandwidth
+/// (Wide 2300 Hz → Mid 1000 Hz → Narrow 500 Hz). Reuses the floor engine's
+/// mode-agnostic preamble + Schmidl-Cox sync + pilot-equalized demod
+/// ([`WidebandLowDensityFloor::with_params_constellation_fec`]). Physics-gated
+/// over AWGN per mode in `sonde-phy/tests/ofdm_main_gate.rs`.
 pub struct OfdmMainWaveform {
     inner: WidebandLowDensityFloor,
+    mode_name: &'static str,
 }
 
 impl OfdmMainWaveform {
-    /// Construct `ofdm-wide` (Wide / QPSK / N1296 R1/2).
+    /// Construct the `ofdm-wide` rung (Wide / QPSK / N1296 R1/2).
     pub fn new() -> Self {
+        Self::wide()
+    }
+
+    /// `ofdm-wide` — Wide params (2300 Hz), the fastest OFDM rung.
+    pub fn wide() -> Self {
+        Self::rung(OfdmModeName::Wide, "ofdm-wide")
+    }
+
+    /// `ofdm-mid` — Mid params (1000 Hz).
+    pub fn mid() -> Self {
+        Self::rung(OfdmModeName::Mid, "ofdm-mid")
+    }
+
+    /// `ofdm-narrow` — Narrow params (500 Hz), the most robust OFDM rung.
+    pub fn narrow() -> Self {
+        Self::rung(OfdmModeName::Narrow, "ofdm-narrow")
+    }
+
+    fn rung(mode: OfdmModeName, mode_name: &'static str) -> Self {
         Self {
             inner: WidebandLowDensityFloor::with_params_constellation_fec(
-                OfdmParams::for_mode(OfdmModeName::Wide),
+                OfdmParams::for_mode(mode),
                 2, // QPSK
                 Box::new(OfdmAdaptiveCodec::new(BlockN::N1296, WifiLdpcRate::R1_2)),
             ),
+            mode_name,
         }
     }
 }
@@ -208,6 +241,10 @@ impl Waveform for OfdmMainWaveform {
 
     fn family(&self) -> ModeFamily {
         ModeFamily::OfdmMain
+    }
+
+    fn mode_name(&self) -> Option<&'static str> {
+        Some(self.mode_name)
     }
 }
 
