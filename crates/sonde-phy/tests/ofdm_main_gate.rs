@@ -43,13 +43,19 @@ fn add_awgn_at_snr_2500(signal: &[f32], snr_2500_db: f64, rng: &mut ChaCha8Rng) 
     signal.iter().map(|&x| x + sigma * gaussian(rng)).collect()
 }
 
-/// The first real OFDM main mode: Wide + QPSK + N1296 R1/2.
-fn ofdm_wide() -> WidebandLowDensityFloor {
+/// An OFDM main-family rung: `mode` params + QPSK + N1296 R1/2 (the ladder's
+/// per-mode recipe — sonde-99l.6).
+fn ofdm_rung(mode: OfdmModeName) -> WidebandLowDensityFloor {
     WidebandLowDensityFloor::with_params_constellation_fec(
-        OfdmParams::for_mode(OfdmModeName::Wide),
+        OfdmParams::for_mode(mode),
         2, // QPSK
         Box::new(OfdmAdaptiveCodec::new(BlockN::N1296, WifiLdpcRate::R1_2)),
     )
+}
+
+/// The first real OFDM main mode: Wide + QPSK + N1296 R1/2.
+fn ofdm_wide() -> WidebandLowDensityFloor {
+    ofdm_rung(OfdmModeName::Wide)
 }
 
 /// `(fer, mean reported SNR_2500)` over `n` seeds at a target injected SNR.
@@ -121,6 +127,39 @@ fn ofdm_wide_qpsk_decodes_and_has_a_knee() {
         "FER must rise as SNR falls (a real knee): {fer_lo:.2} @2 vs {fer_hi:.2} @22"
     );
     assert!(snr_hi.is_finite(), "ofdm-wide reports an honest SNR_2500");
+}
+
+/// Every OFDM ladder rung (narrow/mid/wide) is a REAL end-to-end mode AND the
+/// rungs are ordered by robustness — the point of a ladder (sonde-99l.6). All
+/// decode at a high `SNR_2500` anchor; at a low anchor the WIDER (faster) modes
+/// fail while the NARROWER (more robust) modes still decode, because for a fixed
+/// `SNR_2500` a narrower occupied bandwidth means a higher per-tone SNR.
+#[test]
+fn ofdm_rungs_are_real_and_ordered_by_robustness() {
+    let mut low_fer = Vec::new();
+    for mode in [OfdmModeName::Narrow, OfdmModeName::Mid, OfdmModeName::Wide] {
+        let wf = ofdm_rung(mode);
+        let (fer_hi, snr_hi) = sweep_point(&wf, 48, 22.0, 5);
+        let (fer_lo, _) = sweep_point(&wf, 48, 2.0, 5);
+        eprintln!("{mode:?}: @22dB FER={fer_hi:.2} (reported {snr_hi:.1}); @2dB FER={fer_lo:.2}");
+        assert!(
+            fer_hi <= 0.40,
+            "{mode:?} OFDM rung must decode reliably at high SNR (FER {fer_hi:.2} @22 dB) — a real mode"
+        );
+        low_fer.push((mode, fer_lo));
+    }
+    // Robustness ordering at the low anchor: narrow ≤ mid ≤ wide FER.
+    let narrow = low_fer[0].1;
+    let mid = low_fer[1].1;
+    let wide = low_fer[2].1;
+    assert!(
+        narrow <= mid + 1e-6 && mid <= wide + 1e-6,
+        "ladder must be ordered by robustness @2 dB SNR_2500: narrow {narrow:.2} ≤ mid {mid:.2} ≤ wide {wide:.2}"
+    );
+    assert!(
+        wide > narrow,
+        "the ladder must actually span robustness: wide {wide:.2} should fail where narrow {narrow:.2} survives @2 dB"
+    );
 }
 
 /// Full FER-vs-SNR_2500 sweep for ofdm-wide — emit the curve to read its real

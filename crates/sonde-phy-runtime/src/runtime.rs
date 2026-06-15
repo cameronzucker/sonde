@@ -264,17 +264,27 @@ impl<R: Radio> Worker<R> {
     }
 
     fn do_tx(&mut self, job: TxJob) {
-        // Transmit ONLY with a waveform that actually serves the resolved mode's
-        // family. If none is registered we DROP the over rather than substitute a
-        // different family's waveform — silently keying floor RF for an
-        // OFDM-requested over (the old `.or_else(first)` fallback) is a real
-        // correctness footgun: the link's MODE byte would claim one mode while the
-        // air carries another. A dropped over surfaces as a missed over (the link's
-        // turn-recovery / P1 BASE-fallback handles it); a wrong-family over does
-        // not surface at all. The link is responsible for only requesting modes the
-        // PHY registers (ladder-from-registry, sonde-lcw.1).
-        let family = self.modes.resolve(job.hint, None).family();
-        match self.waveforms.iter().find(|w| w.family() == family) {
+        // Per-mode routing (sonde-99l.6): resolve the hint to a concrete mode and
+        // key the waveform implementing THAT mode (by `mode_name`), so a multi-rung
+        // family (ofdm-narrow/mid/wide) transmits the requested rung — not just any
+        // same-family waveform. A waveform with no `mode_name` (family-generic, e.g.
+        // a future FM bridge or a test double) still matches by family. No match ⇒
+        // DROP: never substitute a different mode's RF (the 99l.5 footgun, now also
+        // guarded within a family — keying ofdm-wide for an ofdm-mid request would
+        // put the wrong mode on the air). A dropped over surfaces as a missed over
+        // (the link's turn-recovery / P1 BASE-fallback handles it). The link only
+        // requests registered modes (ladder-from-registry, sonde-lcw.1).
+        let mode = self.modes.resolve(job.hint, None);
+        let chosen = self
+            .waveforms
+            .iter()
+            .find(|w| w.mode_name() == Some(mode.short_name()))
+            .or_else(|| {
+                self.waveforms
+                    .iter()
+                    .find(|w| w.mode_name().is_none() && w.family() == mode.family())
+            });
+        match chosen {
             Some(waveform) => {
                 // A transmit/encode error is a soundcard hiccup, not an RX channel
                 // measurement — we do not crash the worker, and we do NOT fold it
@@ -318,7 +328,13 @@ impl<R: Radio> Worker<R> {
             }
             match waveform.decode_scan(&samples) {
                 DecodeScan::Frame(frame) => {
-                    let mode = self.modes.resolve(hint_for_family(frame.family), None);
+                    // Label the RxFrame with the SPECIFIC mode the winning waveform
+                    // implements (it knows exactly which rung it is), falling back
+                    // to a family-representative mode for family-generic waveforms.
+                    let mode = match waveform.mode_name() {
+                        Some(name) => self.modes.resolve(ModeHint::MainPinned(name), None),
+                        None => self.modes.resolve(hint_for_family(frame.family), None),
+                    };
                     if let Ok(mut q) = self.quality.lock() {
                         q.record_over(false, frame.snr_2500_db);
                     }
