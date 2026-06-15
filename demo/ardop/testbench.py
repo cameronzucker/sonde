@@ -266,7 +266,17 @@ class SessionParams:
 
     def __init__(self, snr=20.0, condition="none", seed=1, arqbw="2000MAX",
                  call_a="N0AAA", call_b="N0BBB", timeout=60.0, payload=PAYLOAD,
-                 data_timeout=90.0, tap=None, tap_rev=None):
+                 data_timeout=480.0, tap=None, tap_rev=None):
+        # data_timeout is the post-CONNECT transfer window. The default ~3.3 KB
+        # SNDM message moves at the link's *effective* HF throughput (~440 bps on
+        # an Ideal channel; far less once ARDOP rate-adapts down under multipath),
+        # so a full transfer takes minutes, not seconds. The old 90 s only ever
+        # fit the pristine Ideal channel — Good/Moderate/Poor ran out of time and
+        # delivered a partial. Measured: Good @ SNR 10 fully delivers (intact) in
+        # ~287 s. 480 s gives Good comfortable margin and lets the slower Moderate
+        # condition finish too; a genuinely degraded Poor link still shows honest
+        # partial/degradation rather than hanging. (CONNECT itself is capped
+        # separately by `timeout`, so the no-connect / SNR-floor case is unchanged.)
         self.snr = float(snr)
         self.condition = condition
         self.seed = int(seed)
@@ -342,7 +352,11 @@ def run_session(params, emit, should_abort=None):
             H.send(f"MYCALL {call}")
             H.send("PROTOCOLMODE ARQ")
             H.send(f"ARQBW {params.arqbw}")
-            H.send("ARQTIMEOUT 90")
+            # ardopcf's link-level inactivity timeout. 240 s is its max (HostInterface.c
+            # accepts 30..240); be maximally patient so the link rides out Watterson
+            # fades instead of tearing down at 90 s mid-transfer. Sits below the
+            # Python data_timeout backstop so a truly dead link still ends cleanly.
+            H.send("ARQTIMEOUT 240")
             H.send("CWID FALSE")
         time.sleep(0.5)
 
@@ -468,7 +482,7 @@ def main():
     ap.add_argument("--call-b", default="N0BBB")
     ap.add_argument("--timeout", type=float, default=60)
     ap.add_argument("--payload", default=PAYLOAD, help="file to transfer over the link")
-    ap.add_argument("--data-timeout", type=float, default=90)
+    ap.add_argument("--data-timeout", type=float, default=480)
     ap.add_argument("--tap", default=None, help="capture data-direction on-air PCM here")
     args = ap.parse_args()
 
