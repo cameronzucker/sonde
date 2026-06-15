@@ -110,6 +110,49 @@ export function createWaterfall(mountEl, { getAnalyser, isPlaying } = {}) {
   const mesh = new THREE.Mesh(geo, material);
   scene.add(mesh);
 
+  // ── Reference grid + axis labels (X = frequency, Z = time) ─────────────────
+  // A static floor grid under the surface so you can read the spectrum: vertical
+  // lines at frequency ticks, horizontals marking time, and Hz labels along the
+  // camera-facing edge. Added to the scene (not the mesh) so it doesn't scroll.
+  const FREQ_TICKS = [500, 1000, 1500, 2000, 2500];
+  const freqToX = (f) => ((f - BAND_LO_HZ) / (BAND_HI_HZ - BAND_LO_HZ)) * (HALF_X * 2) - HALF_X;
+  (function buildAxes() {
+    const y0 = -0.03;
+    const seg = [];
+    for (const f of FREQ_TICKS) { const x = freqToX(f); seg.push(x, y0, -HALF_Z, x, y0, HALF_Z); }
+    const TROWS = 4;
+    for (let i = 0; i <= TROWS; i++) {
+      const z = -HALF_Z + (i / TROWS) * (HALF_Z * 2);
+      seg.push(-HALF_X, y0, z, HALF_X, y0, z);
+    }
+    const gGeo = new THREE.BufferGeometry();
+    gGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(seg), 3));
+    scene.add(new THREE.LineSegments(gGeo,
+      new THREE.LineBasicMaterial({ color: 0x2f4a58, transparent: true, opacity: 0.5 })));
+
+    const labels = [];
+    function makeLabel(text, scaleX = 1.1) {
+      const cv = document.createElement("canvas"); cv.width = 256; cv.height = 64;
+      const cx = cv.getContext("2d");
+      cx.fillStyle = "#9fc0d4"; cx.font = "bold 34px 'IBM Plex Mono', monospace";
+      cx.textAlign = "center"; cx.textBaseline = "middle"; cx.fillText(text, 128, 34);
+      const tex = new THREE.CanvasTexture(cv);
+      const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false }));
+      sp.scale.set(scaleX, scaleX * 0.25, 1);
+      labels.push({ sp, tex });
+      return sp;
+    }
+    for (const f of FREQ_TICKS) {
+      const sp = makeLabel(String(f));
+      sp.position.set(freqToX(f), y0 + 0.05, HALF_Z + 0.38);
+      scene.add(sp);
+    }
+    const cap = makeLabel("FREQ (Hz)", 1.5);
+    cap.position.set(0, y0 + 0.05, HALF_Z + 1.0);
+    scene.add(cap);
+    buildAxes.labels = labels;
+  })();
+
   // ── Rolling spectral history (ring buffer of normalized rows) ──────────────
   const hist = new Float32Array(ROWS * COLS); // 0..1
   let writeRow = 0;

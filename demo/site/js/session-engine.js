@@ -65,8 +65,8 @@ export function runSession(params, handlers = {}) {
     progress: (ev) => call("onProgress", ev),
     mode: (ev) => call("onMode", ev),
     delivered: (ev) => call("onDelivered", ev),
-    // Live on-air audio: base64 S16LE PCM, decoded to Float32 for the player.
-    audio: (ev) => call("onAudio", { samples: b64ToFloat32(ev.pcm), rate: ev.rate }),
+    // Live on-air audio: base64 S16LE PCM (per direction), decoded to Float32.
+    audio: (ev) => call("onAudio", { samples: b64ToFloat32(ev.pcm), rate: ev.rate, dir: ev.dir || "fwd" }),
     result: (ev) => call("onResult", ev),
     error: (ev) => call("onError", ev),
   };

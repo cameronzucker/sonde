@@ -86,15 +86,30 @@
       <section class="cockpit__left">
         <div class="panel panel--hero" aria-labelledby="hero-label">
           <div class="panel__head">
-            <h2 class="panel__title" id="hero-label"><span class="idx">01</span> Live Spectral Waterfall</h2>
-            <span class="panel__hint">the on-air signal, streamed live · drag to orbit</span>
+            <h2 class="panel__title" id="hero-label"><span class="idx">01</span> Live Spectral Waterfalls</h2>
+            <span class="panel__hint">both on-air directions · drag to orbit</span>
           </div>
-          <div class="stage" id="waterfall-mount" role="img" aria-label="Live 3D spectrogram of the on-air signal">
-            <span class="reg reg--tl" aria-hidden="true"></span>
-            <span class="reg reg--tr" aria-hidden="true"></span>
-            <span class="reg reg--bl" aria-hidden="true"></span>
-            <span class="reg reg--br" aria-hidden="true"></span>
-            <div class="stage__boot" id="stage-boot">press Connect — the live spectrum streams in as the modems transmit…</div>
+          <div class="stage-pair">
+            <div class="stage-wrap">
+              <span class="stage-tag stage-tag--data">A → B · DATA</span>
+              <div class="stage" id="waterfall-fwd" role="img" aria-label="Live 3D spectrogram of the data sender, station A to B">
+                <span class="reg reg--tl" aria-hidden="true"></span>
+                <span class="reg reg--tr" aria-hidden="true"></span>
+                <span class="reg reg--bl" aria-hidden="true"></span>
+                <span class="reg reg--br" aria-hidden="true"></span>
+                <div class="stage__boot">press Connect…</div>
+              </div>
+            </div>
+            <div class="stage-wrap">
+              <span class="stage-tag stage-tag--ack">B → A · ACK / NAK</span>
+              <div class="stage" id="waterfall-rev" role="img" aria-label="Live 3D spectrogram of the receiver acknowledgements, station B to A">
+                <span class="reg reg--tl" aria-hidden="true"></span>
+                <span class="reg reg--tr" aria-hidden="true"></span>
+                <span class="reg reg--bl" aria-hidden="true"></span>
+                <span class="reg reg--br" aria-hidden="true"></span>
+                <div class="stage__boot">press Connect…</div>
+              </div>
+            </div>
           </div>
         </div>
 

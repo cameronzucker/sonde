@@ -26,7 +26,7 @@ const muteBtn = el("mute-btn");
 const muteGlyph = el("mute-glyph");
 
 // ── Module instances + run state ─────────────────────────────────────────────
-let waterfall, imageReveal, sessionLog, controls, liveAudio;
+let waterfallFwd, waterfallRev, imageReveal, sessionLog, controls, liveAudio;
 let imageRange = [0, 0];
 let seed = 1;
 let session = null;   // current EventSource controller ({close})
@@ -68,7 +68,8 @@ function runConnectedSession(state) {
 
   controls.setRunning(true);
   sessionLog.reset();
-  waterfall.reset();
+  waterfallFwd.reset();
+  waterfallRev.reset();
   clearTelemetry();
   statSnr.textContent = `${state.snrDb} dB`;
   imageReveal.showFailed("CONNECTING…", `${state.condition} · ${state.arqbw.replace("MAX", " Hz max")}`);
@@ -80,7 +81,7 @@ function runConnectedSession(state) {
   session = runSession({ ...state, seed: mySeed }, {
     onPhase: (ev) => setStatus(ev.msg),
     onStation: (ev) => sessionLog.event("info", `${ev.station} = ${ev.call} (${ev.role})`),
-    onAudio: (ev) => liveAudio.enqueue(ev.samples, ev.rate),   // LIVE on-air audio → waterfall
+    onAudio: (ev) => liveAudio.enqueue(ev.samples, ev.rate, ev.dir),  // per-direction → its waterfall
     onConnected: (ev) => {
       statBw.textContent = ev.bandwidth ? `${ev.bandwidth} Hz` : "—";
       sessionLog.event("conn", `CONNECTED — ${ev.call_a} ⇄ ${ev.call_b}`,
@@ -168,9 +169,15 @@ async function boot() {
   imageRange = imageFieldRange(offsets());
 
   liveAudio = createLiveAudio();
-  waterfall = createWaterfall(el("waterfall-mount"), {
-    getAnalyser: () => liveAudio.getAnalyser(),
-    isPlaying: () => liveAudio.isPlaying(),
+  // Two waterfalls: A->B (data sender) and B->A (receiver's ACK/NAK bursts), each
+  // tapping its own direction's analyser so the half-duplex turn-taking is visible.
+  waterfallFwd = createWaterfall(el("waterfall-fwd"), {
+    getAnalyser: () => liveAudio.getAnalyser("fwd"),
+    isPlaying: () => liveAudio.isPlaying("fwd"),
+  });
+  waterfallRev = createWaterfall(el("waterfall-rev"), {
+    getAnalyser: () => liveAudio.getAnalyser("rev"),
+    isPlaying: () => liveAudio.isPlaying("rev"),
   });
   sessionLog = createSessionLog(el("session-log-stream"), el("session-progress"));
   imageReveal = createImageReveal(el("recon-image"));
