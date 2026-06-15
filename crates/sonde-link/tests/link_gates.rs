@@ -509,12 +509,10 @@ impl LinkPair {
                 8,
             )
             .with_strategy(strategy),
-            ModeHint::MainAuto,
         );
         let b = Link::new(
             eb,
             Connection::acceptor(callsign("W2XYZ"), gate_profile(), 8).with_strategy(strategy),
-            ModeHint::MainAuto,
         );
         Self {
             chan,

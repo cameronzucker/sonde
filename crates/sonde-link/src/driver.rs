@@ -125,6 +125,12 @@ impl<P: PhyTransport, C: Clock> Driver<P, C> {
         self.conn.state()
     }
 
+    /// Current link adaptation rung (introspection; rises = more robust). Reflects
+    /// mode adaptation driven by the PHY's `channel_quality()` measurements.
+    pub fn current_rung(&self) -> u8 {
+        self.conn.current_rung()
+    }
+
     /// Drain any synchronous `send_frame` errors observed since the last call.
     pub fn take_errors(&mut self) -> Vec<PhyError> {
         self.errors.drain(..).collect()
@@ -163,11 +169,31 @@ impl<P: PhyTransport, C: Clock> Driver<P, C> {
         }
         let logical = self.logical();
 
-        // Ingest: decode inbound frames; a failed decode is dropped.
+        // Ingest: decode inbound frames into a batch first (a failed decode is
+        // dropped). Batching lets us feed the channel measurement BEFORE the SM
+        // reacts to the over, so `apply_peer_feedback`'s worse-direction-wins sees
+        // the fresh reading.
+        let mut inbound = Vec::new();
         while let Some(rx) = self.phy.poll_rx() {
             if let Ok(frame) = LinkFrame::decode(rx.payload()) {
-                self.conn.handle_frame(frame, logical);
+                inbound.push(frame);
             }
+        }
+        // Feed the per-over channel measurement into mode adaptation — only when we
+        // actually decoded something (so an idle/stale snapshot is never re-applied,
+        // which would corrupt the SNR EWMA / FER cadence). A total-loss degradation
+        // that yields no decode is handled by the sender's self-downshift + P1, not
+        // this measurement path.
+        if !inbound.is_empty() {
+            let q = self.phy.channel_quality();
+            self.conn.observe_quality(
+                q.aggregate_snr_db(),
+                q.frame_error_rate(),
+                q.recent_frames_total(),
+            );
+        }
+        for frame in inbound {
+            self.conn.handle_frame(frame, logical);
         }
         // Timers at logical time.
         self.conn.handle_timeout(logical);
@@ -298,6 +324,36 @@ mod tests {
             },
             WireEnd { q, side: 1 },
         )
+    }
+
+    /// A wire end that also reports a fixed `channel_quality()` — to prove the
+    /// Driver feeds the PHY measurement into mode adaptation end-to-end.
+    struct MeasuringWire {
+        q: Queues,
+        side: usize,
+        snr_db: f32,
+        frames_total: u32,
+        frames_failed: u32,
+    }
+    impl PhyTransport for MeasuringWire {
+        fn send_frame(&mut self, payload: &[u8], _hint: ModeHint) -> Result<TxToken, PhyError> {
+            self.q.borrow_mut()[1 - self.side].push_back(payload.to_vec());
+            Ok(TxToken(0))
+        }
+        fn poll_rx(&mut self) -> Option<RxFrame> {
+            let bytes = self.q.borrow_mut()[self.side].pop_front()?;
+            let mode = ModeTable::default().resolve(ModeHint::MainAuto, None);
+            Some(RxFrame::new(bytes, mode, None, 10.0, true))
+        }
+        fn channel_quality(&self) -> ChannelQualityReport {
+            ChannelQualityReport::from_parts(
+                Vec::new(),
+                self.snr_db,
+                self.frames_total,
+                self.frames_failed,
+                None,
+            )
+        }
     }
 
     /// A transport whose `send_frame` always fails (to exercise error capture).
@@ -455,6 +511,55 @@ mod tests {
         assert!(
             a.last_id_real.is_none(),
             "a failed ID-bearing send must not advance the ID cadence"
+        );
+    }
+
+    #[test]
+    fn driver_adapts_the_rung_from_the_phys_channel_quality() {
+        // End-to-end glue: B's PHY reports a poor channel; B folds it into adaptation
+        // and feeds back a robust rung, and the floor-holding sender A obeys (its
+        // rung climbs toward BASE). Proves the Driver → channel_quality →
+        // observe_quality → adapt_rung → apply path is wired, not just the in-memory
+        // logic. (RADIO-1: in-memory doubles, nothing keyed.)
+        let clk = ManualClock::new();
+        let q: Queues = Rc::new(RefCell::new([VecDeque::new(), VecDeque::new()]));
+        let ea = WireEnd {
+            q: Rc::clone(&q),
+            side: 0,
+        };
+        let eb = MeasuringWire {
+            q,
+            side: 1,
+            snr_db: -15.0, // a collapsed channel on A's overs
+            frames_total: 10,
+            frames_failed: 0,
+        };
+        let mut a = Driver::new(
+            ea,
+            Connection::initiator(call("K1ABC"), call("W2XYZ"), 0x1234, profile(), 8),
+            clk.clone(),
+        );
+        let mut b = Driver::new(
+            eb,
+            Connection::acceptor(call("W2XYZ"), profile(), 8),
+            clk.clone(),
+        );
+        a.connect();
+        let start = a.current_rung();
+        a.send(b"adapt".to_vec());
+        let mut b_ev = Vec::new();
+        for _ in 0..80 {
+            a.poll();
+            b_ev.extend(b.poll());
+            clk.advance(Duration::from_millis(20));
+        }
+        assert!(
+            a.current_rung() > start,
+            "A downshifts from B's poor-channel feedback (end-to-end through the Driver)"
+        );
+        assert!(
+            messages(&b_ev).contains(&b"adapt".to_vec()),
+            "and the message still delivers"
         );
     }
 
