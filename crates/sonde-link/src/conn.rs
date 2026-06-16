@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use crate::arq::{Reassembler, RecvBuffer, SendWindow, FIRST_SEQ};
 use crate::frame::{Callsign, FrameType, LinkFrame, StationId};
-use crate::mac::{self, ArqStrategy};
+use crate::mac::{ArqStrategy, Ladder};
 use crate::profile::ModeProfile;
 use sonde_phy::modes::ModeHint;
 
@@ -104,7 +104,14 @@ pub struct Connection {
     remote: Option<Callsign>,
     /// Whether `remote` is learned-from-CONN (acceptor) vs configured (initiator).
     remote_is_learned: bool,
+    /// Active airtime-aware profile for `current_rung` — derives all link timers.
+    /// Swapped on a rung change ([`Connection::apply_rung`]) to the target rung's
+    /// profile, so per-mode timers track the active mode (gap inventory B3).
     profile: ModeProfile,
+    /// The adaptation ladder this connection runs over. Built from the PHY's
+    /// published modes (sonde-3tm registry handshake) via `*_with_ladder`, or the
+    /// built-in uniform-profile mirror for the profile-injecting constructors.
+    ladder: Ladder,
     conn_id: u32,
 
     state: ConnState,
@@ -147,7 +154,9 @@ pub struct Connection {
 
 impl Connection {
     /// Construct the connection initiator (owns the first floor after CONN_ACK).
-    /// The initiator is *configured* with the peer it calls.
+    /// The initiator is *configured* with the peer it calls. Runs over the built-in
+    /// ladder with the supplied profile on every rung (back-compat); use
+    /// [`Connection::initiator_with_ladder`] to run over a PHY-published ladder.
     pub fn initiator(
         local: Callsign,
         remote: Callsign,
@@ -166,6 +175,26 @@ impl Connection {
         Self::new(local, None, true, 0, profile, window)
     }
 
+    /// Initiator over an explicit adaptation [`Ladder`] (the sonde-3tm registry
+    /// handshake: a ladder built from the modes the PHY publishes). The active
+    /// profile + timers are derived from the ladder's default rung and swap per-mode
+    /// on adaptation (gap inventory B3).
+    pub fn initiator_with_ladder(
+        local: Callsign,
+        remote: Callsign,
+        conn_id: u32,
+        ladder: Ladder,
+        window: u32,
+    ) -> Self {
+        Self::with_ladder(local, Some(remote), false, conn_id, ladder, window)
+    }
+
+    /// Acceptor over an explicit adaptation [`Ladder`] (see
+    /// [`Connection::initiator_with_ladder`]).
+    pub fn acceptor_with_ladder(local: Callsign, ladder: Ladder, window: u32) -> Self {
+        Self::with_ladder(local, None, true, 0, ladder, window)
+    }
+
     fn new(
         local: Callsign,
         remote: Option<Callsign>,
@@ -174,11 +203,32 @@ impl Connection {
         profile: ModeProfile,
         window: u32,
     ) -> Self {
+        Self::with_ladder(
+            local,
+            remote,
+            remote_is_learned,
+            conn_id,
+            Ladder::standard_with_uniform_profile(profile),
+            window,
+        )
+    }
+
+    fn with_ladder(
+        local: Callsign,
+        remote: Option<Callsign>,
+        remote_is_learned: bool,
+        conn_id: u32,
+        ladder: Ladder,
+        window: u32,
+    ) -> Self {
+        let current_rung = ladder.default_rung();
+        let profile = ladder.rung(current_rung).profile;
         let mut c = Self {
             local,
             remote,
             remote_is_learned,
             profile,
+            ladder,
             conn_id,
             state: ConnState::Closed,
             floor: Floor::Listening,
@@ -192,7 +242,7 @@ impl Connection {
             awaiting_reply: false,
             owe_ack: false,
             sack_enabled: true,
-            current_rung: mac::default_rung(),
+            current_rung,
             snr_raw: f32::NAN,
             snr_smoothed: f32::NAN,
             fer: 0.0,
@@ -239,7 +289,7 @@ impl Connection {
     /// ladder rung). The driver reads this per send so a mid-session mode change
     /// takes effect on the wire.
     pub fn current_hint(&self) -> ModeHint {
-        mac::rung(self.current_rung).mode
+        self.ladder.rung(self.current_rung).mode
     }
 
     /// Current ladder-rung id (for tests / introspection).
@@ -308,13 +358,13 @@ impl Connection {
     pub fn handle_frame(&mut self, frame: LinkFrame, now: Duration) {
         match frame.frame_type {
             FrameType::Conn => self.on_conn(&frame, now),
-            FrameType::ConnAck => self.on_conn_ack(&frame),
+            FrameType::ConnAck => self.on_conn_ack(&frame, now),
             FrameType::Disc => self.on_disc(&frame),
             FrameType::DiscAck => self.on_disc_ack(&frame),
-            FrameType::Id => self.on_id(&frame),
-            FrameType::Data if self.session_ok(&frame) => self.on_data(frame),
-            FrameType::Ack if self.session_ok(&frame) => self.on_ack(&frame),
-            FrameType::Keepalive if self.session_ok(&frame) => self.on_keepalive(&frame),
+            FrameType::Id => self.on_id(&frame, now),
+            FrameType::Data if self.session_ok(&frame) => self.on_data(frame, now),
+            FrameType::Ack if self.session_ok(&frame) => self.on_ack(&frame, now),
+            FrameType::Keepalive if self.session_ok(&frame) => self.on_keepalive(&frame, now),
             _ => {}
         }
     }
@@ -351,7 +401,7 @@ impl Connection {
                     // its own (the Idle-floor blind spot), and sustained misses still
                     // cascade to the P1 BASE-fallback below.
                     self.silent_overs += 1;
-                    let base = mac::base_rung();
+                    let base = self.ladder.base_rung();
                     if self.current_rung != base && self.silent_overs >= DOWNSHIFT_TO_BASE_OVERS {
                         // We cannot get through at this mode — fall to the robust
                         // BASE mode (design P1) and keep trying there with a fresh
@@ -359,7 +409,7 @@ impl Connection {
                         // peer also follows our mode-id), so they converge to BASE
                         // instead of dying. BASE is the most-robust *available* rung.
                         // Re-take the floor to retransmit.
-                        self.apply_rung(base);
+                        self.apply_rung(base, now);
                         self.silent_overs = 0;
                         self.floor = Floor::Sending;
                         self.deadline = None;
@@ -372,7 +422,7 @@ impl Connection {
                         // retransmit the unacked window. apply_rung clamps to the next
                         // *available* rung (a no-op once we are at BASE).
                         if self.current_rung != base {
-                            self.apply_rung(self.current_rung + 1);
+                            self.apply_rung(self.current_rung + 1, now);
                         }
                         self.floor = Floor::Sending;
                         self.deadline = None;
@@ -442,30 +492,43 @@ impl Connection {
     }
 
     /// Switch to ladder rung `id`: restamp the mode, resize the ARQ window in
-    /// place (preserving the seq stream + in-flight), and flip SACK on/off for
-    /// the rung's strategy. The airtime-aware timer *profile* is intentionally
-    /// NOT swapped here — real per-mode profiles come from the PHY (design §6,
-    /// not yet available); the constructed profile is kept until then.
+    /// place (preserving the seq stream + in-flight), flip SACK on/off for the
+    /// rung's strategy, and **swap the airtime-aware [`ModeProfile`] to the target
+    /// rung** so per-mode timers (turn-recovery/over/keepalive) track the active
+    /// mode (gap inventory B3). For a uniform-profile ladder (the profile-injecting
+    /// constructors) every rung shares one profile, so the swap is a no-op.
     ///
-    /// `id` is **clamped to an available rung** ([`mac::clamp_available`]) — a
-    /// fabricated/unregistered rung is never selected or transmitted (C7), and a
-    /// peer advertising a rung this build lacks (version skew) is absorbed toward
-    /// the nearest more-robust real rung.
-    fn apply_rung(&mut self, id: u8) {
-        let id = mac::clamp_available(id);
+    /// `id` is **clamped to an available rung** ([`Ladder::clamp_available`]) — a
+    /// fabricated/unregistered rung is never selected or transmitted (C7), and an
+    /// inbound id this build lacks is absorbed toward the nearest more-robust real
+    /// rung. (Same-build links share one ladder; cross-build capability negotiation
+    /// is out of scope — see the registry-handshake design.)
+    fn apply_rung(&mut self, id: u8, now: Duration) {
+        let id = self.ladder.clamp_available(id);
         if id == self.current_rung {
             return;
         }
-        let old_family = mac::family_of(self.current_rung);
+        let old_family = self.ladder.family_of(self.current_rung);
         self.current_rung = id;
         self.configure_arq_for_rung(id);
+        // Swap the airtime-aware profile to the target rung (B3): every link timer
+        // derives from it, so the mode's real over-airtime now governs the clocks.
+        self.profile = self.ladder.rung(id).profile;
+        // Re-arm any outstanding turn-recovery deadline from the NEW profile: a
+        // downshift to a slower mode lengthened the over-airtime, so a deadline
+        // armed under the old (faster) profile would fire a premature retransmit
+        // before the slower over could even complete (Codex review). Recompute from
+        // `now`; the timeout/floor handlers that null the deadline still override.
+        if self.deadline.is_some() {
+            self.deadline = Some(now + self.profile.turn_recovery_timeout());
+        }
         // FER is mode-conditioned ⇒ always reset on a rung change (design F6).
         self.fer = 0.0;
         self.fer_samples = 0;
         // The reported usable SNR is only valid within a waveform family ⇒ reset
         // the estimate when the family changes (design F6); keep it within a family
         // (physical SNR is rung-independent).
-        if mac::family_of(id) != old_family {
+        if self.ladder.family_of(id) != old_family {
             self.snr_raw = f32::NAN;
             self.snr_smoothed = f32::NAN;
         }
@@ -476,7 +539,7 @@ impl Connection {
     /// SACK), so the link runs stop-and-wait until a `SelectiveRepeat` mode (the
     /// OFDM family) registers a real waveform.
     fn configure_arq_for_rung(&mut self, id: u8) {
-        let r = mac::rung(id);
+        let r = self.ladder.rung(id);
         self.send.reconfigure(r.window.window);
         self.recv.reconfigure(r.window.window);
         self.sack_enabled = matches!(r.strategy, ArqStrategy::SelectiveRepeat);
@@ -487,9 +550,9 @@ impl Connection {
     /// out at the same mode and the two ends converge. Used only by the *follower*
     /// (the listener), never the floor-holding decider (see the role-gate in the
     /// inbound handlers).
-    fn follow_mode(&mut self, peer_mode: u8) {
+    fn follow_mode(&mut self, peer_mode: u8, now: Duration) {
         if peer_mode != self.current_rung {
-            self.apply_rung(peer_mode);
+            self.apply_rung(peer_mode, now);
         }
     }
 
@@ -513,9 +576,9 @@ impl Connection {
 
     /// The ladder rung this station recommends the PEER use (advertised as
     /// `rx_rung`), from its smoothed channel measurement via the symmetric,
-    /// FER-gated [`mac::adapt_rung`]. No measurement ⇒ `current_rung` (no change).
+    /// FER-gated [`Ladder::adapt_rung`]. No measurement ⇒ `current_rung` (no change).
     fn recommended_rung(&self) -> u8 {
-        mac::adapt_rung(
+        self.ladder.adapt_rung(
             self.current_rung,
             self.snr_raw,
             self.snr_smoothed,
@@ -530,12 +593,12 @@ impl Connection {
     /// robust of the peer's feedback and our own reverse-path recommendation, so a
     /// good forward path cannot pull the shared rung up and break a bad reverse
     /// path. Applied authoritatively in both directions — no probe, no streak.
-    fn apply_peer_feedback(&mut self, peer_rx_rung: u8) {
+    fn apply_peer_feedback(&mut self, peer_rx_rung: u8, now: Duration) {
         // More robust (higher id) of the peer's feedback and our own reverse-path
-        // recommendation. `apply_rung` clamps the result to an available rung, so a
-        // peer advertising a rung this build lacks (version skew) is absorbed.
+        // recommendation. `apply_rung` clamps the result to an available rung, so an
+        // inbound rung this build lacks is absorbed.
         let target = peer_rx_rung.max(self.recommended_rung());
-        self.apply_rung(target);
+        self.apply_rung(target, now);
     }
 
     /// Transition to `Closed`, clearing all per-session ARQ/reassembly state so a
@@ -561,7 +624,7 @@ impl Connection {
         self.reasm.reset();
         // Restore the default (most-robust available) registered mode and its ARQ
         // config so a same-object reconnect starts fresh at a real rung.
-        self.current_rung = mac::default_rung();
+        self.current_rung = self.ladder.default_rung();
         self.configure_arq_for_rung(self.current_rung);
         self.snr_raw = f32::NAN;
         self.snr_smoothed = f32::NAN;
@@ -754,7 +817,7 @@ impl Connection {
         }
     }
 
-    fn on_conn_ack(&mut self, frame: &LinkFrame) {
+    fn on_conn_ack(&mut self, frame: &LinkFrame, now: Duration) {
         if self.state == ConnState::Connecting && frame.conn_id == self.conn_id {
             // Defense-in-depth: the acceptor's ID block must name our peer (SRC)
             // and us (DST). conn_id is the primary check.
@@ -770,7 +833,7 @@ impl Connection {
             // We are now the floor-holding decider for the first over: honor the
             // acceptor's initial rung feedback so the first over starts at the right
             // rung instead of blindly at DEFAULT_RUNG (worse-direction-wins).
-            self.apply_peer_feedback(frame.rx_rung());
+            self.apply_peer_feedback(frame.rx_rung(), now);
         }
     }
 
@@ -797,12 +860,12 @@ impl Connection {
     /// A received periodic `ID` (Part-97) on this session: it proves the peer is
     /// alive (like a keepalive) and confirms the peer's current mode. No host
     /// event; passes the floor only if it carries the over-end token.
-    fn on_id(&mut self, frame: &LinkFrame) {
+    fn on_id(&mut self, frame: &LinkFrame, now: Duration) {
         if !self.session_ok(frame) || !self.id_addressed_to_us(frame) {
             return;
         }
         self.silent_overs = 0;
-        self.adapt_on_inbound(frame);
+        self.adapt_on_inbound(frame, now);
         if frame.is_end_of_over() {
             self.on_over_end();
         }
@@ -814,12 +877,12 @@ impl Connection {
     /// worse-direction-wins). Otherwise we are the **follower** (the peer holds the
     /// floor): adopt its announced `MODE` so our replies match and both ends stay on
     /// one rung. The up/down asymmetry now lives in the measurement (raw vs smoothed
-    /// SNR + FER gate in [`mac::adapt_rung`]), not in any per-frame counter.
-    fn adapt_on_inbound(&mut self, frame: &LinkFrame) {
+    /// SNR + FER gate in [`Ladder::adapt_rung`]), not in any per-frame counter.
+    fn adapt_on_inbound(&mut self, frame: &LinkFrame, now: Duration) {
         if self.awaiting_reply {
-            self.apply_peer_feedback(frame.rx_rung());
+            self.apply_peer_feedback(frame.rx_rung(), now);
         } else {
-            self.follow_mode(frame.mode);
+            self.follow_mode(frame.mode, now);
         }
     }
 
@@ -834,9 +897,9 @@ impl Connection {
         }
     }
 
-    fn on_data(&mut self, frame: LinkFrame) {
+    fn on_data(&mut self, frame: LinkFrame, now: Duration) {
         self.silent_overs = 0;
-        self.adapt_on_inbound(&frame);
+        self.adapt_on_inbound(&frame, now);
         self.send.on_ack(frame.ack_through, frame.sack); // piggybacked ack
         let end_of_over = frame.is_end_of_over();
         let end_of_msg = frame.is_end_of_msg();
@@ -852,18 +915,18 @@ impl Connection {
         }
     }
 
-    fn on_ack(&mut self, frame: &LinkFrame) {
+    fn on_ack(&mut self, frame: &LinkFrame, now: Duration) {
         self.silent_overs = 0;
-        self.adapt_on_inbound(frame);
+        self.adapt_on_inbound(frame, now);
         self.send.on_ack(frame.ack_through, frame.sack);
         if frame.is_end_of_over() {
             self.on_over_end();
         }
     }
 
-    fn on_keepalive(&mut self, frame: &LinkFrame) {
+    fn on_keepalive(&mut self, frame: &LinkFrame, now: Duration) {
         self.silent_overs = 0;
-        self.adapt_on_inbound(frame);
+        self.adapt_on_inbound(frame, now);
         // A keepalive may carry the floor token (an idle holder relinquishing).
         if frame.is_end_of_over() {
             self.on_over_end();
@@ -889,6 +952,7 @@ impl Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mac;
 
     fn call(s: &str) -> Callsign {
         Callsign::new(s).unwrap()
@@ -917,6 +981,89 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    // ---- registry handshake B3: per-mode ModeProfile swap on a rung change -------
+
+    #[test]
+    fn apply_rung_swaps_the_mode_profile_to_the_target_rung() {
+        // A multi-available-rung ladder (the synthetic algorithm fixture) carries the
+        // standard distinct per-rung profiles. Switching rungs must swap the active
+        // profile so per-mode timers (turn-recovery/over/keepalive) track the mode
+        // (gap inventory B3 — previously apply_rung resized ARQ but never the profile).
+        let ladder = crate::mac::test_support::all_available_ladder();
+        let mut c =
+            Connection::initiator_with_ladder(call("K1ABC"), call("W2XYZ"), 0x1234, ladder, 8);
+        // Construction adopts the default (most-robust available = deepest) rung.
+        let before = c.profile.over_airtime();
+        c.apply_rung(0, Duration::ZERO); // climb to the fastest rung
+        let after = c.profile.over_airtime();
+        assert_ne!(
+            before, after,
+            "apply_rung must swap the ModeProfile to the target rung"
+        );
+        assert_eq!(
+            after,
+            Duration::from_millis(300),
+            "fast rung's over-airtime is now active"
+        );
+        assert_eq!(
+            c.profile.per_over_mtu(),
+            1024,
+            "fast rung's per-frame capacity is now active"
+        );
+    }
+
+    #[test]
+    fn uniform_profile_ladder_keeps_the_injected_profile_across_rung_changes() {
+        // The back-compat path: a profile-injecting constructor builds a uniform
+        // ladder, so a rung change is a profile no-op (preserves injected timers/MTU).
+        let mut c = Connection::initiator(call("K1ABC"), call("W2XYZ"), 0x1234, profile(), 8);
+        let before = c.profile.clone();
+        // Force a rung change that clamp keeps real; uniform profile is unchanged.
+        c.apply_rung(0, Duration::ZERO);
+        assert_eq!(c.profile, before, "uniform-profile ladder: swap is a no-op");
+        assert_eq!(c.profile, profile());
+    }
+
+    #[test]
+    fn apply_rung_rearms_an_outstanding_deadline_for_a_slower_profile() {
+        // A turn-recovery deadline armed under a fast rung must be re-armed when we
+        // downshift to a slower mode mid-wait — otherwise it fires a premature
+        // retransmit before the slower over could even complete (Codex review).
+        let ladder = crate::mac::test_support::all_available_ladder();
+        let mut c =
+            Connection::initiator_with_ladder(call("K1ABC"), call("W2XYZ"), 0x1234, ladder, 8);
+        c.apply_rung(0, Duration::ZERO); // fast rung (300 ms over-airtime)
+        let now = Duration::from_secs(1);
+        // Arm a turn-recovery deadline under the fast profile (as poll_transmit would).
+        c.deadline = Some(now + c.profile.turn_recovery_timeout());
+        let fast_deadline = c.deadline.unwrap();
+        // Downshift to the slowest rung at the same instant.
+        c.apply_rung(4, now);
+        let slow_deadline = c
+            .deadline
+            .expect("the deadline stays armed across a downshift");
+        assert!(
+            slow_deadline > fast_deadline,
+            "a downshift to a slower mode must push the deadline out, not fire early"
+        );
+        assert_eq!(
+            slow_deadline,
+            now + c.profile.turn_recovery_timeout(),
+            "re-armed from the new (slower) profile"
+        );
+    }
+
+    #[test]
+    fn apply_rung_leaves_an_idle_link_without_a_deadline() {
+        // No outstanding deadline (Idle floor) ⇒ a rung change must not fabricate one.
+        let ladder = crate::mac::test_support::all_available_ladder();
+        let mut c =
+            Connection::initiator_with_ladder(call("K1ABC"), call("W2XYZ"), 0x1234, ladder, 8);
+        assert!(c.deadline.is_none());
+        c.apply_rung(0, Duration::from_secs(1));
+        assert!(c.deadline.is_none(), "no deadline to re-arm ⇒ stays None");
     }
 
     const TICK: Duration = Duration::from_millis(10);
@@ -1563,9 +1710,9 @@ mod tests {
         // the one real mode — nothing fabricated is ever applied.
         let mut c = init();
         let base = mac::base_rung();
-        c.apply_peer_feedback(0); // "go to the fastest OFDM rung" — unavailable
+        c.apply_peer_feedback(0, Duration::ZERO); // "go to the fastest OFDM rung" — unavailable
         assert_eq!(c.current_rung(), base);
-        c.apply_peer_feedback(mac::NUM_RUNGS - 1); // "go to the deep-floor" — unavailable
+        c.apply_peer_feedback(mac::NUM_RUNGS - 1, Duration::ZERO); // "deep-floor" — unavailable
         assert_eq!(c.current_rung(), base);
     }
 
