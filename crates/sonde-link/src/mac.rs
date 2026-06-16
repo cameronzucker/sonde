@@ -275,6 +275,24 @@ impl Ladder {
         self.rungs[(id as usize).min(self.rungs.len() - 1)].family
     }
 
+    /// The smallest per-frame payload capacity across all **available** rungs — the
+    /// fragment size the link enqueues at (gap inventory B4). Sizing every fragment
+    /// to the deepest *available* rung guarantees a committed DATA seq stays
+    /// transmittable on any mode it may be retransmitted under after a downshift:
+    /// the ARQ keys retransmits on a **stable** per-fragment seq, so an oversized
+    /// committed fragment could never be re-sent on a slower mode (re-fragmenting
+    /// would renumber the stream and break the peer's reassembly). Available-only,
+    /// per the same-build / availability-gated selection scope. At least 1.
+    pub fn min_available_fragment_bytes(&self) -> usize {
+        self.rungs
+            .iter()
+            .filter(|r| r.available)
+            .map(|r| r.profile.per_over_mtu())
+            .min()
+            .unwrap_or(1)
+            .max(1)
+    }
+
     /// Mid-session rung adaptation from a channel **measurement** (symmetric-SNR
     /// adaptation design). The receiver calls this to choose the rung it recommends
     /// the peer use; the sender obeys it (worse-direction-wins). FER is a
@@ -564,6 +582,16 @@ mod tests {
         let mut l2 = all_available_ladder();
         l2.rungs[NUM_RUNGS as usize - 1].available = false;
         assert_eq!(l2.adapt_rung(1, -30.0, -30.0, 0.0, 8), NUM_RUNGS - 2);
+    }
+
+    #[test]
+    fn min_available_fragment_bytes_is_the_deepest_available_rungs_capacity() {
+        // B4: fragments must fit the SMALLEST reachable mode so a downshift (or a
+        // retransmit after one) never orphans an oversized fragment. Today only the
+        // wideband floor (64 B) is available, so that is the global minimum.
+        assert_eq!(Ladder::standard().min_available_fragment_bytes(), 64);
+        // With the whole ladder available, the deepest rung (deep-floor, 16 B) binds.
+        assert_eq!(all_available_ladder().min_available_fragment_bytes(), 16);
     }
 
     #[test]

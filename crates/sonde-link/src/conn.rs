@@ -321,10 +321,20 @@ impl Connection {
         self.deadline = Some(now + self.profile.turn_recovery_timeout());
     }
 
-    /// Enqueue a host message for reliable, in-order delivery. Fragmented across
-    /// DATA frames per the mode's per-over MTU; reassembled at the peer.
+    /// Enqueue a host message for reliable, in-order delivery, fragmented across
+    /// DATA frames and reassembled at the peer.
+    ///
+    /// Fragments are sized to the **smallest reachable mode** ([`Ladder::
+    /// min_available_fragment_bytes`]), not the current rung's capacity (gap
+    /// inventory B4). The ARQ commits a stable per-fragment seq at enqueue and
+    /// retransmits that exact payload, so a fragment sized to a fast mode would be
+    /// un-transmittable after a mid-session downshift (or on a retransmit after
+    /// one). Sizing to the deepest available rung keeps every committed fragment
+    /// transmittable on any mode it may be carried under. (Coalescing small
+    /// fragments into larger frames on fast modes — for efficiency — is a separate
+    /// follow-up: it needs multi-seq framing, see sonde-3tm Phase-2 notes.)
     pub fn send(&mut self, data: Vec<u8>) {
-        let frag = self.profile.per_over_mtu().max(1);
+        let frag = self.ladder.min_available_fragment_bytes();
         let mut last = FIRST_SEQ;
         if data.is_empty() {
             last = self.send.enqueue(Vec::new());
@@ -1064,6 +1074,52 @@ mod tests {
         assert!(c.deadline.is_none());
         c.apply_rung(0, Duration::from_secs(1));
         assert!(c.deadline.is_none(), "no deadline to re-arm ⇒ stays None");
+    }
+
+    // ---- B4: fragment at the global-minimum capacity (downshift-safe) -----------
+
+    #[test]
+    fn send_fragments_at_the_global_minimum_capacity_not_the_current_rung() {
+        // On a FAST rung (per-frame 1024 B) a 100-byte message would be one fragment
+        // if we sized to the current rung — but a later downshift (or a retransmit
+        // after one) to the deep-floor (16 B) could never carry a 1024-B fragment.
+        // B4: enqueue every fragment at the deepest *available* rung's capacity
+        // (here 16 B), so committed DATA seqs stay transmittable on any reachable
+        // mode. The ARQ keys retransmits on stable per-fragment seqs, so the
+        // fragment size must be downshift-safe at enqueue time.
+        let ladder = crate::mac::test_support::all_available_ladder();
+        let mut c =
+            Connection::initiator_with_ladder(call("K1ABC"), call("W2XYZ"), 0x1234, ladder, 8);
+        c.apply_rung(0, Duration::ZERO); // sit on the fast rung (per-frame 1024 B)
+        assert_eq!(c.profile.per_over_mtu(), 1024, "fast rung is active");
+        c.send(vec![0u8; 100]);
+        // 100 bytes / 16-B global-min = 7 fragments (not 1 at the fast rung's 1024).
+        assert_eq!(
+            c.send.outstanding(),
+            7,
+            "fragmented at the 16-B global minimum"
+        );
+        for (_seq, payload) in c.send.over_frames() {
+            assert!(
+                payload.len() <= 16,
+                "every fragment fits the deepest available mode ({} > 16)",
+                payload.len()
+            );
+        }
+    }
+
+    #[test]
+    fn send_empty_message_still_enqueues_one_end_of_message_fragment() {
+        // The empty-message branch must survive the global-min sizing change.
+        let ladder = crate::mac::test_support::all_available_ladder();
+        let mut c =
+            Connection::initiator_with_ladder(call("K1ABC"), call("W2XYZ"), 0x1234, ladder, 8);
+        c.send(Vec::new());
+        assert_eq!(
+            c.send.outstanding(),
+            1,
+            "one empty DATA frame for an empty msg"
+        );
     }
 
     const TICK: Duration = Duration::from_millis(10);
