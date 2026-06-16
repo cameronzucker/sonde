@@ -42,8 +42,5 @@ pub use frame::{
 };
 pub use host::HostCommand;
 pub use link::Link;
-pub use mac::{
-    adapt_rung, base_rung, clamp_available, default_rung, recommended_rung, route, rung,
-    ArqStrategy, Route, WindowParams, NUM_RUNGS,
-};
+pub use mac::{base_rung, default_rung, ArqStrategy, Ladder, Route, WindowParams, NUM_RUNGS};
 pub use profile::ModeProfile;
