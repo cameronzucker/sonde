@@ -36,7 +36,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # cpal -> alsa-sys wants ALSA headers + pkg-config before any cargo step
       # (see ci.yml). Not needed for the wasm32 build, kept for parity/safety.
