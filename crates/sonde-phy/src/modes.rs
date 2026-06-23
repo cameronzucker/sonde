@@ -35,12 +35,17 @@ pub enum ModeHint {
     FloorCrowdedBand,
 }
 
-/// An immutable mode descriptor. Pinned numeric parameters land here
-/// in later phases; this skeleton carries names + family.
+/// An immutable mode descriptor: the catalog *identity* of a mode.
 #[derive(Debug, Clone)]
 pub struct ModeDescriptor {
     short_name: &'static str,
     family: ModeFamily,
+    /// Canonical cross-build wire id — the value carried in the link's MODE byte
+    /// and `rx_rung` feedback. MUST stay in `0..=7` (the `rx_rung` feedback field
+    /// is 3 bits) and stable across builds; the link↔PHY registry handshake keys
+    /// on it (sonde-ddg / sonde-3tm). Assigned in stable registry order so adding
+    /// modes (e.g. QAM) never shifts existing ids.
+    wire_id: u8,
 }
 
 impl ModeDescriptor {
@@ -52,6 +57,35 @@ impl ModeDescriptor {
     pub fn family(&self) -> ModeFamily {
         self.family
     }
+    /// Canonical cross-build wire id (`0..=7`) — see the field docs.
+    pub fn wire_id(&self) -> u8 {
+        self.wire_id
+    }
+}
+
+/// A registered mode's published **capability** — the physics the link's
+/// adaptation ladder is built from (sonde-ddg, the PHY half of the link↔PHY
+/// registry handshake sonde-3tm). Distinct from [`ModeDescriptor`] (catalog
+/// identity): a capability is a mode that the runtime actually *registered* and
+/// whose knee/airtime/capacity are *measured*. The link sorts its ladder by
+/// `knee_snr_db`, sizes overs from `per_frame_airtime`/`per_frame_payload_bytes`,
+/// and addresses the mode by `mode_name` (`ModeHint::MainPinned`) / `wire_id`
+/// (MODE byte). Same-build-only: no cross-build capability negotiation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModeCapability {
+    /// Canonical wire id (`0..=7`), from [`ModeDescriptor::wire_id`].
+    pub wire_id: u8,
+    /// Stable mode identity, for `ModeHint::MainPinned`.
+    pub mode_name: &'static str,
+    /// Waveform family (the link derives its 3 adaptation tiers from this).
+    pub family: ModeFamily,
+    /// Estimator-domain `SNR_2500` FER knee (dB) — measured physics, the value
+    /// the link's reported SNR is compared against (with the +3 dB upshift margin).
+    pub knee_snr_db: f32,
+    /// Wall-clock airtime of ONE PHY `send_frame` carrying `per_frame_payload_bytes`.
+    pub per_frame_airtime: core::time::Duration,
+    /// Payload bytes one PHY frame carries (the link's per-frame fragment size).
+    pub per_frame_payload_bytes: u16,
 }
 
 /// Resolved mode after applying `ModeHint` + channel measurement.
@@ -70,26 +104,34 @@ impl Default for ModeTable {
                 // pins in Phase 7. Three modes is a starting point per
                 // PHY spec §3.Q1 ("ARDOP uses 4; sonde may use fewer
                 // or more"); empirical channel-sim sweep settles count.
+                // Canonical wire_ids are STABLE (never reordered): 0..=2 OFDM
+                // QPSK rungs, 3..=4 floor family, 5..=7 reserved for future QAM
+                // rungs — so adding modes never shifts an existing id.
                 ModeDescriptor {
                     short_name: "ofdm-narrow",
                     family: ModeFamily::OfdmMain,
+                    wire_id: 2,
                 },
                 ModeDescriptor {
                     short_name: "ofdm-mid",
                     family: ModeFamily::OfdmMain,
+                    wire_id: 1,
                 },
                 ModeDescriptor {
                     short_name: "ofdm-wide",
                     family: ModeFamily::OfdmMain,
+                    wire_id: 0,
                 },
                 // Floor family — default + situational
                 ModeDescriptor {
                     short_name: "floor-wblo",
                     family: ModeFamily::RobustnessFloor,
+                    wire_id: 3,
                 },
                 ModeDescriptor {
                     short_name: "floor-nfsk",
                     family: ModeFamily::RobustnessFloor,
+                    wire_id: 4,
                 },
             ],
         }
@@ -138,5 +180,49 @@ impl ModeTable {
             .find(|m| m.short_name == name)
             .cloned()
             .expect("mode-table short_name must exist; constructor enforces")
+    }
+
+    /// Look up a mode descriptor by `short_name`, or `None` if unknown — the
+    /// fallible lookup the capability publication uses (vs the infallible
+    /// `by_name` on hints the resolver guarantees exist).
+    pub fn descriptor(&self, name: &str) -> Option<&ModeDescriptor> {
+        self.modes.iter().find(|m| m.short_name == name)
+    }
+
+    /// All catalog mode descriptors, in table order.
+    pub fn descriptors(&self) -> &[ModeDescriptor] {
+        &self.modes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn canonical_wire_ids_are_unique_and_in_range() {
+        let table = ModeTable::default();
+        let ids: Vec<u8> = table.descriptors().iter().map(|d| d.wire_id()).collect();
+        let uniq: BTreeSet<u8> = ids.iter().copied().collect();
+        assert_eq!(uniq.len(), ids.len(), "wire_ids must be unique: {ids:?}");
+        assert!(
+            ids.iter().all(|&id| id <= 7),
+            "wire_ids must be 0..=7 (rx_rung is 3 bits): {ids:?}"
+        );
+    }
+
+    #[test]
+    fn wire_ids_are_the_pinned_canonical_assignment() {
+        let table = ModeTable::default();
+        for (name, want) in [
+            ("ofdm-wide", 0u8),
+            ("ofdm-mid", 1),
+            ("ofdm-narrow", 2),
+            ("floor-wblo", 3),
+            ("floor-nfsk", 4),
+        ] {
+            assert_eq!(table.descriptor(name).unwrap().wire_id(), want, "{name}");
+        }
     }
 }

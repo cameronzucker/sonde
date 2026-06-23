@@ -151,6 +151,8 @@ pub struct SondePhy {
     /// enqueue; the worker drops it when `Radio::transmit` returns (PTT
     /// released). Read by [`PhyTransport::tx_in_flight`]. Shared with the worker.
     in_flight: Arc<AtomicUsize>,
+    /// Published per-mode capabilities, snapshotted at construction (sonde-ddg).
+    capabilities: Vec<sonde_phy::modes::ModeCapability>,
 }
 
 impl SondePhy {
@@ -176,6 +178,11 @@ impl SondePhy {
     where
         R: Radio + 'static,
     {
+        // Snapshot the published per-mode capabilities BEFORE the registry moves
+        // into the worker thread (sonde-ddg). Capabilities are static for the
+        // build; the link reads this snapshot via `capabilities()` at ladder build.
+        let capabilities = crate::capabilities::snapshot(&waveforms);
+
         let (tx_jobs, job_rx) = mpsc::channel::<TxJob>();
         let (frame_tx, rx_frames) = mpsc::channel::<RxFrame>();
         let quality = Arc::new(Mutex::new(QualitySnapshot::default()));
@@ -207,7 +214,15 @@ impl SondePhy {
             worker: Some(worker),
             next_token: 0,
             in_flight,
+            capabilities,
         }
+    }
+
+    /// Published per-mode capabilities for the registered waveforms — the link's
+    /// adaptation ladder is built from this (sonde-ddg / sonde-3tm). Static for the
+    /// build; publication order = registry order (the link sorts by knee).
+    pub fn capabilities(&self) -> &[sonde_phy::modes::ModeCapability] {
+        &self.capabilities
     }
 
     /// Signal the worker to stop and join it. Idempotent. Called by `Drop`, but
@@ -555,6 +570,14 @@ mod tests {
             0.0,
             "FER recovers within window"
         );
+    }
+
+    #[test]
+    fn sondephy_publishes_capabilities_for_the_standard_registry() {
+        let phy = SondePhy::with_waveforms(crate::standard_waveforms(), LoopbackRadio::new());
+        let caps = phy.capabilities();
+        assert_eq!(caps.len(), 5, "all 5 standard modes published via SondePhy");
+        assert!(caps.iter().all(|c| c.wire_id <= 7 && c.knee_snr_db.is_finite()));
     }
 
     #[test]
