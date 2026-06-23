@@ -23,6 +23,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod capabilities;
 pub mod radio;
 pub mod runtime;
 pub mod waveform;
@@ -32,6 +33,8 @@ pub mod soundcard;
 
 pub use radio::{LoopbackRadio, Radio};
 pub use runtime::SondePhy;
+/// Re-export the shared link↔PHY capability type (defined in `sonde-phy`).
+pub use sonde_phy::modes::ModeCapability;
 pub use waveform::{
     standard_waveforms, DecodeScan, DecodedFrame, FloorWaveform, NfskWaveform, OfdmMainWaveform,
     Waveform,
