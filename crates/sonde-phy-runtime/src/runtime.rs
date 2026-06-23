@@ -577,7 +577,9 @@ mod tests {
         let phy = SondePhy::with_waveforms(crate::standard_waveforms(), LoopbackRadio::new());
         let caps = phy.capabilities();
         assert_eq!(caps.len(), 5, "all 5 standard modes published via SondePhy");
-        assert!(caps.iter().all(|c| c.wire_id <= 7 && c.knee_snr_db.is_finite()));
+        assert!(caps
+            .iter()
+            .all(|c| c.wire_id <= 7 && c.knee_snr_db.is_finite()));
     }
 
     #[test]
